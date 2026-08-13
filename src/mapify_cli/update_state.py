@@ -55,7 +55,7 @@ def _state_from_payload(payload: Any) -> UpdateState | None:
         "pending_refresh",
         "pending_providers",
     }
-    if set(payload) - allowed_keys:
+    if set(payload) != allowed_keys:
         return None
     if type(payload.get("schema_version")) is not int:
         return None
@@ -147,6 +147,7 @@ def automatic_check_due(state: UpdateState, now: datetime) -> bool:
 if os.name == "nt":
 
     def _try_lock(fd: int) -> None:
+        # Intent: Windows byte-range locks need a persistent byte to lock.
         if os.fstat(fd).st_size == 0:
             os.lseek(fd, 0, os.SEEK_SET)
             os.write(fd, b"\0")
@@ -203,6 +204,7 @@ def project_update_lock(
     acquired = False
     try:
         if nofollow == 0:
+            # Intent: Match path and descriptor identities to detect path swaps.
             path_stat = os.lstat(lock_path)
             fd_stat = os.fstat(fd)
             if stat.S_ISLNK(path_stat.st_mode) or (

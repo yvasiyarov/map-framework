@@ -13,6 +13,7 @@ from typing import IO, Any, cast
 
 import pytest
 
+import mapify_cli.update_state as update_state_module
 from mapify_cli.update_state import (
     UpdateLockBusy,
     UpdateLockSecurityError,
@@ -71,6 +72,32 @@ def test_state_write_replaces_the_previous_document(tmp_path: Path) -> None:
     }
 
 
+def test_failed_state_replace_preserves_old_state_and_removes_tempfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / ".map" / "update-state.json"
+    original_state = UpdateState(last_observed_version="3.25.1")
+    write_update_state(tmp_path, original_state)
+
+    replace_error = OSError("replace failed")
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise replace_error
+
+    monkeypatch.setattr(update_state_module.os, "replace", fail_replace)
+
+    with pytest.raises(OSError) as caught:
+        write_update_state(
+            tmp_path,
+            UpdateState(last_observed_version="3.26.0"),
+        )
+
+    assert caught.value is replace_error
+    assert read_update_state(tmp_path) == original_state
+    assert list(state_path.parent.glob(f".{state_path.name}.*.tmp")) == []
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -83,6 +110,7 @@ def test_state_write_replaces_the_previous_document(tmp_path: Path) -> None:
         '{"schema_version": 1, "last_installed_version": false}',
         '{"schema_version": 1, "pending_refresh": 1}',
         '{"schema_version": 1, "pending_providers": ["codex", 2]}',
+        ('{"schema_version": 1, "last_attempt_at": "2026-08-13T11:00:00Z"}'),
     ],
 )
 def test_corrupt_state_becomes_default_cache_miss(
