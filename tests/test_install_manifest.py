@@ -42,6 +42,7 @@ from mapify_cli.install_manifest import (
     _scan_statusline_config_entry,
     build_manifest,
     check_installed,
+    normalize_providers,
     read_manifest,
     reconcile_config,
     write_manifest,
@@ -912,6 +913,27 @@ def test_old_single_provider_manifest_populates_providers(tmp_path: Path) -> Non
     assert loaded.providers == ["claude"]
 
 
+def test_provider_normalization_orders_and_deduplicates_requested_providers() -> None:
+    assert normalize_providers(["codex", "claude", "codex"]) == ["claude", "codex"]
+
+
+def test_legacy_dual_provider_manifest_populates_both_providers(tmp_path: Path) -> None:
+    raw = {
+        "mapify_version": VERSION,
+        "provider": "claude+codex",
+        "installed_at": _TIMESTAMP,
+        "entries": [],
+    }
+    path = tmp_path / ".map" / MANIFEST_FILENAME
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = read_manifest(tmp_path)
+
+    assert loaded is not None
+    assert loaded.providers == ["claude", "codex"]
+
+
 def test_dual_provider_manifest_contains_union_without_duplicate_shared_files(
     tmp_path: Path,
 ) -> None:
@@ -928,6 +950,29 @@ def test_dual_provider_manifest_contains_union_without_duplicate_shared_files(
         dest.startswith((".codex/", ".agents/"))
         for dest in destinations
     )
+
+
+def test_dual_provider_manifest_serializes_legacy_provider_field(tmp_path: Path) -> None:
+    _setup_claude_install(tmp_path)
+    _setup_codex_install(tmp_path)
+
+    manifest = build_manifest(tmp_path, ["claude", "codex"], VERSION)
+
+    assert manifest.provider == "claude+codex"
+
+
+def test_dual_provider_manifest_preserves_claude_config_entries(tmp_path: Path) -> None:
+    _setup_claude_install(tmp_path)
+    _setup_codex_install(tmp_path)
+    _write_mcp_json(tmp_path, {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG})
+    _write_statusline_local(tmp_path, '"/path/to/map-statusline.py"')
+
+    manifest = build_manifest(tmp_path, ["claude", "codex"], VERSION)
+
+    assert {entry.key_path for entry in manifest.config_entries} == {
+        f"mcpServers.{_MAP_SERVER_NAME}",
+        "statusLine",
+    }
 
 
 def test_check_installed_scans_both_provider_roots(tmp_path: Path) -> None:
