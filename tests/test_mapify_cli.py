@@ -39,6 +39,15 @@ from mapify_cli.install_manifest import read_manifest
 runner = CliRunner()
 
 
+def _snapshot_tree(root: Path) -> dict[str, bytes]:
+    """Capture file paths and bytes so failed refreshes prove non-mutation."""
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 class TestSSLContext:
     """Test SSL context creation with proper security."""
 
@@ -691,6 +700,81 @@ class TestRefreshExistingInit:
         assert result.exit_code == 1
         assert not target.exists()
 
+    def test_refresh_existing_rejects_initialized_named_project_without_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        target = tmp_path / "sibling"
+        first = runner.invoke(
+            app,
+            ["init", target.name, "--no-git", "--mcp", "none"],
+        )
+        assert first.exit_code == 0, first.stdout
+        before = _snapshot_tree(tmp_path)
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                target.name,
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--debug",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "current directory" in refresh.stdout
+        assert _snapshot_tree(tmp_path) == before
+
+    @pytest.mark.parametrize(
+        ("installed_provider", "requested_provider"),
+        [("claude", "codex"), ("codex", "claude")],
+    )
+    def test_refresh_existing_rejects_uninstalled_provider_without_mutation(
+        self,
+        tmp_path: Path,
+        installed_provider: str,
+        requested_provider: str,
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                installed_provider,
+            ],
+        )
+        assert first.exit_code == 0, first.stdout
+        before = _snapshot_tree(tmp_path)
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                requested_provider,
+                "--debug",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "installed provider" in refresh.stdout
+        assert _snapshot_tree(tmp_path) == before
+
     def test_refresh_existing_requires_config_and_complete_provider_layout(
         self, tmp_path: Path
     ) -> None:
@@ -932,6 +1016,192 @@ class TestRefreshExistingInit:
         assert mcp_path.read_text(encoding="utf-8") == malformed
         assert list(tmp_path.glob(".mcp.backup.*.json")) == []
         assert reflector_path.read_text(encoding="utf-8") == "user sentinel\n"
+
+    @pytest.mark.parametrize(
+        "manifest_content",
+        [
+            "{malformed",
+            "[]\n",
+            json.dumps(
+                {
+                    "mapify_version": "3.25.0",
+                    "provider": "claude",
+                    "installed_at": "2026-08-13T00:00:00Z",
+                    "entries": {},
+                }
+            ),
+        ],
+        ids=["malformed", "non-object", "schema-invalid"],
+    )
+    def test_refresh_existing_invalid_manifest_is_fatal_and_non_mutating(
+        self, tmp_path: Path, manifest_content: str
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        manifest_path = tmp_path / ".map" / "mapify.lock.json"
+        manifest_path.write_text(manifest_content, encoding="utf-8")
+        before = _snapshot_tree(tmp_path)
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--debug",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing install manifest" in refresh.stdout
+        assert _snapshot_tree(tmp_path) == before
+
+    def test_refresh_existing_unreadable_manifest_is_fatal_and_non_mutating(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        manifest_path = tmp_path / ".map" / "mapify.lock.json"
+        before = _snapshot_tree(tmp_path)
+        original_read_text = Path.read_text
+
+        def deny_manifest_read(path: Path, *args: object, **kwargs: object) -> str:
+            if path == manifest_path:
+                raise PermissionError("manifest unreadable")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_manifest_read)
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--debug",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing install manifest" in refresh.stdout
+        assert _snapshot_tree(tmp_path) == before
+
+    @pytest.mark.parametrize(
+        "mcp_content",
+        ['{"mcpServers": {', "[]\n"],
+        ids=["malformed", "non-object"],
+    )
+    def test_codex_refresh_invalid_mcp_is_fatal_and_non_mutating(
+        self, tmp_path: Path, mcp_content: str
+    ) -> None:
+        os.chdir(tmp_path)
+        claude = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                "claude",
+            ],
+        )
+        codex = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--provider", "codex"],
+        )
+        assert claude.exit_code == 0, claude.stdout
+        assert codex.exit_code == 0, codex.stdout
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(mcp_content, encoding="utf-8")
+        before = _snapshot_tree(tmp_path)
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "codex",
+                "--debug",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing Claude MCP configuration" in refresh.stdout
+        assert _snapshot_tree(tmp_path) == before
+        assert list(tmp_path.glob(".mcp.backup.*.json")) == []
+
+    def test_codex_refresh_unreadable_mcp_is_fatal_and_non_mutating(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        os.chdir(tmp_path)
+        claude = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                "claude",
+            ],
+        )
+        codex = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--provider", "codex"],
+        )
+        assert claude.exit_code == 0, claude.stdout
+        assert codex.exit_code == 0, codex.stdout
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+        before = _snapshot_tree(tmp_path)
+        original_read_text = Path.read_text
+
+        def deny_mcp_read(path: Path, *args: object, **kwargs: object) -> str:
+            if path == mcp_path:
+                raise PermissionError("MCP config unreadable")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_mcp_read)
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "codex",
+                "--debug",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing Claude MCP configuration" in refresh.stdout
+        assert _snapshot_tree(tmp_path) == before
+        assert list(tmp_path.glob(".mcp.backup.*.json")) == []
 
     def test_refresh_existing_manifest_failure_is_fatal_but_normal_init_warns(
         self, tmp_path: Path

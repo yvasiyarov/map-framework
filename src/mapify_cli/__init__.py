@@ -34,7 +34,7 @@ import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import typer
@@ -131,6 +131,9 @@ from mapify_cli.delivery import (
 from mapify_cli.delivery import (
     create_task_decomposer_content as create_task_decomposer_content,
 )
+
+if TYPE_CHECKING:
+    from mapify_cli.install_manifest import InstallManifest
 
 
 # Create secure SSL context with proper fallback
@@ -772,13 +775,135 @@ def _read_refresh_mcp_config(project_path: Path) -> dict[str, Any] | None:
     return data
 
 
-def _refresh_mcp_selection(project_path: Path) -> list[str]:
-    """Recover the existing MAP-owned Claude MCP selection for a refresh."""
-    from mapify_cli.install_manifest import read_manifest
+def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
+    """Strictly parse an existing install manifest before refresh mutations."""
+    from mapify_cli.install_manifest import (
+        MANIFEST_FILENAME,
+        ConfigEntry,
+        InstallManifest,
+        ManifestEntry,
+        normalize_providers,
+    )
 
+    manifest_path = project_path / ".map" / MANIFEST_FILENAME
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read existing install manifest: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Could not read existing install manifest: expected a JSON object"
+        )
+
+    def require_string(record: dict[str, Any], field: str, label: str) -> str:
+        value = record.get(field)
+        if not isinstance(value, str):
+            raise RuntimeError(
+                "Could not read existing install manifest: "
+                f"{label}.{field} must be a string"
+            )
+        return value
+
+    mapify_version = require_string(data, "mapify_version", "manifest")
+    legacy_provider = require_string(data, "provider", "manifest")
+    installed_at = require_string(data, "installed_at", "manifest")
+
+    raw_entries = data.get("entries")
+    if not isinstance(raw_entries, list):
+        raise RuntimeError(
+            "Could not read existing install manifest: entries must be a JSON array"
+        )
+    entry_fields = {
+        "dest",
+        "content_hash",
+        "template_hash",
+        "management_mode",
+        "committed",
+        "mapify_version",
+        "installed_at",
+    }
+    entries: list[ManifestEntry] = []
+    for index, raw_entry in enumerate(raw_entries):
+        label = f"entries[{index}]"
+        if not isinstance(raw_entry, dict) or set(raw_entry) != entry_fields:
+            raise RuntimeError(
+                "Could not read existing install manifest: "
+                f"{label} does not match the manifest-entry schema"
+            )
+        for field in entry_fields - {"committed"}:
+            require_string(raw_entry, field, label)
+        if not isinstance(raw_entry["committed"], bool):
+            raise RuntimeError(
+                "Could not read existing install manifest: "
+                f"{label}.committed must be a boolean"
+            )
+        if raw_entry["management_mode"] not in {"fenced", "full", "hooks-merge"}:
+            raise RuntimeError(
+                "Could not read existing install manifest: "
+                f"{label}.management_mode is invalid"
+            )
+        entries.append(ManifestEntry(**raw_entry))
+
+    raw_config_entries = data.get("config_entries", [])
+    if not isinstance(raw_config_entries, list):
+        raise RuntimeError(
+            "Could not read existing install manifest: "
+            "config_entries must be a JSON array"
+        )
+    config_fields = {"file", "key_path", "installed_at", "mapify_version"}
+    config_entries: list[ConfigEntry] = []
+    for index, raw_entry in enumerate(raw_config_entries):
+        label = f"config_entries[{index}]"
+        if not isinstance(raw_entry, dict) or set(raw_entry) != config_fields:
+            raise RuntimeError(
+                "Could not read existing install manifest: "
+                f"{label} does not match the config-entry schema"
+            )
+        for field in config_fields:
+            require_string(raw_entry, field, label)
+        config_entries.append(ConfigEntry(**raw_entry))
+
+    legacy_providers = legacy_provider.split("+")
+    normalized_legacy = normalize_providers(legacy_providers)
+    if not normalized_legacy or len(normalized_legacy) != len(legacy_providers):
+        raise RuntimeError(
+            "Could not read existing install manifest: provider is invalid"
+        )
+
+    raw_providers = data.get("providers")
+    if raw_providers is None:
+        providers = normalized_legacy
+    elif not isinstance(raw_providers, list) or not all(
+        isinstance(name, str) for name in raw_providers
+    ):
+        raise RuntimeError(
+            "Could not read existing install manifest: providers must be a JSON "
+            "array of strings"
+        )
+    else:
+        providers = normalize_providers(raw_providers)
+        if providers != raw_providers or providers != normalized_legacy:
+            raise RuntimeError(
+                "Could not read existing install manifest: providers are invalid"
+            )
+
+    return InstallManifest(
+        mapify_version=mapify_version,
+        provider=legacy_provider,
+        installed_at=installed_at,
+        entries=entries,
+        config_entries=config_entries,
+        providers=providers,
+    )
+
+
+def _refresh_mcp_selection(
+    manifest: "InstallManifest | None", mcp_data: dict[str, Any] | None
+) -> list[str]:
+    """Recover the existing MAP-owned Claude MCP selection for a refresh."""
     standard_servers = build_standard_mcp_servers()
-    mcp_data = _read_refresh_mcp_config(project_path)
-    manifest = read_manifest(project_path)
     manifest_servers: set[str] = set()
     if manifest is not None:
         prefix = "mcpServers."
@@ -801,6 +926,27 @@ def _refresh_mcp_selection(project_path: Path) -> list[str]:
         for name, expected in standard_servers.items()
         if existing_servers.get(name) == expected
     ]
+
+
+def _start_init_workflow_logger(
+    project_name: str | None, mcp: str, debug: bool
+) -> None:
+    """Start init diagnostics after refresh preflight has proved non-mutating."""
+    if not is_debug_enabled(debug):
+        return
+
+    from mapify_cli.workflow_logger import MapWorkflowLogger
+
+    workflow_logger = MapWorkflowLogger(Path.cwd(), enabled=True)
+    log_file = workflow_logger.start_session(
+        task_id=f"mapify_init_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    )
+    console.print(f"[dim]Debug logging enabled: {log_file}[/dim]")
+    workflow_logger.log_event(
+        "command_start",
+        f"mapify init {project_name or '.'}",
+        metadata={"debug": debug, "mcp": mcp},
+    )
 
 
 @app.command()
@@ -919,21 +1065,9 @@ def init(
     # Show banner
     show_banner()
 
-    # Initialize workflow logger if debug mode is enabled
-    workflow_logger = None
-    if is_debug_enabled(debug):
-        from mapify_cli.workflow_logger import MapWorkflowLogger
-
-        workflow_logger = MapWorkflowLogger(Path.cwd(), enabled=True)
-        log_file = workflow_logger.start_session(
-            task_id=f"mapify_init_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
-        )
-        console.print(f"[dim]Debug logging enabled: {log_file}[/dim]")
-        workflow_logger.log_event(
-            "command_start",
-            f"mapify init {project_name or '.'}",
-            metadata={"debug": debug, "mcp": mcp},
-        )
+    requested_project_name = project_name
+    if not refresh_existing:
+        _start_init_workflow_logger(requested_project_name, mcp, debug)
 
     # Validate provider
     valid_providers = ("claude", "codex")
@@ -941,6 +1075,13 @@ def init(
         console.print(
             f"[red]Error:[/red] Invalid provider '{provider}'. "
             f"Valid providers: {', '.join(valid_providers)}"
+        )
+        raise typer.Exit(1)
+
+    if refresh_existing and project_name != ".":
+        console.print(
+            "[red]Error:[/red] --refresh-existing can only refresh the current "
+            "directory; the target must be exactly '.'."
         )
         raise typer.Exit(1)
 
@@ -1047,13 +1188,24 @@ def init(
                 "project with .map/config.yaml and an installed provider layout."
             )
             raise typer.Exit(1)
+        if provider not in existing_providers:
+            console.print(
+                f"[red]Error:[/red] Cannot refresh '{provider}': that provider is "
+                "not an installed provider in the current MAP project."
+            )
+            raise typer.Exit(1)
         try:
+            refresh_manifest = _read_refresh_manifest(project_path)
+            refresh_mcp_config = _read_refresh_mcp_config(project_path)
             effective_agent_memory = _load_refresh_agent_memory(project_path)
             if provider != "codex":
-                refresh_mcp_servers = _refresh_mcp_selection(project_path)
+                refresh_mcp_servers = _refresh_mcp_selection(
+                    refresh_manifest, refresh_mcp_config
+                )
         except RuntimeError as exc:
             console.print(f"[red]Error:[/red] {exc}")
             raise typer.Exit(1) from exc
+        _start_init_workflow_logger(requested_project_name, mcp, debug)
 
     # Setup tracker
     tracker = StepTracker("Initialize MAP Framework Project")
