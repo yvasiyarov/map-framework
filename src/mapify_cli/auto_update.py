@@ -480,6 +480,7 @@ def check_and_update(
             current_version, "A major version can be approved only in manual mode."
         )
 
+    completed_result: UpdateResult | None = None
     try:
         if (
             mode is UpdateMode.AUTOMATIC
@@ -499,13 +500,14 @@ def check_and_update(
 
         try:
             with project_update_lock(project_path, timeout_s=LOCK_TIMEOUT_SECONDS):
-                return _check_locked(
+                completed_result = _check_locked(
                     project_path,
                     current_version,
                     mode,
                     approved_major,
                     effective_now,
                 )
+            return completed_result
         except UpdateLockBusy:
             if mode is UpdateMode.AUTOMATIC:
                 return UpdateResult(UpdateStatus.SKIPPED, current_version)
@@ -522,7 +524,20 @@ def check_and_update(
             UpdateStatus.ERROR,
             current_version,
             installed_version=(
-                state.last_installed_version if state.pending_refresh else None
+                completed_result.installed_version
+                if completed_result is not None
+                and completed_result.installed_version is not None
+                else state.last_installed_version if state.pending_refresh else None
             ),
             message=_actionable_error_message(exc, mode, state),
+            refreshed_providers=(
+                completed_result.refreshed_providers
+                if completed_result is not None
+                else ()
+            ),
+            reload_current_skill=(
+                completed_result.reload_current_skill
+                if completed_result is not None
+                else False
+            ),
         )

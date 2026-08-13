@@ -1223,6 +1223,59 @@ def test_manual_outer_boundary_failure_is_actionable(
     assert "Retry the manual update" in result.message
 
 
+@pytest.mark.parametrize("mode", [UpdateMode.AUTOMATIC, UpdateMode.MANUAL])
+def test_lock_cleanup_failure_preserves_completed_update_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: UpdateMode,
+) -> None:
+    @contextlib.contextmanager
+    def failing_cleanup_lock(
+        project: Path,
+        *,
+        timeout_s: float,
+    ) -> Generator[None, None, None]:
+        del project, timeout_s
+        yield
+        raise OSError("lock cleanup failed")
+
+    monkeypatch.setattr(auto_update, "project_update_lock", failing_cleanup_lock)
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_version_targets",
+        lambda current, client: VersionTargets(StableVersion(3, 26, 0), None),
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "installed_providers",
+        lambda project: ("claude",),
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "install_exact_version",
+        lambda project, version: None,
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "refresh_installed_providers",
+        lambda project, providers: ("claude",),
+    )
+
+    result = check_and_update(tmp_path, "3.25.0", mode, now=NOW)
+
+    assert result.status is UpdateStatus.ERROR
+    assert result.installed_version == "3.26.0"
+    assert result.refreshed_providers == ("claude",)
+    assert result.reload_current_skill is True
+    assert result.message is not None and "lock cleanup failed" in result.message
+    if mode is UpdateMode.MANUAL:
+        assert "Retry the manual update" in result.message
+    state = read_update_state(tmp_path)
+    assert state.last_installed_version == "3.26.0"
+    assert state.pending_refresh is False
+    assert state.pending_providers == ()
+
+
 def test_failure_after_same_major_refresh_preserves_all_completed_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
