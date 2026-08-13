@@ -33,6 +33,7 @@ from mapify_cli import (
     read_project_mcp_json,
     write_project_mcp_json,
 )
+from mapify_cli.auto_update import UpdateMode, UpdateResult, UpdateStatus
 from mapify_cli.delivery import create_map_tools
 from mapify_cli.install_manifest import read_manifest
 
@@ -1578,8 +1579,265 @@ class TestDoctorCommand:
         assert ".map/scripts" in result.stdout
 
 
+class TestInternalUpdateCommand:
+    """Test the hidden machine-readable project update adapter."""
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_automatic_error_is_silent_success(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        mock_update.return_value = UpdateResult(
+            UpdateStatus.ERROR, "3.25.0", message="offline"
+        )
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout == ""
+        assert result.stderr == ""
+        assert result.output == ""
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_automatic_unexpected_exception_is_silent_success(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        def raise_noisily(*_args: object, **_kwargs: object) -> UpdateResult:
+            print("incidental stdout")
+            print("incidental stderr", file=sys.stderr)
+            raise OSError("unexpected")
+
+        mock_update.side_effect = raise_noisily
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout == ""
+        assert result.stderr == ""
+        assert result.output == ""
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_automatic_success_emits_one_clean_unicode_json_object(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        expected = UpdateResult(
+            UpdateStatus.CURRENT,
+            "3.25.0",
+            message="Текущая версия 🎉",
+        )
+
+        def return_noisily(*_args: object, **_kwargs: object) -> UpdateResult:
+            print("incidental stdout")
+            print("incidental stderr", file=sys.stderr)
+            return expected
+
+        mock_update.side_effect = return_noisily
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+        )
+
+        expected_output = (
+            '{"status": "current", "current_version": "3.25.0", '
+            '"message": "Текущая версия 🎉", "reload_current_skill": false}\n'
+        )
+        assert result.exit_code == 0
+        assert result.stdout == expected_output
+        assert result.stderr == ""
+        assert result.output == expected_output
+        assert result.stdout.count("\n") == 1
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_error_is_json_failure(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        mock_update.return_value = UpdateResult(
+            UpdateStatus.ERROR, "3.25.0", message="offline"
+        )
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "manual", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        assert json.loads(result.stdout) == {
+            "status": "error",
+            "current_version": "3.25.0",
+            "message": "offline",
+            "reload_current_skill": False,
+        }
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_unexpected_exception_is_bounded_json_failure(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        def raise_noisily(*_args: object, **_kwargs: object) -> UpdateResult:
+            print("incidental stdout")
+            print("incidental stderr", file=sys.stderr)
+            raise OSError("unexpected" + "x" * 3_000)
+
+        mock_update.side_effect = raise_noisily
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "manual", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "error"
+        assert payload["message"].startswith("MAP update failed: unexpected")
+        assert len(payload["message"]) == 2_000
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_success_emits_one_clean_unicode_json_object(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        expected = UpdateResult(
+            UpdateStatus.UPDATED,
+            "3.25.0",
+            installed_version="3.26.0",
+            message="Обновлено 🎉",
+            refreshed_providers=("claude", "codex"),
+            reload_current_skill=True,
+        )
+
+        def return_noisily(*_args: object, **_kwargs: object) -> UpdateResult:
+            print("incidental stdout")
+            print("incidental stderr", file=sys.stderr)
+            return expected
+
+        mock_update.side_effect = return_noisily
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "manual", "--project", str(tmp_path)],
+        )
+
+        expected_output = (
+            '{"status": "updated", "current_version": "3.25.0", '
+            '"installed_version": "3.26.0", "message": "Обновлено 🎉", '
+            '"refreshed_providers": ["claude", "codex"], '
+            '"reload_current_skill": true}\n'
+        )
+        assert result.exit_code == 0
+        assert result.stdout == expected_output
+        assert result.stderr == ""
+        assert result.output == expected_output
+        assert result.stdout.count("\n") == 1
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_invalid_mode_is_one_clean_json_failure(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "scheduled", "--project", str(tmp_path)],
+        )
+
+        expected_output = (
+            json.dumps(
+                {"status": "error", "message": "--mode must be automatic or manual"}
+            )
+            + "\n"
+        )
+        assert result.exit_code == 1
+        assert result.stdout == expected_output
+        assert result.stderr == ""
+        assert result.output == expected_output
+        mock_update.assert_not_called()
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_forwards_approved_major(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        mock_update.return_value = UpdateResult(UpdateStatus.CURRENT, "3.25.0")
+
+        result = runner.invoke(
+            app,
+            [
+                "_update",
+                "--mode",
+                "manual",
+                "--project",
+                str(tmp_path),
+                "--approve-major",
+                "4.0.0",
+            ],
+        )
+
+        assert result.exit_code == 0
+        mock_update.assert_called_once_with(
+            tmp_path.resolve(),
+            current_version=mapify_cli.__version__,
+            mode=UpdateMode.MANUAL,
+            approved_major="4.0.0",
+        )
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_automatic_approved_major_rejection_is_silent(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        mock_update.return_value = UpdateResult(
+            UpdateStatus.ERROR,
+            "3.25.0",
+            message="A major version can be approved only in manual mode.",
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "_update",
+                "--mode",
+                "automatic",
+                "--project",
+                str(tmp_path),
+                "--approve-major",
+                "4.0.0",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert result.output == ""
+        mock_update.assert_called_once_with(
+            tmp_path.resolve(),
+            current_version=mapify_cli.__version__,
+            mode=UpdateMode.AUTOMATIC,
+            approved_major="4.0.0",
+        )
+
+    def test_internal_update_is_hidden_from_help(self) -> None:
+        result = runner.invoke(app, ["--help"])
+
+        assert result.exit_code == 0
+        assert "_update" not in result.stdout
+
+
 class TestUpgradeCommand:
     """Test the upgrade command."""
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    @mock.patch("mapify_cli.get_latest_release", return_value={"tag_name": "v0.0.1"})
+    def test_public_upgrade_does_not_use_auto_update_service(
+        self, mock_release: mock.Mock, mock_auto: mock.Mock
+    ) -> None:
+        del mock_release
+
+        result = runner.invoke(app, ["upgrade"])
+
+        assert result.exit_code == 0
+        mock_auto.assert_not_called()
 
     @mock.patch("mapify_cli._run_self_upgrade", return_value=0)
     @mock.patch(

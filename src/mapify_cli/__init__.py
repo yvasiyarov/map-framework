@@ -25,6 +25,8 @@ Or install globally:
 
 __version__ = "3.25.0"
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -1902,6 +1904,57 @@ def minimality_report(
         console.print_json(data=report)
         return
     _render_minimality_report(report)
+
+
+@app.command("_update", hidden=True)
+def internal_update(
+    mode: str = typer.Option(..., "--mode"),
+    project: Path = typer.Option(Path("."), "--project"),
+    approve_major: str | None = typer.Option(None, "--approve-major"),
+) -> None:
+    """Run the machine-readable project update protocol used by MAP skills."""
+    from mapify_cli.auto_update import UpdateMode, UpdateStatus, check_and_update
+
+    try:
+        parsed_mode = UpdateMode(mode)
+    except ValueError:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": "--mode must be automatic or manual",
+                }
+            )
+            + "\n"
+        )
+        raise typer.Exit(1) from None
+
+    try:
+        # The internal protocol owns presentation. Suppress incidental warnings,
+        # prints, and library diagnostics, then emit at most one JSON object.
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = check_and_update(
+                project.resolve(),
+                current_version=__version__,
+                mode=parsed_mode,
+                approved_major=approve_major,
+            )
+    except Exception as exc:  # noqa: BLE001 -- final presentation boundary
+        if parsed_mode is UpdateMode.AUTOMATIC:
+            return
+        message = f"MAP update failed: {exc}"[:2_000]
+        sys.stdout.write(json.dumps({"status": "error", "message": message}) + "\n")
+        raise typer.Exit(1) from None
+
+    if parsed_mode is UpdateMode.AUTOMATIC and result.status is UpdateStatus.ERROR:
+        return
+
+    sys.stdout.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+    if result.status is UpdateStatus.ERROR:
+        raise typer.Exit(1)
 
 
 def _mapify_install_kind() -> str:
