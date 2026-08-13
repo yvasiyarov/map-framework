@@ -782,6 +782,14 @@ def init(
             "project (project-scoped, committed). See docs/USAGE.md."
         ),
     ),
+    auto_update: bool | None = typer.Option(
+        None,
+        "--auto-update/--no-auto-update",
+        help=(
+            "Enable or disable automatic stable MAP updates for this project. "
+            "Enabled by default; omit to preserve an existing project choice."
+        ),
+    ),
     autonomy: bool | None = typer.Option(
         None,
         "--autonomy/--no-autonomy",
@@ -996,6 +1004,7 @@ def init(
         try:
             from mapify_cli.config.project_config import (
                 apply_agent_memory_overrides,
+                apply_auto_update_override,
                 apply_compression_overrides,
                 apply_sofa_overrides,
                 write_default_config,
@@ -1010,6 +1019,8 @@ def init(
                 apply_compression_overrides(
                     config_path, compression, compression_threshold
                 )
+            if auto_update is not None:
+                apply_auto_update_override(config_path, auto_update)
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1053,6 +1064,7 @@ def init(
         try:
             from mapify_cli.config.project_config import (
                 apply_agent_memory_overrides,
+                apply_auto_update_override,
                 apply_compression_overrides,
                 apply_sofa_overrides,
                 write_default_config,
@@ -1067,6 +1079,8 @@ def init(
                 apply_compression_overrides(
                     config_path, compression, compression_threshold
                 )
+            if auto_update is not None:
+                apply_auto_update_override(config_path, auto_update)
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore

@@ -167,6 +167,72 @@ class TestGitOperations:
 class TestInitCommand:
     """Test the init command."""
 
+    def test_init_no_auto_update_persists_false(self, tmp_path: Path) -> None:
+        os.chdir(tmp_path)
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--no-auto-update",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "updates.auto: false" in (tmp_path / ".map" / "config.yaml").read_text()
+
+    def test_init_auto_update_reenables_existing_project(self, tmp_path: Path) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--no-auto-update",
+            ],
+        )
+        second = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--auto-update",
+            ],
+        )
+        assert first.exit_code == second.exit_code == 0
+        assert "updates.auto: true" in (tmp_path / ".map" / "config.yaml").read_text()
+
+    def test_init_without_update_flag_preserves_false(self, tmp_path: Path) -> None:
+        os.chdir(tmp_path)
+        runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--no-auto-update",
+            ],
+        )
+        result = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert result.exit_code == 0
+        assert "updates.auto: false" in (tmp_path / ".map" / "config.yaml").read_text()
+
     def test_init_basic(self, tmp_path):
         """Test basic initialization without options.
 
