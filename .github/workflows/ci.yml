@@ -11,10 +11,10 @@ jobs:
   validate-version:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: "3.11"
 
@@ -71,10 +71,10 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
 
@@ -85,14 +85,22 @@ jobs:
 
     - name: Run linters
       run: |
-        # Run linters if installed (Linux/macOS only)
-        which ruff > /dev/null 2>&1 && ruff check src/ tests/ || echo "Ruff not installed, skipping"
-        which mypy > /dev/null 2>&1 && mypy src/ || echo "Mypy not installed, skipping"
+        # ruff/mypy/pyright are always installed via the [dev] extra above.
+        # Each command must fail the step on error - do not swallow nonzero exits.
+        ruff check src/ tests/
+        mypy src/
+        pyright src/
+
+    - name: Install uv
+      run: pip install uv
+
+    - name: Render parity check
+      run: make check-render
 
     - name: Run Codex provider regression checks
       run: |
         python -m pytest -v \
-          tests/test_template_sync.py::TestCodexTemplateSynchronization \
+          tests/test_template_render.py::TestRenderRepoTreesCodex \
           tests/test_mapify_cli.py::TestCodexProvider
 
     - name: Run tests
@@ -101,9 +109,9 @@ jobs:
 
     - name: Upload coverage to Codecov
       if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v7
       with:
-        file: ./coverage.xml
+        files: ./coverage.xml
         fail_ci_if_error: false
 
   build:
@@ -111,10 +119,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: "3.11"
 
@@ -128,11 +136,11 @@ jobs:
 
     - name: Check package
       run: |
-        pip install twine
-        twine check dist/*
+        python -m pip install --upgrade "packaging>=26" "twine>=6.2.0"
+        python -m twine check dist/*
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: dist-${{ github.run_id }}
         path: dist/

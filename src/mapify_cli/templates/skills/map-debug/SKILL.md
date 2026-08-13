@@ -1,33 +1,28 @@
 ---
 name: map-debug
-description: |
-  Structured MAP debugging via task-decomposer, actor, and monitor agents. Use when reproducing a bug, isolating a regression, or diagnosing an error with specialized agents. Do NOT use for greenfield features; use map-plan or map-efficient.
+description: |-
+  Structured MAP debugging via task-decomposer, actor, and monitor agents. Use when reproducing a bug, isolating a regression, or diagnosing an error with specialized agents — including failing or flaky tests (pytest AssertionError), crashes and segmentation faults, memory-corruption or memory errors in native/C extensions, intermittent or load-dependent failures (e.g. 500s under load), data-corruption bugs that only appear in production, scripts or hooks that silently exit or produce no output, and any "find the root cause" / "walk me through diagnosing" / "help me investigate" request. Trigger on phrasing like "failing test", "mysterious error", "segfault", "memory error", "intermittently fails", "root cause", "isolate the cause", "debug why", "diagnose", or "investigate the error". Prefer this over generic investigation when the user wants a systematic decompose-reproduce-fix-verify workflow. Do NOT use for greenfield features; use map-plan or map-efficient.
 effort: medium
 disable-model-invocation: true
 argument-hint: "[bug description]"
 ---
 # MAP Debugging Workflow
 
-**🚨 ABSOLUTELY FORBIDDEN 🚨**
+## Workflow Guardrails
 
-You are **STRICTLY PROHIBITED** from:
+Use the specialized MAP agents because debugging depends on isolated root-cause evidence:
 
-❌ **"Optimizing" the workflow by skipping agents** - Each agent MUST be called
-❌ **"Using general-purpose instead of specialized agents"** - USE the correct subagent_type
-❌ **"Combining steps to save time"** - Each agent MUST be called individually
-❌ **Any variation of "I'll optimize by..."** - NO ADDITIONAL OPTIMIZATION ALLOWED
-
-**YOU MUST:**
-✅ Call task-decomposer FIRST (not general-purpose)
-✅ Call actor for EACH subtask (not general-purpose)
-✅ Call monitor after EACH actor (not general-purpose)
-✅ Verify each agent used required MCP tools (check output)
+- Start with `task-decomposer` so investigation, fix, and verification work are separated.
+- Use `actor` for each investigation or fix subtask rather than a general-purpose agent.
+- Use `monitor` after each fix subtask so written code is validated before impact analysis.
+- Use `predictor` and `evaluator` only after Monitor approves a fix, as described below.
+- Do not combine phases to save time; each phase consumes the previous phase's evidence.
 
 Debug the following issue using the MAP framework:
 
 **Debug Request:** $ARGUMENTS
 
-Use compact evidence-first examples from [Evidence-First Output Examples](../../references/map-output-examples.md) when asking agents to report root causes, validation failures, or impact risks.
+Use compact evidence-first examples from [Evidence-First Output Examples](../../references/map-output-examples.md) when asking agents to report root causes, validation failures, or impact risks. Use the shared [XML Prompt Envelope](../../references/map-xml-prompt-envelopes.md) for long debugging prompts so logs, affected files, and fixes are separated from instructions and output contracts.
 
 ## Effort and Parallelism Policy
 
@@ -40,19 +35,37 @@ parallel_tool_policy: sequential_root_cause_first
 - Keep the debugging pipeline sequential because each phase depends on the latest evidence and written repo state.
 - Parallelize only independent read-only log/code searches during initial investigation.
 
+## When Not To Expand Scope
+
+- Do not turn a bug fix into a refactor, feature, or architecture cleanup unless the root cause requires that change.
+- Do not add extra agents beyond the documented debugging sequence; switch workflows only if the task stops being a debugging task.
+- Do not continue polishing after the original symptom is reproduced, fixed, and verified.
+
+## Mutation Boundary Constraints
+
+These constraints apply to every fix subtask:
+
+- Do not edit unrelated files, even if they are nearby or easy to clean up.
+- Do not add, remove, or upgrade dependencies unless the root cause evidence explicitly requires that dependency change.
+- Do not refactor neighboring code unless the bug cannot be fixed and verified without that exact refactor.
+- If a dependency change, broad refactor, or scope expansion seems necessary, report it as a blocker/tradeoff instead of doing it silently.
+
 ## Workflow Overview
 
 Debugging workflow focuses on analysis before implementation:
 
 ```
 1. DECOMPOSE → task-decomposer (break down debugging steps)
-2. FOR each debugging step:
-   3. IMPLEMENT → actor (edit files directly)
-   4. VALIDATE → monitor (check written files)
-   5. PREDICT → predictor (assess impact of fix)
-   6. EVALUATE → evaluator (verify fix quality)
-   7. Keep Actor's already-written fix
-3. DONE → Suggest /map-learn if user wants to preserve patterns
+2. REPRODUCE → write an executable probe; record_repro_probe MUST witness exit 42
+   ("no fix without root cause") before any fix is written
+3. FOR each fix step:
+   4. IMPLEMENT → actor (edit files directly)
+   5. VALIDATE → monitor (check written files)
+   6. PREDICT → predictor (assess impact of fix)
+   7. EVALUATE → evaluator (verify fix quality)
+   8. Keep Actor's already-written fix
+9. VERIFY → verify_repro_resolved: the SAME probe MUST flip to exit 0 (resolved)
+10. DONE → Suggest /map-learn if user wants to preserve patterns
 ```
 
 ## Step 1: Analyze the Issue
@@ -69,27 +82,76 @@ Before calling task-decomposer, gather context:
 Task(
   subagent_type="task-decomposer",
   description="Decompose debugging steps",
-  prompt="Break down this debugging process into atomic steps:
+  prompt="<documents>
+  <document source='debug-request'>
+    <document_content>$ARGUMENTS</document_content>
+  </document>
+  <document source='error-logs'>
+    <document_content>[if available]</document_content>
+  </document>
+  <document source='affected-files'>
+    <document_content>[from analysis]</document_content>
+  </document>
+</documents>
 
-**Issue:** $ARGUMENTS
-
-**Context:**
-- Error logs: [if available]
-- Affected files: [from analysis]
+<task>
+Break down this debugging process into atomic investigation, fix, and verification steps.
+</task>
 
 JSON contract reference: [Decomposition Output](../../references/map-json-output-contracts.md#decomposition-output).
 
+<expected_output>
 Output JSON with:
 - subtasks: array of {id, description, debug_type: 'investigation'|'fix'|'verification', acceptance_criteria}
 - root_cause_hypothesis: string
 - estimated_complexity: 'low'|'medium'|'high'
+</expected_output>
 
+<constraints>
 Debug types:
 - investigation: analyze code, logs, reproduce issue
 - fix: implement solution
-- verification: test fix, check for regressions"
+- verification: test fix, check for regressions
+</constraints>"
 )
 ```
+
+## Step 2.5: Reproduce With an Executable Probe (MANDATORY root-cause gate)
+
+**No fix may be written until an executable probe has empirically reproduced the bug.** This operationalizes the "no fix without root cause" Iron Law: the runner *witnesses* the bug instead of trusting a claim, and the probe becomes a deterministic artifact Monitor / final-verifier can re-run.
+
+1. Write a small, self-contained **executable** probe under `.map/<branch>/repro/` (it is gitignored — throwaway). Give it a shebang and the sentinel exit contract:
+   - exit **42** when the bug **reproduces** (`MAP_REPRODUCED`)
+   - exit **0** when the bug is **absent** (`MAP_RESOLVED`)
+   - any other exit code or a timeout = inconclusive (the gate will not advance)
+
+   Example `.map/<branch>/repro/probe.sh` (a shell wrapper makes this language-agnostic — wrap the real check for pytest / go test / node / etc.):
+   ```bash
+   #!/usr/bin/env bash
+   # Reproduces the bug: <one-line root-cause hypothesis>.
+   # Exit 42 while the bug is present, 0 once it is fixed.
+   if python3 -c 'import sys; from app import parse; sys.exit(0 if parse("") == [] else 1)'; then
+     exit 0     # correct behavior -> bug absent
+   else
+     exit 42    # wrong behavior -> bug reproduced
+   fi
+   ```
+
+2. Record it. The runner copies the probe into an **immutable locked snapshot**, executes it, and arms the gate only when it actually exits 42:
+   ```bash
+   python3 .map/scripts/map_step_runner.py record_repro_probe \
+     .map/<branch>/repro/probe.sh \
+     --root-cause "<short root-cause statement>"
+   ```
+   - `valid:true, phase:"reproduced"` → the root cause is demonstrated; proceed to the fix.
+   - `valid:false` (exit code != 42) → **you do not yet understand the bug.** Return to investigation; do NOT write a fix.
+
+3. Only now implement the fix (Step 3), then verify the flip in Step 4.
+
+**Scope & honesty:**
+- Keep probes throwaway. Promote a probe to a real regression test only when the bug warrants permanent coverage.
+- The runner proves a *witnessed behavioral flip* (42 → 0) on an immutable probe — **not** that the probe captures the *real* root cause. Monitor still judges that.
+- If an executable probe is genuinely impossible (e.g. a pure docs/comment typo with no runtime behavior), STOP and surface a `CLARIFICATION_NEEDED` to the user with the reason. Never skip the gate silently or hand-write the artifact.
 
 ## Step 3: For Each Debugging Step
 
@@ -131,6 +193,7 @@ Task(
 **Root Cause:** [identified root cause]
 
 Apply the fix directly with Edit/Write tools.
+Do not edit unrelated files, add or upgrade dependencies, or refactor neighboring code unless the root cause evidence explicitly requires it. Report any required scope expansion as a blocker/tradeoff.
 
 JSON contract reference: [Actor Change Summary](../../references/map-json-output-contracts.md#actor-change-summary).
 
@@ -150,16 +213,30 @@ Do not serialize full file contents in your response."
 
 After each fix (max 5 Actor->Monitor retry iterations per subtask):
 
+- On the first Monitor rejection, pass feedback back to Actor normally.
+- On the second or later rejection for the same fix attempt, run `python3 .map/scripts/map_step_runner.py build_retry_quarantine debug-fix <retry_count> "<monitor feedback>"` and make the next Actor prompt use `.map/<branch>/retry_quarantine.json` as CLEAN_RETRY context. Do not reuse the rejected approach unless the quarantine artifact explicitly preserves it.
+
 ```
 Task(
   subagent_type="monitor",
   description="Validate fix",
-  prompt="Validate this debugging fix in the written repo state:
+  prompt="<documents>
+  <document source='original-issue'>
+    <document_content>[description]</document_content>
+  </document>
+  <document source='written-files'>
+    <document_content>Written Files: [files_changed from Actor]</document_content>
+  </document>
+  <document source='root-cause'>
+    <document_content>[identified root cause]</document_content>
+  </document>
+</documents>
 
-**Original Issue:** [description]
-**Written Files:** [files_changed from Actor]
-**Root Cause:** [identified root cause]
+<task>
+Validate this debugging fix in the written repo state.
+</task>
 
+<instructions>
 Check:
 - Read the written files and verify the code exists in the repo
 - Does the fix address the root cause?
@@ -167,13 +244,16 @@ Check:
 - Are there proper error handling?
 - Is the fix testable?
 - Are there any edge cases missed?
+</instructions>
 
+<expected_output>
 Output JSON with:
 - evidence: array of {file_path, line_range, quote, relevance}; cite the changed code or failing/passing test before verdict fields
 - valid: boolean
 - issues: array of {severity, category, description}
 - verdict: 'approved'|'needs_revision'|'rejected'
-- feedback: string"
+- feedback: string
+</expected_output>"
 )
 ```
 
@@ -256,7 +336,13 @@ This writes `.map/<branch>/learning-handoff.md` and `.json`, updates `artifact_m
 After all fixes applied:
 
 1. **Run full test suite** to check for regressions
-2. **Verify original issue is resolved**
+2. **Verify the original issue is resolved with the repro-probe gate** — re-run the SAME probe; it must flip from reproducing (42) to resolved (0):
+
+   ```bash
+   python3 .map/scripts/map_step_runner.py verify_repro_resolved
+   ```
+
+   `valid:true, phase:"resolved"` confirms the fix. `valid:false` (still reproducing or inconclusive) is a **hard stop**: the fix did not resolve the root cause — return to Step 3. The runner re-runs the immutable locked snapshot, so a sha256-mismatch error means the probe was altered — re-`record_repro_probe` from the original probe.
 3. **Check predictor's similar_issues** - fix those too if relevant
 4. **Create commit** with clear description of fix and root cause
 5. **Write a run health report** with the terminal status that matches the verified debug outcome:
@@ -286,16 +372,16 @@ This is **completely optional**. Run it when debugging patterns are valuable for
 ## MCP Tools for Debugging
 
 - `mcp__sequential-thinking__sequentialthinking` - Complex root cause analysis
-- `mcp__deepwiki__ask_question` - Learn from how others solved similar issues
 
-## Critical Constraints
+## Debugging Constraints
 
-- **ALWAYS identify root cause** before implementing fixes
-- **NEVER skip testing** after applying fixes
-- **ALWAYS check for similar issues** in other parts of codebase
-- **Use Task tool** to call all subagents
+- Identify the root cause before implementing fixes.
+- **Prove the root cause with an executable probe BEFORE any fix** (`record_repro_probe` must witness exit 42); **verify the same probe flips to exit 0 after the fix** (`verify_repro_resolved`). See Step 2.5 — the gate is a hard stop, never skipped silently.
+- Test after applying fixes.
+- Check for similar issues in other parts of the codebase when Predictor flags them or the root cause pattern is reusable.
+- Use the Task tool to call the specialized subagents in the sequence above.
 
-## Example
+## Examples
 
 User says: `/map-debug TypeError in authentication middleware`
 
@@ -310,12 +396,9 @@ You should:
 Begin debugging now.
 
 
-## Examples
-
-```
-/map-debug <typical args>
-```
-
 ## Troubleshooting
 
-- **Issue:** Workflow doesn't behave as expected. **Fix:** Re-read the section above titled 'What this command CANNOT do' (if present) and ensure prerequisites are met. Run `/map-resume` to recover from interruptions.
+- **Issue:** A fix is applied before the root cause is identified. **Fix:** Stop and return to investigation — the repro-probe gate (Step 2.5) requires `record_repro_probe` to witness exit 42 BEFORE any fix.
+- **Issue:** `verify_repro_resolved` returns `valid:false` after the fix. **Fix:** Hard stop — the probe still reproduces (exit 42) or is inconclusive, so the root cause is not resolved. Iterate the fix and re-verify; do not commit. A sha256-mismatch reason means the locked probe was altered — re-`record_repro_probe` from the original.
+- **Issue:** The same bug pattern may exist elsewhere. **Fix:** Check sibling code when Predictor flags it or the root cause is reusable (see "Debugging Constraints").
+- **Issue:** The session was interrupted mid-workflow. **Fix:** Run `/map-resume` to recover.

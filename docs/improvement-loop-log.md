@@ -1,3 +1,70 @@
+## 2026-05-20 - Clean-room retry and context quarantine for failed agent iterations [2605.08563]
+
+- Decision: `implemented`
+- Branch: `codex/2605-08563-clean-retry`
+- Baseline: `/map-efficient`, `/map-task`, and `/map-debug` carried Monitor feedback forward through repeated Actor retries, while `run_health_report.json` only recorded retry counts. Repeated failures could therefore reuse rejected implementation momentum without a durable clean-room boundary.
+- Forward Change: Repeated Monitor rejection now marks `clean_retry_required`, writes `.map/<branch>/retry_quarantine.json`, validates the quarantine artifact before the next clean Actor attempt, updates run-health clean vs ordinary retry counters, and surfaces quarantine paths during `/map-resume`.
+- Decisive Validation: Focused retry, run-health, schema, and template-sync tests cover serial retry, wave retry, quarantine validation, and generated template parity. Generated-project smoke exercised installed `.map/scripts/map_orchestrator.py` and `.map/scripts/map_step_runner.py`, validated `retry_quarantine.json`, wrote `run_health_report.json`, and inspected clean-retry counters plus artifact presence.
+- Next Trigger: Reuse this when changing Actor->Monitor retry behavior, retry counters, resume diagnostics, or any workflow prompt that tells Actor to retry after validation failure.
+- Reusable Learnings:
+  - command: `pytest tests/test_map_orchestrator.py::TestMonitorFailed tests/test_map_orchestrator.py::TestWaveMonitorFailed tests/test_map_step_runner.py::test_build_retry_quarantine_writes_valid_artifact tests/test_artifact_schemas.py::test_validate_retry_quarantine_schema tests/test_template_sync.py -v`
+  - invariant: `After the second Monitor rejection for a subtask, the next Actor attempt must use clean retry context from retry_quarantine.json instead of raw failed-session context.`
+  - review-check: `When adding retry isolation fields, verify step_state.json, retry_quarantine.json, run_health_report.json, shipped skills, templates, schemas, and resume briefing stay aligned.`
+
+## 2026-05-20 - Compact `/map-resume` Recovery Skill Body [2604.033-1]
+
+- Decision: `implemented`
+- Branch: `codex/2604-033-resume-skill-lifecycle`
+- Baseline: Claude Code's official skill docs say invoked skill content stays in context and recommend concise `SKILL.md` bodies with supporting files; `/map-resume` is specifically used after context exhaustion, but its active body still carried 504 lines including low-frequency examples, state-file examples, token-budget notes, and troubleshooting.
+- External Docs: Claude Code skills docs, https://docs.anthropic.com/en/docs/claude-code/skills, accessed 2026-05-20; applied rules: invoked skill content stays in context, compaction reattaches recent skill invocations within a limited token budget, supporting files should hold detailed reference material, and `SKILL.md` should stay focused.
+- Forward Change: Moved the low-frequency material into `.claude/skills/map-resume/resume-reference.md`, kept the active recovery path in `SKILL.md`, synced the template copy, updated docs, and split the parent plan into future high-traffic workflow playbook and retained-body lint slices.
+- Decisive Validation: Focused skill lifecycle regression checks both source and template copies for the compact `/map-resume` body and supporting reference. Generated-project smoke inspected installed `.claude/skills/map-resume/SKILL.md` and `resume-reference.md` so the installed recovery workflow matches the repo surface.
+- Next Trigger: Reuse this when a task skill is invoked after compaction, `/clear`, or long-running workflow interruption and contains examples/troubleshooting that do not need to stay in the active body.
+- Reusable Learnings:
+  - command: `pytest tests/test_skills.py::TestSkillStructure::test_map_resume_keeps_recovery_skill_body_compact tests/test_template_sync.py -v`
+  - invariant: `Recovery skills should keep the active SKILL.md body focused on checkpoint detection and next action; move low-frequency examples, state-shape references, token notes, and troubleshooting into bundled supporting files.`
+  - review-check: `When externalizing skill content, verify local Markdown links resolve, supporting files are template-synced, and generated-project smokes inspect both the compact SKILL.md and the supporting file.`
+
+## 2026-05-19 - Reviewer Prompt Budget Enforcement [2604.023-2]
+
+- Decision: `implemented`
+- Branch: `codex/2604-023-review-prompt-budget`
+- Baseline: `/map-review` already persisted a primary review bundle and separated it from raw diff with XML prompt envelopes, but reviewer fan-out still asked the operator to paste unbounded bundle/diff text into each Monitor, Predictor, and Evaluator prompt.
+- Forward Change: Added `build_review_prompts` to the runtime helper and shipped template copy, wired `/map-review` to call it before Task fan-out, kept the review bundle primary, clipped lower-priority raw diff first under `MAP_REVIEW_PROMPT_BUDGET_TOKENS`, and documented the review prompt budget boundary.
+- Decisive Validation: Focused prompt-builder tests and a synthetic old/new reviewer A/B test prove oversized raw diffs are clipped while bundle evidence, XML envelope shape, reviewer instructions, and expected output contracts survive. A generated-project smoke ran the installed helper against an oversized review bundle plus real git diff and confirmed the prompt stayed under 1,500 estimated tokens with `git diff` clipped.
+- Review Result: Inline diff review checked source/template sync, prompt-envelope preservation, review-bundle priority, docs/plan consistency, and the new CLI surface; no blocking issues remained before commit.
+- Next Trigger: Reuse this learning whenever a MAP workflow fans out long branch artifacts into multiple reviewer or verifier prompts.
+- Reusable Learnings:
+  - command: `python3 .map/scripts/map_step_runner.py build_review_prompts --budget-tokens 1500 --review-preferences "Flag correctness first."`
+  - invariant: `/map-review` reviewer prompts must keep the persisted review bundle as primary context and clip raw diff before bundle text whenever prompt budgeting is required.
+  - review-check: `For prompt-budget changes, include an old/new A/B test that proves the old prompt exceeds the target while the new prompt preserves task/instruction/output-contract sections under budget.`
+
+## 2026-05-19 - Actor Context Block Token Budget Enforcement [2604.023-1]
+
+- Decision: `implemented`
+- Branch: `codex/2604-023-context-budget`
+- Baseline: `build_context_block()` assembled current subtask, dependency results, plan overview, and repo delta as an unbounded string; long plans could silently crowd out the active Actor prompt even though MAP already exposed transcript-level compaction nudges.
+- Forward Change: Added deterministic estimated-token helpers, enforced a default 4,000-token cap for generated Actor `<map_context>` blocks, prioritized current-subtask and dependency summaries over broad overview text, preserved valid XML shape with a truncation note, synced the template helper copy, and documented the `MAP_CONTEXT_BLOCK_BUDGET_TOKENS` override.
+- Decisive Validation: Focused token-budget and context-block tests prove oversized multi-subtask contexts stay within the configured budget while preserving current-task and dependency evidence. Template sync verifies generated projects receive the runner change. Generated-project smoke and broader validation are recorded in the PR evidence.
+- Review Result: Inline diff review checked source/template parity, current-context preservation, dependency-summary ordering, and docs/plan consistency; no blocking issue remained after reducing file-list caps so dependency summaries survive tight budgets.
+- Next Trigger: Reuse this learning whenever a generated prompt helper assembles branch artifacts into a model-facing context block.
+- Reusable Learnings:
+  - command: `pytest tests/test_token_budget.py tests/test_map_step_runner.py::TestBuildContextBlock -v`
+  - invariant: `Generated prompt context builders must preserve valid envelope shape and prioritize current-task/dependency evidence before broad plan overview when clipping to a budget.`
+  - review-check: `When adding prompt budget enforcement, test the forced-truncation path with a small configured budget rather than only asserting normal-sized prompts still render.`
+
+## 2026-05-19 - Clean-session TEST->CODE handoff for TDD workflows [2604.036]
+
+- Decision: `rejected`
+- Branch: `codex/2604-036-close-tdd-handoff`
+- Baseline: The active plan still described split-session TDD as missing, but the current product already has targeted TDD red-phase handoff artifacts and `/map-task` resume behavior.
+- Forward Change: Removed the stale active plan section and recorded the exact `[2604.036]` heading in `docs/improvement-done.md` with runtime, template, docs, roadmap, and regression-test evidence.
+- Decisive Validation: Focused TDD handoff/resume tests and template sync passed; a repo-built generated-project smoke confirmed installed `/map-tdd` and `/map-task` expose the contract handoff and resume paths; `make lint` and `pytest -m "not slow"` passed; the idea indexer confirmed `2604.036` is now done-only. Full `pytest` was attempted and hit the cumulative live SDK boundary after surfacing transient plan/efficient results; the surfaced plan and efficient tests passed on rerun, the live SDK module passed through review E2E before its cumulative timeout, and the final full-flow boundary passed individually.
+- Review Result: Inline diff review found no blocking issues; the diff is ledger-only, the roadmap already marks targeted TDD handoff as shipped, and the generated-project smoke supports the installed-user evidence claimed in the done entry.
+- Next Trigger: Reuse this learning whenever an active plan item describes a workflow behavior already shipped in a targeted mode rather than the broad mode originally proposed.
+- Reusable Learnings:
+  - review-check: `Before implementing a broad workflow-mode item, inspect whether the highest-payoff targeted mode already shipped the promised user journey and close the stale parent with evidence instead of rebuilding it.`
+
 ## 2026-05-18 - Command-specific thinking and parallelism profiles [2604.029]
 
 - Decision: `implemented`
@@ -244,3 +311,105 @@
   - command: `uv run --no-sync mapify init <new-dir> --no-git --mcp none`
   - invariant: `If shipped skills link to .claude/references files, the matching src/mapify_cli/templates/references files must exist, be byte-identical, and be covered by template-sync tests.`
   - review-check: `When a plan item mixes user-visible prompt behavior with future generic lint tooling, close only the shipped behavior and leave the lint rule as a child follow-up.`
+## 2026-05-18 - Claude 4.6 command simplification and verb calibration [2604.025]
+
+- Decision: `implemented`
+- Branch: `codex/2604-025-prompt-calibration`
+- PR: `https://github.com/azalio/map-framework/pull/129`
+- Baseline: MAP task skills still contained older prompt patterns such as `ABSOLUTELY FORBIDDEN`, `STRICTLY PROHIBITED`, `CRITICAL: ALWAYS`, and generic `YOU MUST:` blocks in non-release workflows. Anthropic's current prompt guidance says Claude 4.5/4.6-era prompts can overtrigger tools and subagents when older undertriggering workarounds remain in place.
+- Forward Change: Replaced non-release blanket prohibition blocks with targeted workflow guardrails, added explicit `When Not To Expand Scope` clauses to lightweight/resume/single-subtask skills, preserved real hard stops in `/map-release`, synced templates, and added a scanner that rejects the banned blanket prohibition phrases outside release safety.
+- Decisive Validation: Focused prompt-tone and template-sync tests passed, `make lint` passed, `pytest -m "not slow"` passed, and generated-project `uv run --no-sync mapify init ... --no-git --mcp none` emitted calibrated skill prompts. Full `pytest` was attempted and reached the live Claude SDK review boundary after plan/efficient live tests passed; the timed-out review boundary then passed both individually and as the full `TestMapReviewE2E` class.
+- Next Trigger: Reuse this learning whenever editing `.claude/skills/map-*/SKILL.md`, shipped template skill copies, or workflow prompt wording that could affect subagent/tool triggering.
+- Reusable Learnings:
+  - command: `pytest tests/test_skills.py::TestPromptToneCalibration tests/test_template_sync.py -v`
+  - command: `uv run --no-sync mapify init <new-dir> --no-git --mcp none`
+  - invariant: `Non-release MAP task skills should use targeted guardrail wording and explicit scope off-ramps; reserve blanket all-caps prohibition blocks for irreversible release/tag safety.`
+  - review-check: `When changing prompt tone, verify required workflow gates remain semantically explicit even if CRITICAL/MUST/NEVER wording is reduced.`
+
+## 2026-05-19 - Context-first XML envelopes for slash commands [2604.026]
+
+- Decision: `implemented`
+- Branch: `codex/2604-026-xml-envelopes`
+- PR: `https://github.com/azalio/map-framework/pull/131`
+- Baseline: High-context MAP skills mixed persisted artifacts, user requests, workflow policy, and output schemas in ad hoc markdown inside subagent prompts. `/map-review` in particular passed the review bundle, review preferences, and git diff as inline prose, so future edits could accidentally move long artifacts below instructions or blur primary bundle context with secondary diff context.
+- Forward Change: Added `.claude/references/map-xml-prompt-envelopes.md` and the shipped template copy, then applied the artifact-first envelope to `/map-plan`, `/map-efficient`, `/map-debug`, and `/map-review`. The change preserved existing MAP semantic tags such as `<MAP_Contract>` and `<map_context>` while wrapping larger prompt inputs in `<documents>` before `<task>`, `<workflow_policy>` or `<instructions>`, and `<expected_output>`.
+- Decisive Validation: Focused XML envelope tests scan both `.claude/skills/` and `src/mapify_cli/templates/skills/` for the reference link and required tags. The generated-project smoke confirmed `mapify init` emits the new reference and XML tags in installed skills. `make lint`, `pytest -m "not slow"`, the timed-out live SDK boundary test, live `/map-review` E2E, and live full-flow E2E passed. Full `pytest` and full live SDK module runs both hit the 30-minute tool timeout at the same cumulative boundary, with no deterministic failure before timeout.
+- Next Trigger: Reuse this learning whenever changing MAP skill prompts that pass specs, review bundles, diffs, logs, current-subtask context, or other large artifacts into subagents.
+- Reusable Learnings:
+  - command: `pytest tests/test_skills.py::TestXMLPromptEnvelopeContracts tests/test_template_sync.py::TestReferenceTemplateSynchronization -v`
+  - command: `uv run --no-sync mapify init <new-dir> --no-git --mcp none`
+  - invariant: `High-context MAP skill prompts should put long artifacts in <documents> before task/instructions/output schema and keep source/template skill copies byte-synced.`
+  - gotcha: `Existing prompt contract tests may assert marker phrases such as Written Files; XML refactors must preserve those explicit markers inside the tagged document content.`
+  - review-check: `When changing /map-review reviewer prompts, verify the review bundle remains the primary tagged document and raw diff remains secondary.`
+
+## 2026-05-19 - Compile-time skill IR and anti-injection audit for provider surfaces [2605.221]
+
+- Decision: `implemented`
+- Branch: `codex/2605-221-skill-ir-audit`
+- PR: `https://github.com/azalio/map-framework/pull/132`
+- Baseline: MAP shipped Claude and Codex provider skills as hand-authored Markdown templates. Existing tests covered frontmatter, trigger rules, prompt tone, JSON contracts, links, and template sync, but there was no single typed representation that could parse every shipped `SKILL.md`, record content hashes, and fail unsafe provider-surface drift before `mapify init` installed the files into user repos.
+- Forward Change: Added `src/mapify_cli/skill_ir.py` with a `SkillIR` dataclass, parser, audit findings, supporting-file/link validation, hidden instruction-override phrase detection, deterministic content hashes, and a CLI entry point. Added focused tests that parse all shipped Claude and Codex template skills, reject missing references, reject unsupported frontmatter, reject injection-like instructions, and verify the CLI exits non-zero on findings.
+- Decisive Validation: Focused Skill IR tests passed, the audit command returned no findings for both shipped provider skill roots, focused skill/template sync regressions passed, `make lint` passed, `pytest -m "not slow"` passed, generated Claude and Codex `mapify init` smokes emitted the expected skill trees, and the full `pytest` attempt reached live review E2E before the 30-minute tool timeout; the timed-out review boundary test passed when rerun directly.
+- Next Trigger: Reuse this when changing `SKILL.md` templates, adding new provider skill roots, changing supported frontmatter, or adding a future generated-skill emitter.
+- Reusable Learnings:
+  - command: `PYTHONPATH=src python -m mapify_cli.skill_ir src/mapify_cli/templates/skills src/mapify_cli/templates/codex/skills --format json`
+  - invariant: `When changing provider skill templates, parse both Claude and Codex SKILL.md trees into SkillIR so content hashes, frontmatter shape, references, and injection-like text are validated together.`
+  - gotcha: `Claude skill Markdown references can legitimately point outside the skill folder to sibling bundled references such as ../../references/*.md, so audits should allow links inside the provider bundle root rather than only inside the individual skill directory.`
+  - review-check: `When adding static provider-surface audits, verify they cover generated-template roots and do not only inspect repo-local .claude skills.`
+
+## 2026-05-20 - Budget Decision Artifact for Active Prompt Paths [2604.023-3]
+
+- Decision: `implemented`
+- Branch: `codex/2604-023-budget-artifact`
+- Baseline: Actor and review prompt builders enforced deterministic budgets, but users had to inspect prompt text or transcripts to know which active prompt path clipped context and which budget to adjust.
+- Forward Change: The active Actor context and `/map-review` prompt builders now append compact decisions to `.map/<branch>/token_budget.json` and record a `token_budget` manifest stage, while docs explain how operators use the report to continue, raise a budget, or split a workflow.
+- Decisive Validation: Focused Actor/review prompt tests assert token-budget decisions, clipped sections, and manifest stage updates. A generated-project smoke ran installed `.map/scripts/map_step_runner.py build_context_block` and `build_review_prompts --branch default --budget-tokens 1500` against real branch artifacts plus a real git diff, then inspected `.map/default/token_budget.json` for all four active prompt-path decisions.
+- Next Trigger: Reuse this learning whenever a MAP prompt path clips context, adds a new budgeted prompt builder, or needs an operator-facing diagnostic artifact for a current workflow decision.
+- Reusable Learnings:
+  - command: `python3 .map/scripts/map_step_runner.py build_review_prompts --branch <branch> --budget-tokens <n> --review-preferences "..."`
+  - invariant: `Only active prompt builders that already enforce budgets should write token_budget.json decisions; do not add telemetry for dormant context mechanisms before activation evidence exists.`
+  - gotcha: `Generated-project review prompt smokes should pass --branch when the desired .map branch differs from git's current branch name.`
+  - review-check: `When adding prompt-budget artifacts, verify the artifact names clipped sections and source artifacts, not only before/after token counts.`
+## 2026-05-20 - Compact high-traffic workflow playbooks [2604.033-2]
+
+- Decision: `implemented`
+- Branch: `codex/2604-033-2-compact-playbooks`
+- PR: `https://github.com/azalio/map-framework/pull/138`
+- Baseline: The high-traffic workflow skills `/map-plan`, `/map-efficient`, `/map-check`, and `/map-review` each carried hundreds of lines of active instructions, examples, troubleshooting, and low-frequency reference material. Official Claude Code skill docs say invoked `SKILL.md` content stays in context and compaction reattaches recent skill invocations within a limited budget, so large active bodies increase recurring context cost for the workflows users run most.
+- Forward Change: Moved low-frequency examples, troubleshooting, detailed rationale, command matrices, wave details, and section rubrics into bundled supporting files while keeping mandatory next-action flow, state-machine commands, output contracts, run-health closeout, review bundle wiring, and handoff flows in each active `SKILL.md`.
+- Decisive Validation: Focused skill/template tests passed, generated-project smoke confirmed installed high-traffic skills were <=500 lines and included supporting references, `make lint` passed, `pytest -m "not slow"` passed, and Skill IR audit found no provider-surface findings.
+- Next Trigger: Reuse this when a task skill used in normal workflows grows beyond 500 lines, or when examples/troubleshooting/rationale start living in invoked `SKILL.md` instead of supporting files.
+- Reusable Learnings:
+  - command: `pytest tests/test_skills.py::TestSkillStructure::test_high_traffic_workflow_skills_keep_active_bodies_compact tests/test_template_sync.py -v`
+  - command: `uv run --no-sync mapify init <new-dir> --no-git --mcp none`
+  - invariant: `High-traffic workflow SKILL.md files should keep active next-action flow under 500 lines and link bundled supporting files for examples/troubleshooting/reference material.`
+  - review-check: `When compacting task skills, verify source and template SKILL.md files still preserve state-machine commands, output contracts, closeout artifact writes, and prompt-contract markers before moving detail into references.`
+  - gotcha: `Tests that assert a command appears before first Task( can fail if prose mentions Task( earlier than the real launch; keep literal launch markers out of preflight prose.`
+
+## 2026-05-20 - Constraint-first provider rule templates [2604.040]
+
+- Decision: `implemented`
+- Branch: `codex/2604-040-constraint-provider-rules`
+- Baseline: The active plan identified that generated provider rules lacked a structural guardrail against broad positive write directives. Claude write-capable surfaces already had scattered scope wording, but there was no uniform installed-project constraint that blocked unrelated edits, dependency churn, or neighboring refactors at mutation boundaries.
+- Forward Change: Added `Mutation Boundary Constraints` to the Actor agent, `/map-fast`, `/map-efficient`, `/map-task`, `/map-debug`, `.codex/AGENTS.md`, and Codex `$map-fast`, then synced the shipped templates. The constraints require agents to report dependency changes, broad refactors, or scope expansion as blockers/tradeoffs instead of doing them silently.
+- Decisive Validation: Focused prompt regression tests now scan source and shipped Claude/Codex provider surfaces for the mutation-boundary section and required unrelated-file/dependency/refactor/blocker phrases. Generated-project smokes inspected installed `.claude/` files, root `AGENTS.md` for Codex, and `.codex/skills/map-fast/SKILL.md`.
+- Validation Boundary: `pytest` and `pytest tests/integration/test_e2e_claude_sdk.py -v -m slow` were both attempted and exceeded the 30-minute tool timeout without a deterministic failure message. Deterministic validation passed via `make lint`, `pytest -m "not slow"`, focused skill/template tests, no-LLM e2e artifact tests, Skill IR audit, and generated-project smokes.
+- Next Trigger: Reuse this when adding a write-capable provider surface, changing Actor/fix prompts, or introducing any prompt that says to apply edits directly.
+- Reusable Learnings:
+  - command: `pytest tests/test_skills.py::TestSkillStructure::test_write_capable_claude_surfaces_have_constraint_first_boundaries tests/test_skills.py::TestSkillStructure::test_write_capable_codex_surfaces_have_mutation_boundaries -v`
+  - command: `uv run --no-sync mapify init <new-dir> --no-git --mcp none`
+  - invariant: `Every write-capable provider surface should include Mutation Boundary Constraints that block unrelated edits, dependency changes, and neighboring refactors unless the current contract explicitly requires them.`
+  - review-check: `When a prompt says Actor/fix/apply_patch should edit files directly, verify the same prompt or its enclosing skill tells the agent to report required scope expansion as a blocker/tradeoff.`
+## 2026-05-20 - Clean-room retry and context quarantine [2605.08563]
+
+- Decision: `implemented`
+- Branch: `codex/2605-08563-clean-retry`
+- PR: `pending`
+- Baseline: Repeated Monitor failures fed feedback back into Actor without a clean-room context boundary, so rejected approaches could carry forward while run health only exposed retry counts.
+- Forward Change: Repeated Monitor rejection now writes `retry_quarantine.json`, marks `clean_retry_required` in step state, validates the quarantine artifact, surfaces clean/ordinary retry counters in `run_health_report.json`, and tells resume/Actor prompts not to rehydrate raw failed context.
+- Decisive Validation: Focused retry/schema/template tests passed; generated-project smoke exercised installed `map_orchestrator.py` and `map_step_runner.py`, validated `retry_quarantine.json`, wrote `run_health_report.json`, and inspected `clean_retry_count` plus retry-quarantine artifact presence.
+- Next Trigger: Read these learnings before changing Actor->Monitor retry logic, run-health retry signals, resume diagnostics, or workflow prompts that describe retries after validation failure.
+- Reusable Learnings:
+  - command: `python3 .map/scripts/map_step_runner.py validate_retry_quarantine`
+  - invariant: `After the second Monitor rejection for a subtask, the next Actor attempt must use clean retry context from retry_quarantine.json instead of raw failed-session context.`
+  - review-check: `When adding retry isolation fields, verify step_state.json, retry_quarantine.json, run_health_report.json, shipped skills, templates, schemas, and resume briefing stay aligned.`

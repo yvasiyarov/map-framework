@@ -50,23 +50,19 @@ Before starting the release process, verify all requirements are met:
 ### 1. Code Quality Checks
 
 ```bash
-# Run full CI/CD test suite locally
-pytest tests/ --cov=src/mapify_cli --cov-report=term-missing
-
-# Run linters
-black src/ tests/ --check
-ruff check src/ tests/
-mypy src/
+# Run the maintained CI/CD gate locally
+make check
 
 # Verify package builds successfully
-python -m build
-twine check dist/*
+uv run --with build python -m build
+uv run --with twine twine check dist/*
 ```
 
 **Expected Results**:
 - ✅ All tests pass (100% success rate)
 - ✅ No linting errors
 - ✅ Type checking passes
+- ✅ Rendered templates are up to date
 - ✅ Package builds without errors
 - ✅ `twine check` reports no issues
 
@@ -403,11 +399,12 @@ If `--force` is undesirable, the minimum manual steps are:
    `src/mapify_cli/templates/map/scripts/map_step_runner.py` to pick up
    `create_review_bundle()` and `prepare_detached_review()`.
 2. Overwrite `.claude/skills/map-review/SKILL.md` (and the Codex mirror at
-   `.codex/skills/map-review/SKILL.md` if applicable) so the skill invokes the
-   bundle helpers and surfaces the `--detached` flag.
-3. Re-run `make sync-templates` (or `scripts/sync-templates.sh`) inside the
-   MAP repo if you maintain a fork — the synchronisation gate is enforced by
-   `pytest tests/test_template_sync.py`.
+   `.agents/skills/map-review/SKILL.md`, plus its `review-reference.md` and
+   `adversarial-reference.md` siblings) so the skill invokes the bundle
+   helpers and surfaces the `--detached` flag.
+3. Re-run `make render-templates` inside the MAP repo if you maintain a fork —
+   the render parity gate is enforced by `make check-render` and
+   `pytest tests/test_template_render.py`.
 
 After upgrading, the first `/map-review` invocation will materialise
 `.map/<branch>/review-bundle.json` and `.md`; subsequent reviews read the

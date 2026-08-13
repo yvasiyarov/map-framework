@@ -1,5 +1,106 @@
 # MAP Framework Improvement Done
 
+## Clean-room retry and context quarantine for failed agent iterations [2605.08563]
+
+- Date: 2026-05-20
+- Added clean-room retry isolation to the Actor->Monitor failure path: the first Monitor rejection remains an ordinary feedback retry, while the second or later rejection for the same subtask marks `retry_isolation=clean_retry_required`, increments clean retry counters, and writes `.map/<branch>/retry_quarantine.json`.
+- The quarantine artifact records the subtask, retry count, compact Monitor rejection summary, do-not-repeat guidance, preserved constraints, required evidence, and source artifact references so the next Actor attempt can change approach without dropping `blueprint.json` hard constraints, acceptance tags, or mutation boundaries.
+- Extended `run_health_report.json` resiliency signals with `clean_retry_count`, `contaminated_retry_count`, and `retry_isolation_status`, plus retry-quarantine artifact inventory, so interrupted or blocked workflows expose whether a retry was isolated.
+- Wired `/map-efficient`, `/map-task`, `/map-debug`, and `/map-resume` to validate or build retry quarantine artifacts before clean retries, and synced the shipped template copies so generated projects receive the same retry boundary.
+- Added schema support for retry quarantine artifacts and focused regression coverage for serial retries, wave retries, run-health counters, quarantine validation, and source/template sync.
+
+## Constraint-first provider rule templates [2604.040]
+
+- Date: 2026-05-20
+- Added `Mutation Boundary Constraints` to write-capable Claude provider surfaces: `.claude/agents/actor.md`, `/map-fast`, `/map-efficient`, `/map-task`, and `/map-debug`, plus the shipped template copies.
+- Added matching Codex constraints to `.codex/AGENTS.md` and `$map-fast`, plus the shipped template copies, so installed Codex projects get the same unrelated-edit/dependency-change boundary.
+- The constraints tell agents not to edit unrelated files, add/remove/upgrade dependencies, or refactor neighboring code unless the current task/subtask explicitly requires it; required scope expansion must be reported as a blocker/tradeoff instead of done silently.
+- Added regression tests that scan source and generated Claude/Codex provider surfaces for the mutation-boundary section and required phrases before release.
+- Updated README, usage, and architecture docs to describe the installed-user behavior and maintainer guardrail.
+- Verified with focused mutation-boundary prompt tests, full skill/template-sync tests, generated Claude and Codex `mapify init` smokes that inspected installed provider files, Skill IR audit, `make lint`, `pytest -m "not slow"`, and no-LLM e2e artifact tests. Full `pytest` and the slow Claude SDK module were attempted, but each exceeded the 30-minute tool timeout without a deterministic failure message.
+
+## Compact high-traffic workflow playbooks [2604.033-2]
+
+- Date: 2026-05-20
+- Compactified the high-traffic workflow skill bodies for `/map-plan`, `/map-efficient`, `/map-check`, and `/map-review`, reducing active `SKILL.md` sizes to 301, 295, 295, and 302 lines respectively while preserving required phase headings, state-machine commands, output contracts, run-health closeout, review bundle wiring, and handoff flows.
+- Moved low-frequency examples, troubleshooting, detailed rationale, command matrices, wave details, and reference notes into bundled supporting files: `plan-reference.md`, `efficient-reference.md`, `check-reference.md`, and `review-reference.md`.
+- Synced the `.claude/skills/` changes into shipped templates so generated projects receive the same compact active playbooks and bundled references.
+- Added regression coverage that enforces active high-traffic workflow skill bodies stay under 500 lines, link their supporting reference, and ship source/template supporting files.
+- External documentation checked: Claude Code skills docs, https://docs.anthropic.com/en/docs/claude-code/skills, accessed 2026-05-20; relevant constraints are that invoked `SKILL.md` content stays in context, compaction reattaches recent skill invocations within a limited token budget, supporting files should hold detailed reference material, and `SKILL.md` should stay focused.
+
+## Compact `/map-resume` Recovery Skill Body [2604.033-1]
+
+- Date: 2026-05-20
+- Moved `/map-resume` low-frequency example transcripts, integration notes, state-file shape examples, token-budget notes, and troubleshooting into bundled `resume-reference.md` so the invoked recovery `SKILL.md` stays focused on checkpoint detection, briefing, confirmation, and state-machine continuation.
+- Reduced the active `/map-resume` skill body from 504 lines to 305 lines while preserving required Examples and Troubleshooting navigation sections plus links to the supporting reference.
+- Added regression coverage that scans both `.claude/skills/map-resume/` and the shipped template copy so recovery skill growth and missing supporting references fail before release.
+- External documentation checked: Claude Code skills docs, https://docs.anthropic.com/en/docs/claude-code/skills, accessed 2026-05-20; relevant constraints are that invoked `SKILL.md` content stays in context, compaction reattaches recent skill invocations within a limited token budget, supporting files should hold detailed reference material, and `SKILL.md` should stay focused.
+- Updated README, usage, and architecture docs to describe the compact recovery surface, and updated the active plan parent with follow-up slices for high-traffic workflow playbooks and retained-body linting.
+
+## Budget Decision Artifact for Active Prompt Paths [2604.023-3]
+
+- Date: 2026-05-20
+- Added `.map/<branch>/token_budget.json` generation to the two active budgeted prompt paths: `/map-efficient` Actor `<map_context>` building and `/map-review` Monitor/Predictor/Evaluator prompt fan-out.
+- Each decision records the prompt path name, configured budget, estimated tokens before/after enforcement, budget action, clipped section labels, source artifact references, and path-specific metadata such as role, current subtask, and budget environment variable.
+- Added a `token_budget` artifact-manifest stage and `TOKEN_BUDGET_REPORT_SCHEMA` so generated projects have a machine-readable operator breadcrumb for deciding whether to continue, raise `MAP_CONTEXT_BLOCK_BUDGET_TOKENS` / `MAP_REVIEW_PROMPT_BUDGET_TOKENS`, or split the workflow.
+- Updated README, usage, and architecture docs to describe the operator flow while keeping the artifact limited to already-active prompt builders, not dormant REGISTRY/FOCUS mechanisms.
+- Verified with focused Actor/review prompt budget tests, token-budget schema tests, template-sync coverage, and a generated-project smoke that created both Actor and review prompt decisions from real branch artifacts plus a real git diff.
+
+## Reviewer Prompt Budget Enforcement [2604.023-2]
+
+- Date: 2026-05-19
+- Added `build_review_prompts` to `.map/scripts/map_step_runner.py` and the shipped template copy so `/map-review` builds separate bounded Monitor, Predictor, and Evaluator prompts from the persisted review bundle, review preferences, and raw `git diff` before fan-out.
+- Each reviewer prompt now defaults to a 12,000 estimated-token cap via `MAP_REVIEW_PROMPT_BUDGET_TOKENS`, preserves reviewer task/instruction/output-contract XML envelope sections, keeps `.map/<branch>/review-bundle.md` as the primary context, clips lower-priority raw diff context first, and emits a `Review Prompt Budget` diagnostic document when clipping occurs.
+- Updated `/map-review` skill wiring and shipped template copy to call the prompt builder before Task fan-out, plus README, usage, architecture, and roadmap docs so installed projects expose the new review budget boundary.
+- Verified with focused prompt-builder tests, a synthetic old/new reviewer A/B test proving the new prompt stays under budget while the old inline prompt exceeds it, skill/template-sync tests, lint, and a generated-project smoke that created an oversized review bundle and raw diff then confirmed the installed helper preserved the primary bundle sentinel while clipping the diff tail.
+
+## Actor Context Block Token Budget Enforcement [2604.023-1]
+
+- Date: 2026-05-19
+- Added deterministic estimated-token helpers to `src/mapify_cli/token_budget.py` and wired generated `.map/scripts/map_step_runner.py` `build_context_block()` output through a hard budget gate.
+- The generated Actor `<map_context>` path now defaults to a `4000` estimated-token cap, honors `MAP_CONTEXT_BLOCK_BUDGET_TOKENS` for explicit override, keeps current-subtask identity and dependency summaries ahead of broad plan overview text, and emits a `# Context Budget` truncation note while preserving a closed `</map_context>` tag.
+- Field check against `/Users/azalio/gitroot/src.yandex.cloud` found 8 current-format MAP runs and 63 sampled subtask contexts; the largest generated Actor `<map_context>` was ~1,255 estimated tokens, while raw artifacts in the same tree reached ~16,013-token `blueprint.json`, ~13,240-token review bundle, and ~11,819-token task plan sizes. This confirms the shipped Actor path is compact on real runs and that remaining risk sits in other prompt paths that may consume raw artifacts.
+- Synced the shipped template helper copy, updated README, usage, architecture, and roadmap docs, and split the remaining umbrella budget work into active child slices for review prompt budgeting and budget-decision artifacts only after active prompt paths need them.
+- Verified with focused token-budget and context-block tests plus template-sync coverage; generated-project smoke and broader validation are recorded in the PR evidence.
+
+## Clean-session TEST->CODE handoff for TDD workflows [2604.036]
+
+- Date: 2026-05-19
+- Decision: rejected as an active-plan item because the clean-session TDD handoff path is already implemented for the targeted TDD workflow where it has the strongest user payoff.
+- Repo evidence: `.claude/skills/map-tdd/SKILL.md` and the shipped template copy define targeted TDD as `DECOMPOSE -> TEST_WRITER -> TEST_FAIL_GATE -> CONTRACT_HANDOFF -> STOP`, write `.map/${BRANCH}/test_contract_${SUBTASK_ID}.md`, call `record_test_contract_handoff`, mark the contract ready, and tell the user to resume implementation with `/map-task ST-001`.
+- Repo evidence: `.claude/skills/map-task/SKILL.md` and the shipped template copy detect `test_handoff_<subtask>.json` plus `test_contract_<subtask>.md` and call `resume_from_test_contract` so Actor starts from the persisted red-phase contract instead of re-running research or test authoring.
+- Repo evidence: `.map/scripts/map_orchestrator.py` and the shipped template copy implement `mark_contract_ready` and `resume_from_test_contract`; Actor instructions in TDD mode require code-only implementation and tell Actor to read the persisted contract artifacts before editing.
+- Repo evidence: `.map/scripts/map_step_runner.py` and the shipped template copy implement `record_test_contract_handoff`, write `test_handoff_<subtask>.json`, and record the `test_contract` stage in `artifact_manifest.json`.
+- Repo evidence: `tests/test_map_orchestrator.py::TestResumeFromTestContract`, `tests/test_map_step_runner.py::test_record_test_contract_handoff_creates_json_and_manifest`, README, `docs/USAGE.md`, `docs/ARCHITECTURE.md`, and `docs/roadmap.md` all cover or document the targeted clean-session handoff behavior.
+- No runtime change was needed; this loop removed the stale active backlog section so future loops do not rebuild the shipped targeted TDD contract handoff.
+
+## Compile-time skill IR and anti-injection audit for provider surfaces [2605.221]
+
+- Date: 2026-05-19
+- Added `src/mapify_cli/skill_ir.py`, a typed static audit layer that lowers shipped Claude and Codex `SKILL.md` files into `SkillIR` records with provider, name, invocation mode, allowed tools, supporting-file references, extracted safety constraints, and SHA-256 content hashes.
+- The audit exits non-zero for unsupported frontmatter, frontmatter/folder name mismatch, missing descriptions, unresolved bundled Markdown references, links escaping the provider bundle root, and hidden instruction-override phrases such as “ignore previous instructions.”
+- Added `python -m mapify_cli.skill_ir src/mapify_cli/templates/skills src/mapify_cli/templates/codex/skills` as the release validation command for hand-authored provider skill surfaces until a full generator is worth the migration.
+- Updated README, usage, architecture, and roadmap docs so maintainers know the Skill IR audit protects provider surfaces before `mapify init` installs them into user repos.
+- Verified with focused Skill IR tests, ruff on the new module/tests, focused skill/template regression tests, the Skill IR audit CLI, `make lint`, `pytest -m "not slow"`, and repo-built generated-project smokes that emitted both Claude and Codex skill trees. Full `pytest` was attempted after the final code changes and reached the live `/map-review` SDK boundary before the 30-minute tool timeout; the exact boundary test passed on rerun.
+
+## Context-first XML envelopes for slash commands [2604.026]
+
+- Date: 2026-05-19
+- Added a shared `.claude/references/map-xml-prompt-envelopes.md` reference, with the shipped template copy, documenting the artifact-first XML envelope pattern from Anthropic long-context/XML prompt guidance.
+- Updated `/map-plan`, `/map-efficient`, `/map-debug`, and `/map-review` high-context subagent prompts so long artifacts are wrapped in `<documents>` before `<task>`, workflow instructions, and `<expected_output>`.
+- Refactored `/map-review` reviewer fan-out prompts so the persisted review bundle, review preferences, and git diff are separate tagged documents, with the bundle explicitly primary and the diff secondary.
+- Updated README, usage, architecture, and roadmap docs, and added regression tests that scan both `.claude/skills/` and `src/mapify_cli/templates/skills/` for the XML envelope reference and required tags.
+- Verified with focused XML envelope/template-sync tests, `make lint`, `pytest -m "not slow"`, a repo-built `mapify init` smoke that inspected generated skill/reference output, the timed-out live SDK boundary test rerun, live `/map-review` E2E, and live full-flow E2E. Full `pytest` and the full live SDK module were attempted but exceeded the 30-minute tool timeout at the same cumulative live boundary without a deterministic failure; the exact boundary test passed individually.
+
+## Claude 4.6 command simplification and verb calibration [2604.025]
+
+- Date: 2026-05-18
+- Recalibrated shipped MAP skill prompts so non-release workflows use targeted guardrails and normal wording instead of blanket all-caps prohibition blocks. `/map-release` keeps explicit hard-stop language because tag pushes and PyPI publication are irreversible.
+- Added explicit `When Not To Expand Scope` clauses to `/map-fast`, `/map-check`, `/map-resume`, and `/map-task` so lightweight/resume/single-subtask flows stop at their intended boundary instead of adding extra research, planning, agents, or polish.
+- Tightened `/map-debug`, `/map-efficient`, `/map-tdd`, and `/map-plan` wording around required phases while preserving real gates for research, Monitor validation, blueprint metadata, TDD read-only test boundaries, and state-machine operations.
+- Synced `.claude/skills/` into shipped templates, updated README/usage/architecture/roadmap docs, and added prompt-tone regression coverage that rejects blanket prohibition blocks in non-release task skills.
+- Verified with focused prompt-tone/template-sync tests, `make lint`, `pytest -m "not slow"`, and a repo-built generated-project smoke that inspected emitted skill prompts. Full `pytest` was attempted and exceeded the 30-minute tool timeout at the live Claude SDK review boundary after plan/efficient live tests passed; the timed-out review test passed on rerun and the full `TestMapReviewE2E` class passed separately.
+
 ## Command-specific thinking and parallelism profiles [2604.029]
 
 - Date: 2026-05-18

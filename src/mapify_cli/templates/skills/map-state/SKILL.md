@@ -1,6 +1,6 @@
 ---
 name: map-state
-version: "1.0.0"
+version: "3.1.0"
 description: >-
   Branch-scoped MAP planning in `.map/`. Use when the user needs a
   persistent task plan, progress tracking, or resume support across
@@ -44,14 +44,15 @@ All files reside in `.map/<branch>/` directory with branch-based naming:
 .map/
 └── <branch>/
     ├── task_plan_<branch>.md    # Primary plan with phases and status
-    ├── findings_<branch>.md     # Research findings, decisions, key files
+    ├── research/
+    │   └── plan__discovery.md   # Plan-scope research, decisions, key files
     ├── progress_<branch>.md     # Action log, errors, test results
     ├── step_state.json          # Canonical orchestrator step + subtask state
 ```
 
 **Example**: On branch `feature-auth`:
 - `.map/feature-auth/task_plan_feature-auth.md`
-- `.map/feature-auth/findings_feature-auth.md`
+- `.map/feature-auth/research/plan__discovery.md`
 - `.map/feature-auth/progress_feature-auth.md`
 
 ## Hook Behavior
@@ -146,20 +147,22 @@ Only Monitor agent updates task_plan status (via `status_update` output field).
 
 **Why**: Prevents race conditions, ensures consistent state, clear ownership.
 
+## Constraints (NEVER)
+
+These are hard rules — each one protects shared, persistent state. If a task seems to require violating one, STOP and ask the user.
+
+- **NEVER** write `task_plan` `**Status:**` from any agent other than Monitor. task-decomposer creates the plan; Monitor owns every subsequent status transition (see Single-Writer Governance). An agent that needs a status change must surface it, not write it.
+- **NEVER** hand-edit `step_state.json`. It is the canonical orchestrator state — mutate it only through `.map/scripts/` orchestrator calls. If the API cannot express what you need, STOP and ask; do not write the file as a fallback.
+- **NEVER** read, write, or delete another branch's `.map/<other-branch>/` tree. Scope is strictly the current branch.
+- **NEVER** set a `**Status:**` outside the defined vocabulary — phase statuses are `pending`, `in_progress`, `complete`; terminal states are listed under "Terminal States". Unknown values break the Stop-hook terminal-state check.
+- **NEVER** commit secrets, tokens, or credentials into plan / progress / research files.
+
 ## Best Practices
 
 - **Goal clarity**: Specific, measurable outcomes
 - **Granular phases**: Each phase = 1 agent action
 - **Checkpoint frequently**: Update status immediately after completion
 - **Terminal state early**: Mark `blocked` as soon as blocker identified
-
-## Error Handling
-
-| Issue | Fix |
-|-------|-----|
-| Plan not found | Run `init-session.sh` |
-| Stop hook warns "No terminal state" | Update `## Terminal State` section |
-| Branch name with `/` | Scripts sanitize: `feature/auth` → `feature-auth` |
 
 ## Terminal States
 
@@ -193,7 +196,7 @@ Only Monitor agent updates task_plan status (via `status_update` output field).
 **Actions:**
 1. Read `.map/<branch>/task_plan_<branch>.md` to find current phase
 2. Read `.map/<branch>/progress_<branch>.md` for recent action log
-3. Read `.map/<branch>/findings_<branch>.md` for accumulated decisions
+3. Read `.map/<branch>/research/plan__discovery.md` for accumulated decisions
 
 **Result:** Agent resumes from last checkpoint without losing context, even after conversation window reset.
 
@@ -222,7 +225,7 @@ Only Monitor agent updates task_plan status (via `status_update` output field).
 
 ---
 
-**Version**: 1.0.0 (2025-01-10)
+**Version**: 3.1.0
 
 **References**:
 - [planning-with-files](https://github.com/OthmanAdi/planning-with-files) - Original pattern

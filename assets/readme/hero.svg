@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="heroTitle heroDesc">
+  <title id="heroTitle">MAP Framework — Plan-then-build AI coding for Claude Code &amp; Codex CLI</title>
+  <desc id="heroDesc">Title block: MAP Framework, Modular Agentic Planner. One-line value and the loop SPEC, PLAN, TEST, CODE, REVIEW, LEARN. PLAN is the approval gate; LEARN feeds the next run.</desc>
+
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#1B2129" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- canvas -->
+  <rect width="1200" height="360" rx="28" fill="#0E1116"/>
+  <rect x="1.5" y="1.5" width="1197" height="357" rx="26.5" fill="url(#grid)" opacity="0.55"/>
+
+  <!-- accent rail -->
+  <rect x="0" y="0" width="7" height="360" fill="#F0B429"/>
+
+  <!-- eyebrow -->
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,sans-serif" fill="#8B949E" font-size="19" letter-spacing="3" font-weight="600">
+    <circle cx="50" cy="66" r="5" fill="#F0B429"/>
+    <text x="66" y="73">MODULAR AGENTIC PLANNER</text>
+  </g>
+
+  <!-- title -->
+  <text x="64" y="146" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,sans-serif" font-size="76" font-weight="800" fill="#E6EDF3" letter-spacing="-1.5">MAP Framework</text>
+
+  <!-- value line -->
+  <text x="66" y="198" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,sans-serif" font-size="26" fill="#C9D1D9" font-weight="500">Plan-then-build AI coding.</text>
+  <text x="66" y="232" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,sans-serif" font-size="26" fill="#8B949E" font-weight="500">You approve the plan before the model writes a line of code.</text>
+
+  <!-- providers -->
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="19" fill="#8B949E">
+    <text x="66" y="292">claude code</text>
+    <text x="182" y="292" fill="#3A4451">/</text>
+    <text x="198" y="292">codex cli</text>
+    <text x="288" y="292" fill="#3A4451">/</text>
+    <text x="304" y="292">python 3.11+</text>
+    <text x="432" y="292" fill="#3A4451">/</text>
+    <text x="448" y="292">v3.23.0</text>
+  </g>
+
+  <!-- divider -->
+  <line x1="836" y1="56" x2="836" y2="304" stroke="#232A33" stroke-width="1"/>
+
+  <!-- right rail: the loop as a vertical gate stack -->
+  <g transform="translate(872 48)">
+    <text x="0" y="0" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="15" fill="#6E7681" letter-spacing="2">THE LOOP</text>
+
+    <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,sans-serif" font-size="19" font-weight="700">
+      <!-- SPEC -->
+      <rect x="0" y="14" width="248" height="36" rx="9" fill="#161B22" stroke="#30363D"/>
+      <text x="18" y="38" fill="#E6EDF3">SPEC</text>
+
+      <!-- PLAN (the approval gate) -->
+      <rect x="0" y="56" width="248" height="38" rx="9" fill="#1C1503" stroke="#F0B429" stroke-width="1.6"/>
+      <text x="18" y="81" fill="#F0B429">PLAN</text>
+      <text x="230" y="80" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" fill="#F0B429" font-weight="500">✓ you approve</text>
+
+      <!-- TEST -->
+      <rect x="0" y="100" width="248" height="36" rx="9" fill="#161B22" stroke="#30363D"/>
+      <text x="18" y="124" fill="#E6EDF3">TEST</text>
+
+      <!-- CODE -->
+      <rect x="0" y="142" width="248" height="36" rx="9" fill="#161B22" stroke="#30363D"/>
+      <text x="18" y="166" fill="#E6EDF3">CODE</text>
+
+      <!-- REVIEW -->
+      <rect x="0" y="184" width="248" height="36" rx="9" fill="#161B22" stroke="#30363D"/>
+      <text x="18" y="208" fill="#E6EDF3">REVIEW</text>
+
+      <!-- LEARN (feeds next run) -->
+      <rect x="0" y="226" width="248" height="36" rx="9" fill="#0D1F14" stroke="#3FB950" stroke-width="1.4"/>
+      <text x="18" y="250" fill="#3FB950">LEARN</text>
+      <text x="230" y="249" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="13" fill="#3FB950" font-weight="500">↻ next run</text>
+    </g>
+  </g>
+</svg>

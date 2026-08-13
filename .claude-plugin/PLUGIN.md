@@ -12,7 +12,7 @@ MAP (Modular Agentic Planner) is a cognitive architecture that orchestrates 11 s
 
 ## Features
 
-### 11 Specialized Agents
+### 9 Specialized Agents
 
 1. **TaskDecomposer** — breaks goals into atomic subtasks
 2. **Actor** — generates code and solutions
@@ -21,10 +21,8 @@ MAP (Modular Agentic Planner) is a cognitive architecture that orchestrates 11 s
 5. **Evaluator** — scores solution quality (functionality, security, testability)
 6. **Reflector** — extracts lessons from successes and failures
 7. **DocumentationReviewer** — checks documentation completeness
-8. **Debate-Arbiter** — cross-evaluates variants with reasoning (Opus)
-9. **Synthesizer** — merges multiple variants (Self-MoA)
-10. **Research-Agent** — isolated codebase research
-11. **Final-Verifier** — adversarial verification (Ralph Loop)
+8. **Research-Agent** — isolated codebase research
+9. **Final-Verifier** — adversarial verification (Ralph Loop)
 
 ### Claude Code Integration
 
@@ -35,16 +33,19 @@ MAP (Modular Agentic Planner) is a cognitive architecture that orchestrates 11 s
 - `track-metrics` — tracks agent performance
 - `workflow-gate` — enforces workflow step sequencing
 
-**10 Slash Commands:**
+**12 Slash Commands:**
 - `/map-efficient` — implement features, refactor code, complex tasks with full MAP workflow
 - `/map-debug` — debug issues using MAP analysis
 - `/map-fast` — small, low-risk changes with minimal overhead
 - `/map-review` — comprehensive review of changes
 - `/map-check` — quality gates and verification
 - `/map-plan` — architecture decomposition
+- `/map-task` — execute one planned subtask
+- `/map-tdd` — test-first implementation workflow
 - `/map-release` — release workflow with validation gates
 - `/map-resume` — resume interrupted workflows
 - `/map-learn` — extract and preserve lessons
+- `/map-understand` — teach and quiz until a target makes sense
 
 ### Cost Optimization
 
@@ -89,7 +90,6 @@ cp map-framework/.claude/settings.hooks.json your-project/.claude/
 
 **Recommended MCP Servers:**
 - `sequential-thinking` — chain-of-thought reasoning
-- `deepwiki` — GitHub repository analysis
 
 ## Quick Start
 

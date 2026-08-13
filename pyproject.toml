@@ -1,6 +1,6 @@
 [project]
 name = "mapify-cli"
-version = "3.9.0"
+version = "3.25.0"
 description = "MAP Framework installer - Modular Agentic Planner for Claude Code"
 authors = [{ name = "MAP Framework Contributors" }]
 readme = "README.md"
@@ -9,31 +9,43 @@ dependencies = [
     "typer>=0.9.0",
     "rich>=13.0.0",
     "httpx>=0.25.0",
+    "jinja2>=3.1,<4",
     "platformdirs>=4.0.0",
     "readchar>=4.0.0",
-    "questionary>=2.0.0"
+    "questionary>=2.0.0",
+    # mapify is a config-driven CLI: project_config.py loads .map/config.yaml via
+    # PyYAML on every config-dependent path (minimality-report, init overrides).
+    # It MUST be a hard runtime dep — a normal install (uv tool / pipx / pip
+    # without dev/test extras) otherwise ships without yaml, hits ImportError,
+    # and silently falls back to default config, ignoring the user's settings (#245).
+    "pyyaml>=6.0.0"
 ]
 
 [project.optional-dependencies]
 ssl = ["truststore>=0.9.0"]
 test = [
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.26.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "pytest-timeout>=2.1.0",
     "pyyaml>=6.0.0",
     "hypothesis>=6.0.0",
     "jsonschema>=4.0.0",
 ]
 dev = [
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.26.0",
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
+    "pytest-timeout>=2.1.0",
     "pyyaml>=6.0.0",
     "hypothesis>=6.0.0",
     "jsonschema>=4.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
+    "pyright>=1.1.400",
     "truststore>=0.9.0",
 ]
 
@@ -48,17 +60,92 @@ build-backend = "hatchling.build"
 include = [
     "src/**/*.py",
     "src/mapify_cli/templates/**/*",
+    "src/mapify_cli/templates_src/**/*.jinja",
     "README.md",
+]
+exclude = [
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/.DS_Store",
+]
+artifacts = [
+    "src/mapify_cli/templates/**/*",
+    "src/mapify_cli/templates_src/**/*.jinja",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mapify_cli"]
+# NOTE: do NOT force-include src/mapify_cli/templates_src here. It already lands
+# in the wheel under mapify_cli/templates_src via `packages` + the global
+# [tool.hatch.build] include/artifacts patterns for templates_src/**/*.jinja.
+# A force-include duplicates every .jinja at the same archive path, which newer
+# hatchling rejects with "A second file is being added ... at the same path".
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/**/*.py",
+    "src/mapify_cli/templates/**/*",
+    "src/mapify_cli/templates_src/**/*.jinja",
+    "tests/**/*",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
 
 [tool.mypy]
 ignore_missing_imports = false
 exclude = [
     "src/mapify_cli/templates/map/scripts/",
+    "tests/skills_eval/fixtures/whole_skill/",
 ]
+
+# Intentionally-broken seeded mini-repos used as whole-skill eval fixtures
+# (e.g. a test importing a deliberately-absent module). They are seeded into a
+# temp cwd at run time, never imported by the package — exclude from static
+# analysis and the language server.
+[tool.pyright]
+# Pin import resolution to the project venv so `make lint` is deterministic
+# regardless of which `pyright` is on PATH (e.g. a global Homebrew/node build
+# that otherwise ignores .venv and spuriously reports unresolved imports).
+venvPath = "."
+venv = ".venv"
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "tests/skills_eval/fixtures/whole_skill",
+]
+
+[tool.ruff]
+extend-exclude = ["tests/skills_eval/fixtures/whole_skill"]
+
+[tool.ruff.lint]
+ignore = [
+    # This codebase deliberately raises ValueError (not TypeError) from
+    # isinstance-based input/data validators (dataclass __post_init__, JSON
+    # schema validation) -- a tested, documented contract (20+
+    # `pytest.raises(ValueError)` assertions and `Raises: ValueError`
+    # docstrings across grace_eval, skills_eval, repo_insight,
+    # validate_dependencies, verification_recorder). TRY004 conflicts with
+    # this established convention rather than catching a real defect.
+    "TRY004",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test modules intentionally adjust sys.path before importing generated scripts.
+"tests/**/*.py" = ["E402"]
+# These standalone generated scripts resolve sibling map_utils imports at runtime.
+"src/mapify_cli/templates/map/scripts/*.py" = ["E402"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer's CLI parameter declarations require typer.Option(...)/typer.Argument(...)
+# as argument defaults -- that's the framework's own idiomatic API, not the
+# mutable-default-argument antipattern B008 exists to catch.
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
+
+[tool.black]
+target-version = ["py311"]
 
 [[tool.mypy.overrides]]
 module = "yaml"

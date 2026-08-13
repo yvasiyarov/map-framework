@@ -7,6 +7,795 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.25.0] - 2026-08-12
+
+### Added
+- **`/map-review` computes its verdict instead of choosing one (closes #406).** `write_review_verdict_ledger` normalizes Monitor/Predictor/Evaluator envelopes into a finding registry and applies a closed decision table (`review_verdict_table.v1`), writing `.map/<branch>/review-verdict-ledger.json` and a human-readable `.md`. Reviewer envelopes are captured to `.map/<branch>/review-agent-<role>.json` and read via `--monitor-file`/`--predictor-file`/`--evaluator-file`/`--adversarial-file`. The table counts every finding whose status is `active` or `downgraded`. Only a finding proven `minor` may be tombstoned — by any route — so neither a missing `reach_evidence` field, nor a reviewer's own `was_present_before_pr=true`, nor an operator objection can erase a blocking finding from the gate; each downgrades severity to `needs_investigation` instead, and doing so to a CRITICAL sets `escalation_required`. `needs_investigation` sits inside that floor because it means "severity not established", not "low severity". Missing, unreadable or malformed reviewer output is itself an active finding: an empty registry reads as "the review was not observed", never as a clean pass. `journal.previous_verdict` is recovered from the ledger on disk, so the journal spans runs.
+- **Objection channels for contesting a review finding (#406).** `record_review_objection --finding-id RVF-001 --channel <channel> [--evidence …]` is the only supported way to remove a finding. `quote_absent`, `wrong_category` and `different_version` are checkable against the change and REQUIRE evidence; they remove a `minor` finding outright and downgrade anything above it with `escalation_required` set, because the objection's evidence is free text that nothing verifies. `unverifiable_context` keeps the finding and escalates to a human, so PROCEED becomes unavailable; `no_new_fact` keeps the finding and repeats the previous verdict. Objections are stored in `.map/<branch>/review-objections.json`, bound to the claim they were raised against so a stale objection cannot drift onto another finding, and limited to one per finding so a registry cannot be worn down by repetition.
+
+- **Wayfind amend commands for post-resolution wording fixes (#396).** `amend_resolution`
+  updates a resolved ticket's gist and/or resolution path in place; `amend_out_of_scope`
+  does the same for an out-of-scope entry's reason/gist. Both touch no structural
+  invariant, are allowed on a handed-off map, and flag `handoff_refresh_needed`.
+- **Wayfind one-non-research-resolve-per-session cap is now opt-in (#395).**
+- **Role-local persistent memory for learning agents (#379).**
+
+### Fixed
+- **PyPI publish action bumped to v1.14.2 so uploads accept Metadata-Version 2.5.**
+  `pypa/gh-action-pypi-publish@v1.13.0` bundles an older twine that rejected the
+  3.25.0 wheel with `InvalidDistribution: '2.5' is not a valid metadata version`
+  even after the repo's own `twine check` step was fixed; v1.14.2 ships twine v7
+  with core-metadata 2.5 support. Applied in `release.yml` and `test-pypi.yml`.
+- **GitHub Release notes are no longer an empty stub.** The changelog-excerpt
+  extraction used a two-address awk range whose start and end patterns both match
+  the `## [X.Y.Z]` heading line, collapsing the range to that single line and
+  yielding an empty excerpt — every past GitHub Release body fell back to
+  "See CHANGELOG.md for details.". Replaced with an explicit flag state machine
+  in `release.yml`, the release-checklist issue template, and the map-release
+  skill.
+- **Atomic writes for `review-verdict-ledger.json` and `review-objections.json` (#409).**
+  Both files were written with non-atomic `write_text()` and could be corrupted by a
+  mid-write kill; they now go through `_write_json_file()` (temp file + `os.replace`).
+- **Non-English Monitor feedback is no longer dropped from retry artifacts (#404).**
+  The keyword filter is a ranking hint only; the full original text is always forwarded.
+- **Six proactive bugs in `wayfind_runner`, `map_step_runner`, and settings deny globs.**
+  `_resolve_evidence_path` rejects absolute paths before path-joining (POSIX join
+  discarded the base and bypassed containment); `add_ticket` accepts only open fog
+  entries as `from_fog`; `validate_mutation_boundary` catches subprocess `OSError`
+  in `_resolve_subtask_diff_base`; `record_scope_baseline` writes atomically; git
+  porcelain quoted filenames (spaces) are un-quoted; `Write`/`MultiEdit` deny
+  patterns now mirror `Edit` for `.env*`/credentials/secret globs.
+- **`wayfind_runner` evidence reads catch `OSError`; `.env` deny glob covers
+  subdirectories (#401, closes #400).**
+- **Five bugs: scope-classifier crash on non-integer config, snake_case config
+  dead-toggle, zero scale-threshold reset, `needs_clarification` verdict without
+  blocking questions rejected, governance category drift for `map-wayfind`/`map-architecture` (#399).**
+- **Secret/credentials deny globs scoped by extension (#397).** Broad
+  `Edit(**/*secret*)`-style globs blocked normal source files like
+  `secret_service.go`; deny patterns now target only secret-material formats
+  (`.yaml`, `.yml`, `.json`, `.toml`, `.env`).
+- **Class-scoped instance-method fixture promoted to module scope (#393).**
+- **`.claude/settings.json` parity is gated via `make check-render` (#390).**
+- **CI/release `twine check` no longer rejects Metadata-Version 2.5 wheels.** The
+  `packaging>=24.2,<26` cap from #195 forced a downgrade to `packaging` 25.0, which
+  does not recognize the Metadata-Version 2.5 that current setuptools emits —
+  the `build` job failed with `InvalidDistribution: '2.5' is not a valid metadata
+  version`. CI, TestPyPI, and PyPI release jobs now install `packaging>=26`.
+
+### Documentation
+- **`wayfind_status` is documented with `--slug`, not a positional argument (#408).**
+  The map-wayfind SKILL.md told the operator to run `wayfind_status <slug>`, which the
+  CLI rejects; all other documented wayfind commands were audited against their argparse
+  definitions and match.
+- **ARCHITECTURE.md refreshed to record the #404 feedback-preservation fix.**
+
+### Changed
+- **The review stage gate is bound to the computed verdict (#406).** `write_stage_gate review <verdict>` is refused, and no gate file written, when `<verdict>` contradicts `computed_verdict` or when no ledger exists for the branch. Enforcement is on by default with no calibration period; `MAP_REVIEW_LEDGER_ENFORCE=0` is the explicit opt-out. Other stages are unaffected. `/map-review`'s closeout now takes `FINAL_VERDICT` from the ledger output rather than asking the model to pick one of `PROCEED|REVISE|BLOCK`.
+
+## [3.24.1] - 2026-07-25
+
+### Fixed
+- **`map-review` closeout no longer errors on its own documented verdicts (closes #388).** `map-review`'s SKILL.md documents `PROCEED | REVISE | BLOCK`, but `write_stage_gate` only accepted `{ready, needs-revision, blocked}`, so following the skill verbatim always failed with `Invalid verdict: revise`. `write_stage_gate` and `write_plan_review` now normalize `PROCEED -> ready`, `REVISE -> needs-revision`, `BLOCK -> blocked` (via a shared `normalize_gate_verdict` helper); unknown verdicts still error. Also fixed the secondary arity mismatch: the Gate Unlock call site passed the review summary as the THIRD positional arg, silently landing it in `source_artifact` instead of `notes` — both call sites in `SKILL.md` and the Codex `review-reference.md` port now pass `<stage> <verdict> <source_artifact> <notes>`.
+
+## [3.24.0] - 2026-07-25
+
+### Added
+- **`disallowedTools` frontmatter on non-writer agents (closes #378).** `monitor`, `research-agent`, `predictor`, and `evaluator` now have their capability boundaries enforced at the harness level instead of relying on prompt text alone: `monitor`/`research-agent` disallow `Edit`/`Agent`; `predictor`/`evaluator` disallow `Edit`/`Write`/`Agent`.
+
+### Fixed
+- **Stale `Write(...)`/`Glob(**)` permission rules no longer emit startup warnings.** Claude Code now matches all file-editing tools (Edit/Write/NotebookEdit) against `Edit(path)` rules only, and all file-reading tools against `Read(path)` rules only. Two shipped surfaces predated that consolidation: `settings.json.jinja`'s 6 redundant `Write(...)` deny/allow entries (already covered by existing `Edit(...)` rules) were removed, and `configure_global_permissions()`'s `Glob(**)` entry (written into the user's global `~/.claude/settings.json` on every `mapify init`) was changed to `Read(**)`, with a one-time migration that also heals any already-installed stale `Glob(**)` rule.
+- **Claude Code harness output-scan markers no longer trip strict JSON gates (closes #380).** Claude Code v2.1.210+ may prepend a `[harness: subagent output matched instruction-shaped pattern(s):` marker line to a subagent report; `detect_truncated_agent_output` now strips known marker lines before JSON parsing instead of treating them as a truncation signal, so valid Monitor/Predictor/Evaluator/Actor payloads are no longer rejected.
+- **`git status` scope checks now detect files inside pre-existing untracked directories (closes #376).** `validate_mutation_boundary`, `record_subtask_baseline`, `record_scope_baseline`, `refresh_blueprint_affected_files`, and `_current_subtask_changed_files` now use `git status --porcelain -uall` instead of the default, which previously collapsed an untracked directory to a single `?? dir/` entry — making new files added inside a pre-existing untracked directory invisible to the mutation-boundary check.
+- **CI's lint step could never fail (`ruff`/`mypy`/`pyright` were unenforced on every PR).** `.github/workflows/ci.yml` used `which ruff && ruff check ... || echo skip`, which falls through to the no-op branch whenever the lint command itself fails, so a red ruff/mypy/pyright run always reported green. Rewritten to run the three checks directly so a real failure now fails the job.
+- **1537 pre-existing ruff violations resolved (`make lint` was red on `main`, invisible to the broken CI gate above).** Fixed across `src/`, `tests/`, and the shipped hook/script templates: explicit `subprocess.run(..., check=False)` (311 sites, behavior-preserving — `False` is the existing default), UTC-aware `datetime.now()` in state/log/backup timestamps (36 sites, matching the project's existing UTC convention), collapsed redundant nested `if`/`with` blocks, restored 6 `# pyright: ignore[reportMissingImports]` suppressions that an earlier automated pass had collaterally stripped alongside an unrelated unused-`noqa` cleanup, and misc modernization (`Optional[X]` → `X | None`, `Dict`/`List` → `dict`/`list`, f-strings, import sorting). Two rule categories were disabled via `pyproject.toml` config instead of restructuring code: `B008` (typer's `Option(...)`/`Argument(...)` argument-default idiom) and `TRY004` (this codebase deliberately raises `ValueError`, not `TypeError`, from isinstance-based input validators — a tested, documented contract).
+
+### Documentation
+- Redesigned README with a native SVG visual system (hero, loop diagram, section headers) and restructured content — proof before claims, case study promoted, implementation details collapsed into `<details>`.
+
+## [3.23.0] - 2026-07-18
+
+### Added
+- **`/map-wayfind` — decision-frontier wayfinding before planning (closes #362).** A new opt-in skill for large or foggy efforts where `/map-plan` would force premature decomposition. It builds a durable, repo-level decision map under `.map/wayfind/<slug>/` and resolves open decisions one at a time behind a claim-before-work frontier, with a "fog of war" for questions that cannot yet be stated sharply. Three explicit modes: `chart` (start a map), `work` (resolve one ticket), `handoff` (finish). Tickets are typed `research | prototype | grilling | task`; `prototype`/`grilling` are human-in-the-loop and cannot be resolved until a verbatim human answer is recorded via `record_human_input`. All state mutations go through the new stdlib-only `wayfind_runner.py` (canonical `state.json` + regenerated `map.md`/`tickets/*.md` views); invariants — DFS cycle-freedom, one-non-research-resolve-per-session, the human-in-the-loop gate, and the terminal handoff condition (fog empty AND no active claims AND every ticket resolved/out-of-scope) — are enforced in the runner. `emit_wayfind_handoff` writes a `handoff.md`/`handoff.json` pair and registers a new `wayfind_handoff` artifact-manifest stage; `/map-plan --wayfind <slug>` (or a single-candidate offer via `list_handoffs`) pre-seeds the spec's Decisions Made / Out of Scope / Open Questions. Maps are committed by default so decisions are durable; `chart` warns about the commit-by-default privacy note and the per-slug opt-out. (Also syncs the artifact-manifest JSON schema to the stage-name authority, adding the previously-missing `approval_hold`/`worktree`/`context_usefulness` stages.)
+- **Scale-adaptive intelligence — automatic scope→workflow-depth mapping (closes #287).** A scale-adaptive config plus a scope classifier (Python layer) with a `classify_scope.py` entry-point script route a task to the right planning depth; `/map-plan`'s Codex variant gains explicit `--light`/`--deep` modes, and the Scale Advisory output was corrected. Documented in `docs/ARCHITECTURE.md`.
+- **SpecKit-style preset composition engine (#291).** Layered template resolution via a new `mapify preset` command family: `list` + `add` (Slice 1); `remove` / `enable` / `disable` / `resolve` (Slice 2); and a composition engine with `render` + `set-priority` supporting prepend/append/wrap strategies (Slice 3).
+- **`/map-architecture` skill — architecture-deepening reports for hotspot modules (closes #363).** A new skill (inspired by mattpocock/skills) that produces an architecture-deepening report for hotspot modules.
+- **`mapify prompt-profile list` command (#353, slice 1).** First slice of eval-gated prompt-profile canary/rollback controls: lists the available prompt profiles.
+- **GRACE semantic code-contract anchor eval (#339, slice 1).** First slice of a semantic code-contract anchor eval for bug-fix workflows.
+- **Implementer-readiness review artifact before decomposition (closes #348).** A new implementer-readiness review artifact runs before task decomposition; `docs/ARCHITECTURE.md` refreshed to document the gate.
+- **Context-usefulness feedback loop for recall ranking (closes #343).** Feeds observed context usefulness back into MAP recall ranking.
+- **Trajectory-level outcome eval with side-by-side regression reports (#351).** Adds a trajectory-level outcome eval (from arXiv:2607.06624) producing side-by-side regression reports.
+- **`/map-plan` → `/map-wayfind` off-ramp for too-foggy tasks (#365).** When a task is too foggy to decompose, `/map-plan` now offers a Workflow-Fit off-ramp that routes to `/map-wayfind`.
+
+### Fixed
+- **`abandon_workflow` escape hatch for stuck workflows (closes #360).** `workflow-gate` previously blocked all repo edits on a stuck `INITIALIZED` workflow that had no plan and no resolvable path to archive; a new `abandon_workflow` escape hatch lets the operator cleanly exit the stuck state.
+
+## [3.22.0] - 2026-07-13
+
+### Fixed
+- **`workflow-gate.py` orthogonal-file relief now applies to every blocking phase, and out-of-repo paths are always allowed (closes #164).** A prior fix (#174) scoped the RESEARCH-phase block to the current subtask's `affected_files`, allowing Edit/Write to files outside that surface — but only during RESEARCH, and it deliberately kept blocking paths that resolve entirely outside the repository. Both choices reproduced the original friction: a report against `neuro-vlad` hit the identical block during INIT_STATE while editing `~/.claude/CLAUDE.md`, a path outside that repo's tree entirely. `is_orthogonal_to_current_subtask()` now treats out-of-repo paths as unconditionally orthogonal (no subtask's `affected_files` can ever legitimately name a path outside the repo it was declared in), and the orthogonal-relief exception in `main()` fires for any blocking phase, not just RESEARCH. The Bash-write bypass (`cat >`, `tee`, `sed -i`) remains a documented, deliberately deferred limitation.
+- **End-of-MAP-flow: sequential completion left `workflow_status` stuck at `IN_PROGRESS`, silently disabling every completion-gated hook, and the post-completion edit gate misled the agent into thrash.** `validate_step`'s sequential terminal transition set `current_step_phase=COMPLETE` but never `workflow_status=WORKFLOW_COMPLETE`/`completed_at`, so the most common completion path (a sequential `/map-efficient` or `/map-task` run) finished half-marked and every `WORKFLOW_COMPLETE`-gated hook (`scrub-internal-ids`, and any future teardown) silently no-op'd on it. Completion is now atomic at that site (all three fields + `completed_at`), matching `mark_workflow_complete`/`mark_subtask_complete`. On a finished branch the `workflow-gate.py` block message no longer says "Call the Actor agent first" — it names the clean exits (`python3 .map/scripts/map_orchestrator.py archive` / `/map-review`) and instructs the agent to STOP and report rather than edit `.map/` state or the runner; the gate also treats `workflow_status=WORKFLOW_COMPLETE` as permissive regardless of the phase label, so a finished branch never hard-blocks a follow-up edit. `workflow-context-injector.py` replaces silent suppression on a terminal state with a one-shot, low-pressure completion notice (archive/review guidance) for editing tools — refining #317's no-misleading-banner invariant (Bash stays silent). Design was llm-council-reviewed (conv `0cd9bcc7`).
+- **`validate_step` false-progress and scope-warning double-call eliminated on committed subtasks (closes #162).** The false-progress check re-read `step_state.json` from disk via `_resolve_subtask_diff_base`, a secondary read that could return stale data in container environments where `save()` lacks `fsync()`; it now checks the already-loaded in-memory `state.subtask_results` for a recorded `commit_sha` (a present SHA proves the subtask was committed) and skips the check, so no second call is ever needed. Separately, the scope-warning guard used to return `valid=false` on first occurrence and demand an identical second call to advance — pure ceremony in operator-driven flows with no Actor to intervene; it is now advisory-only (records into `scope_feedback_subtasks`, advances normally, surfaces out-of-scope files as `scope_warning` metadata on the success response).
+- **`tdd.enforce` now documented in `generate_default_config()` (closes #340).** The `tdd.enforce` option shipped in #285 with a `MapConfig` field and YAML alias but was absent from the generated default config, so `mapify init` users had no way to discover it. A commented example block now documents its behavior and default, and new `TestVc9DefaultConfigCompleteness` regression tests prevent future config options from being silently omitted from the generated default.
+- **`map_orchestrator.py` resolves the project root from the caller's git toplevel, not the script anchor (closes #328).** `main()` anchored cwd exclusively to `Path(__file__).resolve().parents[2]`, silently operating on the main clone when invoked by absolute path from a git worktree lacking its own `.map/scripts/` copy. Resolution priority is now: `CLAUDE_PROJECT_DIR` env var → `git rev-parse --show-toplevel` from the caller's cwd (correct for worktrees) → the script-anchored fallback (legacy behavior for non-git callers). An INFO line to stderr flags when the resolved root differs from the anchor so cross-checkout usage is auditable.
+- **Safety-guardrails false positives, PyYAML error status, and `set_waves` install-path fallback (closes #319, closes #320, closes #321).** `safety-guardrails.py` matched dangerous patterns against the full path, blocking benign files under directories whose names contained security words (e.g. `secrets-injector/values.yaml`); it now matches only `os.path.basename(path)`. `parse_requirements_index` collapsed missing-PyYAML and malformed-YAML into one `malformed` status, misleading users whose spec was fine but PyYAML absent; `ImportError` now returns a distinct `pyyaml_missing` status with an actionable install message. `set_waves`' `ImportError` fallback only searched source-checkout layouts, missing `uv tool install` / `pipx` locations; the candidate list now covers common installed-package paths.
+
+### Added
+- **Mandatory TDD enforcement for `/map-tdd` (`tdd.enforce`, closes #285).** When `tdd.enforce: true` in `.map/config.yaml`, `/map-tdd` enforces the Iron Law ("NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST") instead of only preaching it: a mandatory RED-GREEN-REFACTOR cycle, a 14-item Red Flags list, an 11-item Rationalization Table with counters, a Spec Compliance Reviewer (adversarial, `SPEC-COMPLIANT` verdict) and a Code Quality Reviewer gated behind it, plus a Monitor `tdd_violation` verdict that detects code-before-test and rationalization patterns. Backed by a `MapConfig.tdd_enforce` field with a `tdd.enforce` YAML alias (dead-toggle guarded).
+- **Durable approval-hold artifacts in the step runner (closes #344).** New `create_approval_hold` / `decide_approval_hold` / `list_approval_holds` / `get_pending_holds` commands provide a human-gate mechanism for risky workflow actions. Branch-scoped JSON store (`approval_holds.json`) plus a per-hold Markdown report; sequential IDs, idempotent on same kind+summary; a `pending → approved | denied | expired | cancelled` state machine over five hold kinds (`safety_guardrail`, `autonomy_posture`, `template_overwrite`, `plan_approval`, `dangerous_action`); a new `approval_hold` manifest stage; and a `resume_blocked` flag for orchestrator polling. Summaries are redacted — no raw secrets or credential values.
+- **`mapify governance report` — MAP behavior-shaping asset inventory (closes #342).** `mapify governance report [PATH] [--json] [--out FILE]` inventories installed skills, hooks, references, and learned rules from `.claude/` and classifies each asset under six governance categories (Charter, Policy, Context, Harness, Oversight, Learning). Hooks are classified as **enforced** (runtime controls); skills/references/rules as **prompt-only**. A Gaps section flags missing key hooks (`workflow-gate`, `safety-guardrails`) and prompt-only policy claims lacking a backing harness control.
+- **`mapify domain-skill init` — project-local reference-skill bootstrap (closes #338).** Scaffolds a project-local `.claude/skills/<name>/SKILL.md` without fabricating content: discovered facts (project name, README summary, key dirs, safe commands) come from local config files, and missing data becomes explicit TODO placeholders. Secret filenames are never read; the generated skill and CLI output both warn against committing secrets, and the skill is excluded from `skill-rules.json` so it never conflicts with MAP's shipped global catalog.
+- **Reversible config-entry ownership and `mapify uninstall` (closes #314).** MAP-owned provider config merges (MCP servers, statusline) are now tracked in `.map/mapify.lock.json` under a `config_entries` list, enabling safe removal via `mapify uninstall`. A new `ConfigEntry` records the file, dot-notation key path, install time, and version; `reconcile_config` removes only MAP-owned entries whose current value still matches the canonical MAP config (user-modified entries are skipped, absent ones marked missing). Manifests without the field default to `[]` for backward compatibility.
+- **Install manifest/lock for MAP-managed provider surfaces (closes #313).** `mapify init` (Claude and Codex) writes a scan-based install manifest to `.map/mapify.lock.json` recording every MAP-managed file with its `template_hash`, `content_hash`, `management_mode` (fenced/full/hooks-merge), and committed flag. The new `mapify check-installed` command compares the current tree against the manifest and reports missing, drifted, and orphaned managed files (exit codes 0/1/2). Local-only files (`settings.local.json`, symlinks) are excluded from the committed manifest; no absolute paths or secrets are stored.
+- **Optional local structural code-map provider for MAP research (closes #310).** An opt-in, no-network structural code-map provider surfaces symbol/structure context for the research phase, letting Actor localization work from a real structural map rather than blind reads.
+- **Structural-discovery ROI comparison for research-eval (closes #311).** New `research_eval_compare` module runs a side-by-side A/B comparison of two `ResearchEvidence` runs (baseline vs treatment), scoring quality metrics (precision/recall/F1) and exploration-cost metrics (location count, stale count, over-broad count, avg span) **independently**, so token/LOC reductions cannot mask lower localization quality.
+- **Minimality A/B benchmark harness (closes #312).** A deterministic, no-network eval harness that proves MAP minimality is active and isolated without live model calls. `build_doctrine_block()` mirrors the runner's `_minimality_doctrine_block()` so each arm's context is independently verifiable; three fixture tasks (over-build trap, safety-guard invariant survival, irreducible convergence); a contamination check (off arm must lack `<MAP_Minimality_Doctrine>`, treatment arms must carry it — hard FAIL on mismatch); a safety check (required patterns must appear in both arms); and a warn-only LOC-delta check. Report persisted to `.map/eval-runs/minimality/<timestamp>.json`.
+- **Deterministic boundary-quality eval for architecture plans (closes #316).** `boundary_quality_report.py` — a pure-Python advisory evaluator working from `blueprint.json` alone (no network/model/structural-map) — flags `FILE_SHARED_ACROSS_BOUNDARIES` and `CROSS_BOUNDARY_DEP_PRESSURE` (warn), plus `REFACTOR_WITHOUT_TEST_PAIR` and `LOW_COHESION_SUBTASK` (info). Findings are advisory only; hard errors remain in `validate_blueprint_contract`. Subtasks related by a dependency edge suppress file-sharing and pressure warnings.
+- **MAP Prompt Library catalog (`docs/PROMPT_LIBRARY.md`, closes #326).** 14 copyable prompt recipes grouped by SDLC phase (Understand, Plan, Build, Review, Learn) and role (Engineer, Tech Lead, Operator/Maintainer), each with prompt text, fillable slots, MAP surface, prerequisites, why-it-works, and completion signal; plus a prompt-pattern audit table classifying 9 Claude Code Prompt Library patterns against MAP's implementation. Docs-only — no agent/skill prompt bodies or template sources changed.
+- **Adversarial governance violation fixtures (#350).** `tests/test_governance_attack_fixtures.py` adds 16 tests spanning seven enforcement surfaces (orchestrator state machine, strict mutation-boundary gate, false-progress gate, wave lifecycle, safety-guardrails hook, workflow-gate hook, run-health schema), each with a violation fixture (must reject) and a positive-control fixture (must allow) to exercise deny/allow symmetry.
+- **`map_orchestrator.py archive` command + auto-archive on branch reuse (end-of-MAP-flow teardown).** A finished branch's `.map/<branch>/step_state.json` used to linger indefinitely; the gate fail-opens on absent state, but a stale terminal file kept the branch looking "in work" and left the agent to infer completion (and thrash). The new idempotent `archive` command retires a COMPLETED run by renaming `step_state.json` → `step_state.completed-<utc-ts>.json` (the gate then fail-opens and the injector goes quiet); it is a no-op when there is no active state and refuses to touch an in-flight run. Archival is **deferred by design** — it never fires the instant a run reaches COMPLETE — so `/map-review` → `reopen_for_fixes` keeps its review window; instead `initialize_workflow` auto-archives a prior COMPLETED run when a new `/map-*` workflow starts on the branch, so branch reuse always starts clean (the return payload carries `archived_prior`). Design was llm-council-reviewed (conv `0cd9bcc7`).
+
+## [3.21.0] - 2026-07-02
+
+### Changed
+- **Parallel execution defaults flipped ON (`worktree.isolation` off→auto, `execution.concurrent_dispatch` false→true, Slice 6 of #303).** Concurrent wave execution is now **ON by default** for repositories that are git repos with a parallel-ready plan (>=2 independent subtasks in a wave). Off-ramps (either is sufficient): (1) **global kill-switch** — set `MAP_EFFICIENT_SEQUENTIAL_ONLY=1` in your environment; forces the full legacy sequential path, byte-identical to pre-5a behavior, regardless of config; (2) **per-repo opt-out** — set `worktree.isolation: off` and/or `execution.concurrent_dispatch: false` in `.map/config.yaml`. The `auto` isolation mode degrades gracefully to sequential with a warning when git worktrees are unavailable (non-git repo, shallow clone, detached HEAD). Default `worktree.isolation` `MapConfig` value: `"off"` → `"auto"`; `concurrent_dispatch` `MapConfig` value: `False` → `True`; matching defaults in the step-runner config readers (`_worktree_isolation_mode`, `_concurrent_dispatch_enabled`). The `select_execution_strategy` and `compute_dispatch_gate` functions now check the kill-switch as their **first** gate (before any config read or concurrency probe), backed by a new shared `_sequential_only_env()` helper and a stable `WAVE_REASON_SEQUENTIAL_ONLY_ENV` reason code.
+
+### Added
+- **`/map-review` ported to the Codex provider.** `mapify init --provider codex` now ships a `map-review` skill (`$map-review`) alongside `map-plan`/`map-efficient`, feature-parity with the Claude skill: normal mode dispatches `monitor`/`predictor`/`evaluator` via `spawn_agent(agent_type=...)` through two new Codex agent configs (`predictor.toml`, `evaluator.toml`, condensed from the canonical Claude prompts, registered in `config.toml`); adversarial mode runs the same three-pass in-session review (Blind Hunter, Edge Case Hunter, Acceptance Auditor) without a new agent-dispatch primitive; `--cross-ai <runtime>` reuses `run_cross_ai_review` verbatim, preserving the secret-scan/injection-detection/`EXTERNAL UNTRUSTED REFERENCE` trust boundary and its fall-through-never-hard-stop behavior. The skill ships as a `SKILL.md` + `review-reference.md` + `adversarial-reference.md` split (mirroring `map-efficient`'s reference-file pattern), reuses every provider-neutral CLI verb (`create_review_bundle`, `build_review_prompts`, `shuffle-sections`, etc.) unmodified, and contains zero Claude-only API tokens (verified by `test_ac10_no_claude_refs_anywhere`).
+- **Concurrent Actor dispatch for parallel waves (`execution.concurrent_dispatch`, part of #303 Slice 5b).** Activates same-turn concurrent dispatch of Actor subagents within a parallel wave, previously scheduled but always run sequentially. Flag-gated (`execution.concurrent_dispatch: false` by default) so the default code-path is byte-identical to Slice 5a; defaults flip only in Slice 6. Key components: `compute_dispatch_gate` (strict conjunction — `concurrent_dispatch` AND `concurrency_allowed` AND `concurrency_ready` AND `isolation != off`; hard-aborts with a `ConfigError`-equivalent on any config contradiction, fail-closed rather than degrading silently), `run_concurrent_wave` (splits the wave into sub-batches of `execution.max_actors` and dispatches each sub-batch; atomic per-sub-batch merge via `merge_wave_worktrees`), `abort_wave_group` (whole-group rollback — reverts every worktree in the group back to wave base, bounded by `execution.max_wave_retries`), `record_dispatch_actual` (clock-free phantom-parallelism classifier using `max_in_flight` replay — worktree SHA proves isolation but NOT concurrency; emits `phantom_parallel` evidence when actors ran but no concurrent overlap is detectable). Test harness uses barrier-based determinism (no wall-clock sleeps); HC-1 leak-guard suite validates no cross-subtask state leaks under concurrent dispatch. Council review split this into 5a (infrastructure) and 5b (activation); this entry covers 5b.
+- **`deferred_nondeterministic` wired into the core Monitor verdict path (completes #252).** The flaky-triage primitives (`run_/record_/validate_flaky_test_triage`) and the `defer_flaky_subtask` close+advance command already existed, but were **disjoint** from the Monitor verdict path: Monitor could only emit `valid:true`/`valid:false`, had no field to signal a flaky defer, and `validate_step 2.4` could only pass or hard-stop — so a confirmed flake forced an out-of-band manual `defer_flaky_subtask`. The third Monitor outcome is now part of the structured verdict. (1) The Monitor schema gains an OPTIONAL structured `disposition: {kind, check_id}` field (`kind` enum currently `{deferred_nondeterministic}`), absent for normal verdicts, with guidance to emit it on confirmed mixed pass/fail evidence instead of demanding a fake Actor fix. (2) `validate_step 2.4 --disposition deferred_nondeterministic --check-id <id> --monitor-envelope -` routes to the existing `defer_flaky_subtask` **in-process** (the single owner of the close+advance transaction), placed BEFORE the recommendation gates so a defer carrying `recommendation=needs_investigation` is not hard-stopped. (3) **Anti-gaming** (llm-council-reviewed, conv `d3ddca63`): the deferral is honored ONLY when the Monitor envelope structurally backs it — `valid:false`, non-empty `failed_checks`, and a structured `disposition` whose kind + `check_id` match the flags — AND the sidecar holds mixed pass/fail evidence for that `check_id` (re-validated from disk by `defer_flaky_subtask`). A Monitor cannot dodge a real deterministic failure or a green check by merely claiming "flaky"; `recommendation in {revise, block}` together with a disposition is rejected as a contradiction. (Note: the Monitor schema's `failed_checks` lists failed quality *dimensions*, a different namespace from a flaky check id, so the binding is "Monitor admits a dimension failure + dispositions match" rather than "check_id ∈ failed_checks".) (4) **Verdict vs routing:** a deferred run returns `valid:false` + `deferred:true` + `non_green_outcome:true` (a deferral is NOT green — it is a routing decision, not a clean pass); the CLI exits `0` on a deferral (not a hard-stop) and `1` only on a true invalid verdict. A single source-of-truth `MONITOR_DISPOSITIONS` policy dict drives the routing, the CLI `--disposition` surface, and a drift-guard test (the Monitor prompt must name every supported disposition). Closes the last core slice of #252.
+- **Context-budget statusline for all MAP sessions (`map-statusline.py`, completes #284 Phase 3).** A Claude Code `statusLine` render command that shows live context-window usage at a glance: `[Opus] MAP ctx 47% (94k/200k) · feature-x · ST-003 ACTOR`. It reads the usage Claude Code **pre-computes** on stdin (`context_window.used_percentage` / `context_window_size` / `total_input_tokens`), so it does NO transcript parsing, no token counting, and no network — it formats already-available numbers plus the git branch (read directly from `.git/HEAD`, no `git` subprocess; handles the linked-worktree `.git`-as-file case) and the active MAP subtask (best-effort `.map/<branch>/step_state.json`). Output is **never blank and never crashes** — any error degrades to a minimal safe line; it shows `--%` before the first API response (instead of a misleading `0%`) and a `200k?` uncertainty marker when the harness omits the window size. It is wired **non-destructively** at install time by `ensure_map_statusline`: the `statusLine` entry is merged into the user-owned `.claude/settings.local.json` ONLY when no status line already exists in the local/project/user scope — so MAP never overrides a status line the user configured. Writing to `settings.local.json` (not the MAP-managed `settings.json`) avoids all managed-file drift/`.bak` churn and stays idempotent across upgrades; remove the `statusLine` key there to disable. Claude provider only (`statusLine` is a Claude Code concept; the Codex install path never wires it). The other Phase 3 item — threshold warnings — already shipped via the `context-meter.py` `/compact` nudge; the heartbeat/SSE-keepalive item is closed as **harness-owned** (MAP's orchestrator is prompt-driven and dispatches subagents through Claude Code's Task tool, which the harness keeps alive — MAP ships no bespoke keepalive). Design was llm-council-reviewed (conv `585f773b`). Completes #284 Phase 3.
+- **Parallel-wave merge coordinator for worktree isolation (`merge_wave_worktrees`, part of #284 Phase 2).** Wires the existing wave/DAG scheduler to per-subtask worktree isolation so a parallel wave's independent subtasks each run in their own worktree and are accepted **atomically**. Every worktree of a wave is cut off the same base (HEAD at wave start), so they cannot be merged one at a time — the first `merge_subtask_worktree` advances HEAD and the next trips `BASE_DIVERGED`. The new coordinator relaxes *only* that guard to a wave-scoped form: it refuses **external** HEAD movement (`EXTERNAL_HEAD_MOVED`) but allows the sibling divergence each in-wave squash-merge creates. It derives `wave_base_sha` from the sidecar (never a caller parameter), preflights every worktree (commit + per-worktree guards + pre-merge verify) BEFORE touching the working branch, then squash-merges each accepted worktree **by frozen SHA in sorted id order** (one runner commit per subtask — the one-commit-per-subtask contract holds), then runs **one post-wave full gate on the merged tree inside the same transaction**. It is **all-or-nothing** (council-reviewed, conv `c29d6fa9`): any textual conflict, commit failure, or post-wave-gate failure rolls the whole working branch back to the wave base via `git reset --hard` + `git clean -fd` (squash leaves no `MERGE_HEAD`, so `git merge --abort` is never used; MAP runtime state is excluded from the clean) and leaves **every** worktree intact for retry — no partial-wave state ever survives. Safety extras: an advisory `flock` serializes coordinators (`MERGE_IN_PROGRESS`); attached-/clean-target preconditions; conflicted paths are attributed back to the subtasks that touched them (declared-disjoint `affected_files` is only a scheduler hint, so actual changed-file overlap is reported as advisory telemetry while git's textual conflict stays the hard guard). The shared `_wt_freeze_and_verify` primitive (commit + guards + pre-merge verify) is extracted once and reused by both the single-subtask and wave merge paths. CLI: `merge_wave_worktrees <ST…> [--branch B] [--verify-cmd CMD…] [--skip-verify] [--post-wave-cmd CMD…] [--skip-post-wave]`. Phase 3 (context-budget hooks) remains open on #284.
+- **Per-subtask git worktree isolation for `/map-efficient` (`worktree.isolation`, part of #284).** Opt-in, OFF by default. When enabled, each subtask's Actor runs in a dedicated, throwaway git worktree and its result is squash-merged back into the working branch ONLY after the configured `verification_checks` pass IN the worktree (a **pre-merge** gate, strictly stronger than today's post-commit check) — a rejected attempt (Monitor `valid=false` / Evaluator fail) is discarded so the working branch is never touched by a bad attempt. The Python step runner owns the whole lifecycle and every safety guard (producer-owns-parse): `create_subtask_worktree` (crash-safe remove-and-recreate; guards: not-a-repo, protected-ref, nested-worktree refusal, active-git-op, `subtask_id` ref/path sanitization, dirty-main refusal, submodule init), `merge_subtask_worktree` (guards run BEFORE the working branch is touched: base-divergence `git merge-base` check, runtime-state-in-diff, configurable bulk-deletion threshold `worktree.max_deletions`, submodule-pointer change, detached-HEAD, then the pre-merge verify gate; accept = `git merge --squash` + one runner-authored commit, never `--no-ff`, preserving one-commit-per-subtask), `discard_subtask_worktree` (atomic reject, idempotent, optional `--save-patch` forensics), and `worktree_isolation_status` (reconciles recorded vs live worktrees). Worktrees are stored OUT of the working tree under the repo's git common dir (`<git-common-dir>/map-framework/worktrees/`), so `git clean -fdx`, recursive scanners, and accidental commits can never touch them; MAP runtime state (`.map/<branch>/...`) always resolves against the main checkout — state-mutating commands refuse if invoked from inside a managed worktree (the silent state-desync footgun). Every guard returns a structured `{kind, message}` the skill branches on. Config keys `worktree.{isolation,max_deletions}`; new `worktree` manifest stage; `.map/<branch>/worktrees.json` sidecar. Design was llm-council-reviewed (runner-owned worktrees over harness-native `isolation="worktree"`; squash-merge over `--no-ff`; always-discard on reject; pre-merge verification + crash-safe retry + atomic reject folded in so the slice is not a no-op; explicit state-root separation). Phase 2 (wave/DAG parallelism) and Phase 3 (context-budget hooks) remain open on #284.
+- **Cross-AI peer review for `/map-review` (`--cross-ai <runtime>`, part of #288).** `/map-review --cross-ai codex|gemini|claude|opencode` dispatches the review to an INDEPENDENT external AI CLI for a true second opinion (different model/vendor, fresh context with no shared session). The dispatch, parsing, normalization, and untrusted-wrapping all live in the Python step runner (`run_cross_ai_review` / `dispatch_cross_ai_review`, producer-owns-parse) — the skill only handles consent and presentation. Egress is **double-consent**: the per-run `--cross-ai` flag AND `review.cross_ai.enabled: true` in `.map/config.yaml` (off by default) are both required, because the diff/code leaves the machine. Mandatory guardrails: a **high-confidence outbound secret scan** (private keys, AWS/GitHub/Google/Slack credentials) BLOCKS dispatch before the subprocess and surfaces only the pattern name, never the value; the external CLI is invoked `shell=False` with a literal-argv adapter and a configurable timeout; the returned findings ALWAYS enter context behind an `EXTERNAL UNTRUSTED REFERENCE` fence (link/injection scan, applied deterministically in Python so the model cannot skip it) and are advisory-only (`source: cross_ai`, never auto-applied); same-vendor runtimes (`claude`) are honestly labeled `independent_vendor: false`. Any dispatch failure (disabled, CLI missing, not authenticated, timeout, non-JSON output, secret-blocked) degrades non-blockingly and falls back to the in-session review. Config keys `review.cross_ai.{enabled,runtime,timeout_seconds}`. Design was llm-council-reviewed (Python-owned dispatch; single-runtime slice with `--cross-ai all` consensus deferred to a follow-up slice).
+- **Adversarial multi-perspective code review (`/map-review --adversarial`).** Runs three parallel independent reviewers with isolated contexts instead of a single monitor pass: Blind Hunter (diff-only, unbiased by stated intent), Edge Case Hunter (diff + repo read; null handling, boundaries, error paths), and Acceptance Auditor (diff + spec + artifacts; missed requirements, AC gaps). Adds a `--quick` flag (Blind + Acceptance, skips Edge Case) and a `--show-raw-findings` debug flag. Findings use a structured severity/category/evidence/failure_mode schema, deduplicated via deterministic clustering with corroboration signals, and rolled up into a unified report with a convergence section and all-clear statements. New `build_adversarial_review_prompts()` / `aggregate_adversarial_findings()` in the step runner, plus an `adversarial-reference.md` workflow doc. This is the Claude-side feature the Codex port (above) mirrors.
+- **`mapify tokenreport` dashboard, history, estimate, and export modes (closes #289).** `token_report_dashboard()` adds a box-drawing visual layout (session summary, per-subtask bar chart, per-agent/model breakdowns, vs-previous-session comparison); `record_session_snapshot()` persists `token_history.jsonl` for `token_report_history()` trend analysis; `token_report_estimate()` gives a weighted cost projection; `token_report_json()` / `token_report_csv()` support CI/export. New CLI flags: `--dashboard`, `--history`, `--json`, `--csv`, `--estimate`, `--finalize`.
+- **Learned rules scoped by `path_glob` (closes #280).** Rules with a `paths:` frontmatter key are now filtered before Actor context and personal-rules injection, and only load when the agent is working on matching files — aligning with Claude Code's hierarchical rule-loading pattern instead of injecting every learned rule into every subtask regardless of relevance.
+- **Auto-created GitHub Release in the release CI workflow (closes #279).** `release.yml` now uses `softprops/action-gh-release@v2` to auto-create the GitHub Release (with a changelog excerpt) on tag publish, with the required `contents: write` / `id-token: write` permissions. The manual Phase 5.4 (`gh release create`) step is dropped from the `/map-release` skill; the summary/checklist now reference the auto-created release URL instead.
+
+### Fixed
+- **`detect_actor_files_changed_mismatch` no longer false-positives on MAP-only subtask artifacts (closes #277).** The actor files-changed gate validated every declared file against `_current_subtask_changed_files`, which derives from `git diff`/`git status` and strips the gitignored framework trees (`.map/`, `.codex/`, `.agents/`). A subtask whose only declared `affected_files` entry was a MAP artifact (e.g. `.map/<branch>/verification-summary.md`) therefore always reported `status_mismatch=true` with a false "Actor declared files it did not write" recovery instruction, making MAP-only documentation/verification subtasks look like truncated actor edits. The detector now partitions declared files: git-tracked files keep the diff check, while MAP-internal artifacts are validated by filesystem existence + non-empty content (a missing or empty artifact is still a real mismatch). MAP-artifact validation is independent of git availability, so a MAP-only subtask is never forced into a false mismatch by a git error. A new shared `_is_map_internal_artifact` helper de-duplicates the framework-tree prefix list used by both the strip filter and the new validation path.
+- **Workflow-context injection no longer fires on a terminal `COMPLETE` state (closes #317).** When `step_state.json` has `current_step_id` or `current_step_phase` equal to `"COMPLETE"`, `format_reminder()` now returns `None` immediately via a terminal-state guard, so the hook emits `{}` instead of a misleading "REQUIRED: Complete phase COMPLETE" banner after a workflow has already finished. Added a `_TERMINAL_STEP_IDS` frozenset constant and regression tests covering both the subprocess-integration and unit (`format_reminder`) paths.
+- **`record_test_baseline` timeout is now fail-safe, not fail-open (closes #307).** When the baseline subprocess timed out it never finished, so `baseline_failures` was always `[]` — indistinguishable from a genuinely clean suite, silently treating any pre-existing failure as "not pre-existing" and defeating the regression-vs-pre-existing distinction. Status is now `"timed_out"` (distinct from `"baseline_failures"`); a new `baseline_complete: bool` field is `false` on timeout so downstream code can check it before trusting an empty baseline; `list_baseline_failures` propagates `baseline_complete`/`timed_out` and emits a `warning` key when the stored baseline is incomplete. Default `timeout_seconds` raised from 120 to 600 to give most suites room to finish; `--timeout` still accepts an explicit value.
+- **Bare-basename spec citations now auto-resolve instead of hard-failing (closes #301, closes #300).** `validate_spec_citations.py` resolves a bare filename citation (e.g. `api.ts:80`) automatically when it is unique in the repo; an ambiguous bare basename now produces a non-blocking warning instead of a hard error, and a genuinely missing file gets a clearer error message. Separately, `/map-plan` Step 0's research-agent now writes its full report directly to disk (with the pipe-based fallback kept), documenting the `SendMessage` vs. new-`Agent()` footgun for future skill authors.
+
+## [3.20.0] - 2026-06-26
+
+### Added
+- **Automatic cleanup of MAP-internal workflow IDs from shipped code.** At workflow completion (`WORKFLOW_COMPLETE`), the new `scrub-internal-ids.py` Stop hook strips leaked internal identifiers — subtask `ST-001`, acceptance criteria `AC-3`, verification criteria `VC1`, invariants `INV-7`, hard constraints `HC-1` — that an Actor wrote into the code a run changed — as comments (`// The rule (INV-7) is:`) or test names (`test_vc1_*` → `test_*`). The deterministic engine (`.map/scripts/scrub_internal_ids.py`) is hard-scoped to the run's git diff (only files the run changed, only the lines it added; pre-existing IDs on untouched lines are never modified) and to recognized source files using each language's comment syntax (`#`, `//` + `/* */`, `<!-- -->`, …). It strips ID tokens **inside comments** (deleting pure-marker comment lines) and renames `vc<n>` test identifiers with a collision guard. IDs in code, string literals, docstrings, and data files (`.json`, …) are deliberately left intact and only *reported* — stripping a string substring would corrupt legitimate values (e.g. `"INV-7-special-sku"`) and `#` is a heading, not a comment, in markdown. It re-scans for residual. It then commits the cleanup as a dedicated `chore(map): strip internal workflow IDs` commit, runs exactly once per completed run, no-ops outside a completed run, honors `MAP_INVOKED_BY`, and can be disabled with `scrub_internal_ids: false` in `.map/config.yaml`. The Actor prompt now also forbids writing these IDs into comments/strings (the transient `test_vc<n>` grep aid stays during the run and is renamed at close). Claude provider only — the Codex hook model has no `Stop` event; the shared engine ships to `.map/scripts/` regardless.
+
+## [3.19.0] - 2026-06-24
+
+### Fixed
+- **Blueprint affected-files refresh no longer shrinks approved subtask scope after resume (closes #273).** `refresh_blueprint_affected_files` now merges the computed actual delta into existing `affected_files` by default, preserving files that were already approved but excluded from the per-subtask baseline. The old destructive rewrite behavior remains available only via explicit `--replace`, and reports now expose both `actual` and `mode`.
+- **Plan resume requires an overlap floor, not containment alone (closes #274).** `check_plan_resume()` no longer returns a false `resume` verdict (with the dangerous "existing step_state ⇒ plan complete, print checkpoint and STOP" recommendation) when the new goal merely overlaps a contained-but-near-zero existing plan. The verdict now requires a minimum goal overlap in addition to containment, so a genuinely different goal starts fresh instead of silently resuming a stale plan.
+- **Codex `hooks.json` no longer carries an unsupported `_map_managed` top-level key (closes #270).** The codex hooks-JSON generator merged MAP metadata as a top-level `_map_managed` object, which the Codex runtime rejects. The generator now writes only the supported `hooks` structure and keeps MAP's managed-merge bookkeeping out of the emitted file.
+- **`/map-efficient` resume prefers `blueprint.json` for ordered subtask IDs (closes #264).** `resume_from_plan`, `resume_single_subtask`, `resume_from_test_contract`, and `get_plan_progress` now read ordered `ST-XXX` IDs from `blueprint.json` first, falling back to markdown `task_plan` parsing (including the `/map-plan` table layout with IDs in the first column). `set_subtasks` normalizes whitespace-joined arguments and rejects malformed subtask IDs, so resume no longer fails to parse a well-formed plan and force a manual `set_subtasks`.
+
+### Added
+- **Opt-in `--autonomy` posture for `mapify init` (claude provider).** `mapify init --autonomy` writes a "YOLO-minus-git" permission set — broad auto-approve (`Bash(*)`, `Read/Edit/Write/MultiEdit/Glob/Grep/LS(*)`) plus a `Bash(git commit:*)` / `Bash(git push:*)` deny — into the **per-user, gitignored** `.claude/settings.local.json`, leaving the committed team `.claude/settings.json` as the secure curated baseline. Because the permission-level git deny is bypassable under a broad `Bash(*)` allow (`bash -c 'git commit'` matches as `bash`, not `git commit`), enforcement is the `safety-guardrails.py` PreToolUse hook: it now hard-blocks `git commit`/`git push` (including shell-wrapped and chained forms) **gated on a `mapify.autonomy` sentinel** the installer writes beside the permissions, so posture and permissions can't drift apart and the standard commit workflow is never broken for non-autonomy users. `--no-autonomy` cleanly removes the block; omitting the flag leaves any existing local posture untouched on re-init. `mapify init --autonomy` also gitignores `.claude/settings.local.json` so the personal posture can't leak to the team. The codex provider ignores the flag (it installs neither file). Design was llm-council-reviewed (per-user opt-in over team/global default; hook enforcement over permission-deny-alone; sentinel embedded in `settings.local.json`).
+- **Merge-conflict resolution guardrail (closes #256).** The workflow-context injector now surfaces MAP conflict-resolution guidance during a git merge/rebase preflight and whenever the index holds active unmerged paths. It detects conflicted paths read-only via `git diff --name-only --diff-filter=U -z --` (the existing `step_state.json` gate is preserved) and documents the per-file, intent-preserving, test-after-each-batch protocol so conflicts are resolved one file at a time rather than with bulk overwrites.
+- **`defer_flaky_subtask` orchestrator command for validated flaky Monitor outcomes (closes #252).** When a Monitor verdict is an explicit `deferred_nondeterministic` outcome, the orchestrator can now persist the non-green flaky evidence metadata in `step_state.json` and advance without requeueing Actor, preserving run-health completion parity instead of grinding the retry loop on a known-flaky check.
+- **`run_flaky_test_triage` repeat runner for `/map-efficient` (part of #252).** New step-runner subcommand repeats an exact `argv` command with `shell=False` and records flaky-test evidence automatically into `flaky_test_triage.json`, preserving bounded stdout/stderr tails, timeout, and duration evidence. No shell interpretation by default (shell behavior requires explicit argv such as `bash -lc`); output tails are tempfile-backed to avoid unbounded in-memory capture. Design was llm-council-reviewed (argv-based runner; core Monitor/orchestrator state-machine integration deferred).
+- **Qualitative convergence sidecar for high-risk Monitor/self-review gates (issue #257).** New step-runner subcommands `record_qualitative_convergence <gate-id> <pass-json> [--scope monitor|self_review] [--required-clean-passes N] [--max-passes N]` and `validate_qualitative_convergence [path]` persist append-only qualitative review passes in `.map/<branch>/qualitative_convergence.json` and register the `qualitative_convergence` manifest stage. Validation re-derives the tail clean streak from the pass log (`clean, dirty, clean` with K=2 is not converged), rejects `clean=true` with critical findings, requires evidence even for clean passes, and treats `max_passes_exceeded` as a hard stop/escalation rather than a pass. Scope is deliberately limited to qualitative `monitor` / `self_review`; deterministic build/test/lint gates remain single-pass. Part of #251.
+- **Flaky-test triage artifact for `/map-efficient` (issue #252).** New step-runner subcommands `record_flaky_test_triage <check-id> <outcomes-json> [--command ...] [--reason ...] [--branch ...]` and `validate_flaky_test_triage [path]` persist repeated check outcomes in `.map/<branch>/flaky_test_triage.json` and register the `flaky_test_triage` manifest stage. Mixed pass/fail repetitions classify as `disposition:"deferred_nondeterministic"` with `monitor_verdict_policy:"not_valid_without_explicit_triage"` and operator requirements that forbid weakening, skipping, deleting, or treating the artifact as a passing gate. All-failing repetitions classify as `deterministic_failure`; all-passing repetitions classify as `not_reproduced`. Package schemas and run-health artifact inventory now understand the new artifact, while keeping the core Monitor/orchestrator binary verdict path unchanged. Part of #251.
+- **Intra-run failure memory for the Actor→Monitor retry loop (issue #253).** When Monitor rejects the *same* subtask the *same way* twice, `/map-efficient` now injects a binding anti-stagnation constraint into the next Actor attempt so the loop stops re-walking a dead end (token burn / identical rejected diffs). Four deterministic step-runner subcommands implement it: `record_failure_signature "<feedback>" <subtask_id> [--source monitor_rejection|test_failure|gate_failure]` conservatively normalizes the failure (strips line numbers, absolute-path prefixes, hex/uuid/addresses, timestamps, ANSI; preserves exception types, file basenames, symbol/test names, assertion text), hashes it, and arms on the 2nd identical signature; `build_anti_repeat_constraint <subtask_id> [--quarantine-active]` renders the `<intra_run_failure_memory>`-delimited block (shows the human-readable sample, never the hash) and returns empty when nothing is armed or a CLEAN_RETRY quarantine is active that iteration; `set_anti_repeat_subtask_status <subtask_id> succeeded|failed|escalated` records the terminal disposition; `collect_anti_repeat_learn_candidates` feeds `write_learning_handoff` so armed signs from **non-succeeded** subtasks become `/map-learn` candidates (a subtask that eventually passed is excluded — it found a way through). The constraint is *anti-stagnation*, not *anti-approach*: it binds the next delta to resolve the repeated failure, never bans a whole approach. Generic rejections with no concrete anchor ("tests still fail") are recorded `low_specificity` and **never arm**. At the 3rd identical failure the record sets `escalation_recommended=true` as a SIGNAL only — bounded-effort escalation (#255) owns the stop decision; this slice never skips the Actor call. Durable store: `.map/<branch>/anti_repeat.json` + `anti_repeat` manifest stage; thresholds are env-tunable (`MAP_ANTI_REPEAT_ARM_THRESHOLD`, `MAP_ANTI_REPEAT_ESCALATE_THRESHOLD`). Complements — never duplicates — `log_agent_failure` (FORMAT failures only) and `retry_quarantine` (one-shot CLEAN_RETRY). Design was llm-council-reviewed (hard anti-stagnation + generic-failure guard + per-subtask scoping + CLEAN_RETRY suppression). Part of #251.
+- **Bounded-effort escalation: "act once, then escalate" (issue #255).** Turns the #253 `escalation_recommended` SIGNAL (previously written but never consumed) and the orchestrator's `max_retries` hard cap into ONE deterministic terminal outcome instead of grinding the Actor→Monitor loop to the ceiling on a dead end. New step-runner subcommand `build_escalation_outcome <subtask_id> <reason> [--retry-count N --max-retries M] [--quarantine-active]` (reason ∈ `repeated_failure | max_retries`) emits a structured `{status:"escalated", outcome, reason_code, attempts, blocker_summary, repeated_failures, recommended_action}`, sets the subtask's anti-repeat status to `escalated`, writes a durable human-readable `.map/<branch>/escalation_<subtask>.md` blocker report, and registers a new `escalation` manifest stage. The outcome splits on cause: a **3rd identical** failure short-circuits to `outcome:"BLOCKED"` (the constraint armed at the 2nd identical failure was the single bounded recovery act, so the legacy retry-3 Stuck-Recovery is bypassed for identical-failure loops, kept for non-identical stuckness), while budget exhaustion across **differing** failures is `outcome:"CLARIFICATION_NEEDED"`. The stop is re-derived from the anti_repeat store INSIDE the subcommand — a spurious/hallucinated call returns `status:"not_escalated"` (the loop resumes), never a fabricated stop; it binds to the *latest* signature (a fresh failure on the last attempt → resume), a CLEAN_RETRY iteration (`--quarantine-active`) defers the stop so the one-shot reset runs first, and the call is idempotent. The orchestrator's tested retry math is untouched; the runner owns the store (producer-owns-parse). Directly serves "surface blockers, don't fake progress". Design was llm-council-reviewed (hard short-circuit at the 3rd identical signature; BLOCKED vs CLARIFICATION_NEEDED split; deterministic runner-side guard over SKILL prose). Part of #251.
+- **Repro-probe root-cause gate for `/map-debug` (issue #254).** `/map-debug` now *enforces* the "no fix without root cause" Iron Law instead of only preaching it. Before any fix, the agent writes a small self-contained executable probe under the gitignored `.map/<branch>/repro/` that exits `42` while the bug reproduces and `0` once it is gone. Two new deterministic step-runner subcommands gate the fix: `record_repro_probe <probe> [--root-cause … --timeout N --runs N]` copies the probe into an immutable runner-owned locked snapshot, executes it (`shell=False`, hard timeout + process-group kill, `stdin=/dev/null`, bounded output capture, path-containment) and arms the gate only when the runner *witnesses* exit 42 — a self-reported claim never satisfies it; `verify_repro_resolved` re-runs the **same frozen snapshot** (re-checking its sha256) after the fix and passes only on the 42→0 flip. A missing reproduced probe, a still-reproducing probe, an inconclusive run, or a tampered snapshot is a hard stop (CLI exits non-zero). The durable verdict lives in `.map/<branch>/repro_probe.json` and a new `repro_probe` manifest stage; throwaway probes are kept out of VCS via a self-contained `.map/<branch>/repro/.gitignore` (the user's own `.gitignore` is never touched). The runner proves a *witnessed behavioral flip*, not that the probe captures the real root cause — Monitor still owns that semantic judgment. Design was llm-council-reviewed (Option A: sentinel exit contract + frozen snapshot). Part of #251.
+- **Deterministic decomposition-completeness gate (issue #249).** `validate_blueprint_contract` now runs a forward-coverage set-diff between the spec's **Requirements Index** (`mapify:requirements-index:v1` fenced YAML, one `{id, kind}` entry per acceptance criterion / invariant / hard constraint / cross-cutting concern) and `coverage_map` keys. The index is the authoritative requirement list and lives in the spec, not the blueprint, so the decomposer cannot self-certify the set it is measured against. Uncovered requirements produce a **warning** by default; set `MAP_STRICT_COVERAGE=1` for a hard error (off by default — staged migration). An absent index (e.g. the `/map-efficient` no-spec path) emits a loud warning and skips the check — never a silent pass. A malformed index is always a hard error. Confidence is qualitative (`high | medium | low`) with a one-line basis; no numeric scores. Non-blocking guardrails: prose-orphan detection (canonical IDs in spec prose outside the index), reverse-phantom detection (`coverage_map` keys absent from the index), and an ownership-distribution report with a configurable fan-in warning (`_COVERAGE_FANIN_WARN`, default 3). Structural checks: entry-point existence (non-empty plan must have at least one zero-dependency subtask) and warn-first max dependency depth (`MAX_DEPENDENCY_DEPTH` default 5, env override `MAP_MAX_DEPENDENCY_DEPTH`). Spike finding (ST-007): multi-node cycle DFS was evaluated and deliberately omitted — forward-dependency-ordering and `_topo_sort_subtasks` already reject all cycles; a regression test (`test_multinode_cycle_already_rejected`) guards both mechanisms.
+
+## [3.18.0] - 2026-06-21
+
+### Fixed
+- **PyYAML promoted to a hard runtime dependency (closes #245).** `pyyaml` was
+  declared only in the `test`/`dev` optional groups, so a normal install
+  (`uv tool install` / `pipx` / `pip install mapify-cli` without extras) shipped
+  without PyYAML. `project_config.load_map_config` then hit `ImportError`, warned
+  once, and **silently fell back to default config** — the user's entire
+  `.map/config.yaml` (`minimality`, `profile`, `compression_policy`, thresholds,
+  `language`, `prompt_layering`, …) was ignored by every config-dependent CLI path
+  (`minimality-report`, `mapify init` compression/sofa overrides). CI never caught
+  it because the dev/test groups *do* include `pyyaml`. Fix adds `pyyaml>=6.0.0` to
+  `[project].dependencies` in `pyproject.toml`. (The `.map/scripts/map_step_runner.py`
+  runner was unaffected — it reads config via a stdlib-only scalar parser — which is
+  why the defect hid.) Regression tests assert `pyyaml` is in the runtime dependency
+  table and that a non-default `.map/config.yaml` value actually loads.
+
+### Changed
+- **Prompt layering resolved as cache-neutral; `docs_first` stays the default (closes #231).**
+  The remaining field-gated step of #231 — measure `docs_first` vs `stable_first`
+  on a real multi-subtask run, then maybe flip the global default — is resolved
+  **on mechanism, not a fabricated measurement.** Anthropic prompt caching writes
+  a cache entry only at an explicit `cache_control` breakpoint on a content-block
+  boundary and hits require a byte-identical prefix up to that block; Claude Code's
+  Task tool owns the API call and **all** breakpoint placement, and MAP joins its
+  sections into one user-message string so the stable/variable seam lives *mid-block*
+  and can never become a cache boundary. The only byte-identical cross-dispatch
+  prefix (`tools` + role system prompt) is independent of `prompt_layering`, so both
+  modes benefit equally. Therefore `stable_first` yields **no incremental prefix-cache
+  hit** under the current Claude Code Task architecture. **No behavior change:** the
+  global default stays `docs_first`; `stable_first` remains opt-in and is **not** a
+  behavior no-op (it still changes token order/attention) and is never silently
+  remapped. `docs/ARCHITECTURE.md`, `docs/USAGE.md`, the `MapConfig.prompt_layering`
+  comment, the generated `.map/config.yaml` comment, the `map_step_runner.py` layering
+  comments, and `tests/test_prompt_layering.py` were de-overclaimed accordingly, and
+  re-open triggers were recorded. No `token_accounting.json` figures were fabricated —
+  per-subagent cache `usage` is harness-owned and not observable to MAP for Task
+  dispatches, which is exactly why an end-to-end run is a poor test of this hypothesis.
+- **Global `minimality` default flipped `off` → `lite` (Phase 3, closes #183).**
+  The promotion gate (`mapify minimality-report`) reached `candidate` and the
+  manual review gate passed against field telemetry, so the keyless default now
+  resolves to `lite` instead of `off` at BOTH layers: `MapConfig.minimality`
+  (`src/mapify_cli/config/project_config.py`) and the runner's
+  `_load_minimality_level` (`map_step_runner.py`). Projects that omit the key now
+  get the advisory complexity-lens / minimality doctrine (advisory-only — never a
+  verdict gate). Opt out with `minimality: off`. **Opt-out hardening:** YAML 1.1
+  parses bare `off` as boolean `False`, which the str field previously rejected and
+  silently dropped to the default — now the loader coerces a boolean `minimality`
+  back to the `off` level before type-checking, so `minimality: off` (quoted or
+  bare) reliably opts out. `generate_default_config` already wrote `minimality:
+  lite` for new projects, so generated configs are unchanged; only keyless/invalid
+  fallbacks move from `off` to `lite`. Regression tests pin the new default, the
+  bare-`off` opt-out, the invalid→`lite` fallback, run-health stamping, and the
+  doctrine/lens activation at the lite default.
+
+### Added
+- **`/map-plan` Step 0.6: Verify Live/Runtime State gate (#243).** A new
+  `depends_on_runtime_state` workflow-fit signal (6th signal on
+  `record_workflow_fit`, default `false`; CLI flag `--depends-on-runtime-state`,
+  legacy positional path unchanged) arms a gated **Step 0.6** between the
+  Already-Implemented gate (Step 0.5) and decomposition. It is the runtime
+  analogue of Step 0.5: where 0.5 stops you re-planning code that already
+  exists, 0.6 stops you planning against runtime facts that have drifted
+  (prod row counts, enum labels actually present in a live DB, a column that
+  already exists, the applied migration head, a live feature-flag value).
+  Each assumption is either verified read-only through an approved source
+  (replica/dashboard/metadata query — cite the derived fact, never persist
+  prod rows/PII/secrets into `.map/<branch>/` artifacts) or recorded as an
+  `Unverified Runtime Assumption` in the spec's Open Questions / Risks with the
+  exact check to run, with dependent subtasks marked `provisional`. The skill is
+  a planning-time gate, not a runtime tool — it suggests the read-only checks and
+  defers execution to the operator or an authorized sub-agent; it never
+  hard-stops merely because prod is unreachable. Mirrored into the Codex
+  `$map-plan` surface; detail + examples + safety guardrails live in the bundled
+  `plan-reference.md` (the active SKILL body stays under its line budget).
+  `WORKFLOW_FIT_DECISION_SCHEMA` gains the optional `depends_on_runtime_state`
+  boolean (not `required`, so pre-existing `workflow-fit.json` files still
+  validate). Design pressure-tested via llm-council (deep mode). New regression
+  tests pin the signal round-trip, the keyword CLI flag, the legacy-positional
+  default, schema backward-compat, and the gate prose across all rendered
+  Claude + Codex trees.
+- **Opt-in cache-friendly prompt layering for reviewer fan-out (Part of #231).**
+  `.map/config.yaml` now accepts `prompt_layering: docs_first | stable_first`
+  (default `docs_first`, behavior unchanged). `docs_first` keeps the historical
+  attention-optimized envelope (variable `<documents>` first, stable contract
+  last). `stable_first` reorders the stable `<task>`/`<workflow_policy>`/
+  `<instructions>`/`<expected_output>` contract ahead of the variable documents
+  so it forms a **byte-identical prefix** across repeated same-role Monitor/
+  Predictor/Evaluator (and complexity-lens) dispatches — the precondition for an
+  automatic prefix-cache hit. `_render_review_prompt` and
+  `_render_complexity_lens_prompt` route through a shared `_layer_prompt_sections`
+  helper; `build_review_prompts` reads `_load_prompt_layering()` and echoes the
+  active mode as `prompt_layering` in its result. Registered + validated on
+  `MapConfig` and documented (commented) in the generated config. The
+  attention-vs-cache tradeoff is unproven, so the **default does not flip**: it
+  is gated on a measured `docs_first` vs `stable_first` comparison (incremental
+  `cache_read` + no quality regression) — the measurement recipe and the
+  harness-owned-dispatch constraint are documented under "Prompt Layering &
+  Prefix Caching" in `docs/ARCHITECTURE.md`. The token-accounting `cache_read`
+  double-count the issue cited as a measurement caveat was already fixed and is
+  regression-tested, so the comparison numbers are trustworthy. New
+  `tests/test_prompt_layering.py` pins docs_first byte-identity and the
+  stable_first prefix invariant.
+- **Agent-Boundary Doctrine: written down + every live hand-off audited
+  `independent | relay` (#230).** `docs/ARCHITECTURE.md` now carries the explicit
+  criterion — keep a separate sub-agent **only** when it adds an independent /
+  adversarial perspective; collapse any **pure-relay** hop (a context that only
+  paraphrases a prior agent's output, emitting no new verdict) into its caller.
+  It is a *substance* rule, not a *wiring* rule. The doctrine includes a ground-truth
+  audit (classified from actual `subagent_type="…"` dispatch sites, not docs): all
+  8 pipeline-dispatched agents emit independent verdicts and none is a relay; the
+  only relay hops the doctrine condemns — the Self-MoA `synthesizer`/`debate-arbiter`
+  — were already collapsed in #240. The audit also resolves the orphaned
+  `documentation-reviewer` (zero skill dispatch sites) as a **deliberate keep**: it
+  emits a unique, non-relay verdict, so it is retained as an **optional,
+  user-dispatchable** agent (invoke via `Task(subagent_type="documentation-reviewer")`)
+  and now self-declares a `Dispatch status:` annotation. A new
+  `tests/test_agent_dispatch_audit.py` enforces the invariant going forward: any
+  agent shipped with no dispatch site and not marked optional fails the gate,
+  preventing a silent orphan from recurring.
+- **Hand-authored RESEARCH artifacts now self-correct on the first reject, and
+  the exact contract is documented (#228, follow-up to #197).** The documented
+  `save_research` path ("save direct current-session findings") used to cost 2-3
+  `validate_research` rejects because the strict schema enforced by the validator
+  (status enum, `confidence` float, `search_stats` field names, `lines: [start,
+  end]` with a ≤200-line span) lived only in code — the SKILL prose implied free
+  text (`"complete"`, `"high"`, `files_examined`). Now: (1) `validate_research`
+  echoes a copy-pasteable, structurally-valid artifact in a `skeleton` field on
+  ANY failure (bad JSON, wrong types, or a missing artifact), so the first reject
+  is self-correcting — copy it, swap your values, re-save; (2) the exact field
+  table + the same skeleton are documented under "RESEARCH artifact schema" in
+  the map-efficient `efficient-reference.md` (Claude and Codex), with the SKILL
+  RESEARCH section naming the exact status enum and pointing at it. Validator
+  behavior is unchanged for valid artifacts (no `skeleton` field is added).
+- **Compaction now offloads large tool outputs for on-demand retrieval instead
+  of dropping them (#232).** Before context compaction prunes old/large
+  tool-result bodies (grep output, test logs, whole-file reads), MAP now saves
+  each one at full resolution to a retrievable sidecar under
+  `.map/<branch>/compacted/` (an append-only `index.ndjson`, an agent-readable
+  `MANIFEST.md`, and per-output `*.txt` files with a self-describing header).
+  After compaction the post-compact hook points the agent at the manifest so a
+  dropped output is re-read from its sidecar **instead of re-running broad
+  discovery** — the exact re-discovery cost #203 fights. Provider-agnostic: the
+  Claude PreCompact hook and the Codex orchestrator budget warning both capture
+  at the same pre-drop point, sharing one `mapify_cli.tool_output_offload`
+  module. Gated by `compression_policy` — with the default `never` no offload
+  happens and `.map/<branch>/compacted/` is never created. Selection is
+  size-based (≥10K chars any tool, or ≥2K for `Bash`/`Read`/`Grep`/`Glob`;
+  `TodoWrite`/`AskUserQuestion`/`ExitPlanMode` never offloaded); the directory
+  is FIFO-capped (300 files / 100 MiB, evictions logged). **Security:** tool
+  outputs may contain secrets, so every sidecar is written `0o600` and a
+  self-contained `.gitignore` (`*`) is dropped into `compacted/` on creation so
+  it is never committed regardless of the host repo's ignore rules; bodies are
+  never redacted. Persistent Actor/Monitor prompt guidance landed as the
+  eval-gated follow-up #236 (below); the ephemeral post-compact pointer still
+  re-primes the next turn.
+- **Actor and Monitor persistently recover offloaded tool outputs across turns
+  (#236, follow-up to #232).** The #232 post-compact pointer only re-primed the
+  next turn; the map-efficient Actor and Monitor dispatched `<task>` prompts now
+  carry persistent guidance so recover-before-rediscover survives compaction
+  across turns. **Actor:** before re-running broad discovery (re-grep, re-read a
+  large file, re-run the full test suite), check
+  `.map/<branch>/compacted/MANIFEST.md` and `Read` the cited sidecar to recover
+  the earlier output, re-running the tool **only** on a concrete staleness
+  signal (recent edits, a new test run, an updated schema, or the task asking
+  for current state) — the default is sidecar reuse, not over-eager
+  re-discovery. **Monitor:** a sidecar is evidence of *what was checked*, never
+  sole proof of correctness — every verdict stays grounded in live source and a
+  current test run. Wording was validated with llm-council against the
+  documented eval risk (over-trust of stale snapshots vs. skipping needed fresh
+  discovery); the map-efficient `SKILL.md` line budget was bumped 502 → 504 for
+  the two prompt lines, which must live in the dispatched body.
+
+### Removed
+- **Self-MoA and Debate-Arbiter removed entirely from MAP (#230).** Both the
+  Self-MoA multi-variant pattern (`3×Actor → 3×Monitor → Synthesizer → final
+  Monitor`) and the Debate-Arbiter cross-evaluation pattern were documented
+  across `ARCHITECTURE.md`, `USAGE.md`, `INSTALL.md` and the plugin manifests but
+  **never wired into any skill** — no `/map-*` surface dispatched the
+  `synthesizer` or `debate-arbiter` agents, no `--self-moa` flag was ever parsed,
+  and there was no `/map-debate` skill. The orphaned `synthesizer.md` and
+  `debate-arbiter.md` agent templates, the Actor "Self-MoA Support" and Monitor
+  "Self-MoA Output Extension" prompt sections, the `agent_mcp_mappings` entries,
+  and all Self-MoA/Debate documentation are deleted. The shipped agent roster is
+  now **9** (was advertised as 11): TaskDecomposer, Actor, Monitor, Predictor,
+  Evaluator, Reflector, DocumentationReviewer, Research-Agent, Final-Verifier.
+  No runtime behavior changes — nothing dispatched these agents.
+
+### Fixed
+- **`record_test_baseline` silently skipped the MANDATORY pre-flight baseline in
+  monorepos (#229).** Auto-detect probed only the repo root, so when the module
+  lives in a subdir (e.g. `component-manager/go.mod` with no root harness) it
+  returned `status="skipped"` and the whole run proceeded with an empty baseline
+  — the cross-subtask regression gate could then no longer tell an introduced
+  regression from a pre-existing failure. Detection now probes the repo root
+  first, then shallow-scans the immediate subdirectories (one level) for a
+  single module that has a harness and runs the command from that dir (recording
+  `module_dir`/`run_dir`). When more than one subdir qualifies it refuses to
+  guess and skips loudly with `candidate_module_dirs`; the no-harness skip now
+  names the `--command`/`--module-dir` escape hatch. A new `--module-dir`/`--cwd`
+  flag forces the module dir for ambiguous or deeply-nested layouts. Documented
+  in `efficient-reference.md`.
+- **`/map-efficient` Actor truncation gate false-positived on every clean run
+  (#227).** The pre-Monitor `detect_truncated_agent_output --agent actor` gate
+  requires the Actor response to parse as a JSON object
+  (`files_changed`/`tests_run`/`validation_notes`/`blocker`), but the ACTOR
+  `<expected_output>` prompted for free-form prose — so every complete, correct
+  Actor response was flagged `truncated: true`, forcing a needless re-invoke
+  (token waste) or a manual operator override on each subtask. The ACTOR prompt
+  now instructs a strict JSON manifest mirroring the MONITOR contract: code is
+  written via tools first, then summarized into the four-field envelope (no code
+  or diffs inside the JSON). Detector and retry machinery are unchanged. The
+  rationale is documented in `efficient-reference.md`.
+
+## [3.17.1] - 2026-06-18
+
+### Fixed
+- **Broken and misleading prose in lower-tier MAP skill prompts (prompt-quality
+  audit).** Repaired shipped `SKILL.md` defects surfaced by a PQS audit: the
+  `/map-tdd` ACTOR example carried an unterminated `f"""` string (would break on
+  copy-paste) plus a duplicated `<TDD_Tests>` placeholder; `/map-state` declared
+  three conflicting versions (frontmatter `1.0.0`, `metadata` `3.1.0`, footer
+  `1.0.0`) — now all `3.1.0`; the auto-generated Troubleshooting footer in
+  `/map-fast`, `/map-debug`, `/map-tdd`, and `/map-release` referenced a
+  non-existent "What this command CANNOT do" section and shipped a
+  `<typical args>` placeholder Examples block; the `/map-release` validation-gate
+  matrix listed a "Black format" gate that `make check` never runs (black is
+  `make format` only); and `/map-skill-eval` Troubleshooting required a
+  non-existent `id` field on eval-set entries (`cell_id`s are derived).
+
+### Changed
+- **Strengthened inhibition (NEVER rules) and output contracts in read/write MAP
+  skills.** `/map-state`, `/map-tokenreport`, `/map-memory-now`, and
+  `/map-skill-eval` gained explicit `Constraints (NEVER)` blocks (single-writer
+  enforcement, no direct `step_state.json`/run-log edits, read-only guarantees,
+  no auto-persisting secrets or flipping user config) plus fixed output-report
+  templates and a skill-eval self-check — raising prompt quality without changing
+  runtime behavior. The `/map-debug`, `/map-fast`, `/map-tdd`, and `/map-release`
+  Examples/Troubleshooting sections now reference real sections and real example
+  invocations.
+
+## [3.17.0] - 2026-06-18
+
+### Added
+- **`/map-understand` interactive learning mode (#221).** MAP now ships an
+  opt-in deep-understanding slash surface for Claude and Codex. It keeps a
+  transient Markdown checklist in the conversation, teaches code/diffs/workflow
+  artifacts incrementally, asks restatement or quiz checks without revealing
+  multiple-choice answers early, and stays separate from normal workflow
+  verbosity and `/map-learn` persistence.
+- **Minimality rollout telemetry can now be inspected before the Phase 3 default
+  flip (#180/#183).** `run_health_report.json` records the workflow's historical
+  `minimality` level, and `mapify minimality-report` compares complete `off` and
+  opt-in cohorts for retry pressure, guard rework, and deferred-YAGNI reversal
+  rate before marking the local rollout as `candidate`, `hold`, or
+  `insufficient_data`. The report summary now includes `sample_gaps`,
+  `cohort_branches`, `next_actions`, and a candidate-only `manual_review_gate`
+  with opt-in branches plus a clarity/underscope checklist, so maintainers can
+  see the exact telemetry, stale historical-minimality branches, and human review
+  still needed before promotion.
+- **Decomposer pruning is now contract-gated and user-visible (#184).**
+  Blueprints can carry `requiredness`/`pruneable` metadata per active subtask
+  and a `deferred_yagni` parking lot for speculative omissions. The validator
+  rejects non-empty `deferred_yagni` under `minimality: off`/`lite`, requires
+  explicit REVIEW_PLAN approval warnings under `full`/`ultra`, and Actor context
+  now preserves approved omissions so they are not silently implemented or lost.
+- **Deferred YAGNI items can be restored before approval (#184).**
+  `map_orchestrator.py restore_deferred_yagni YG-NNN` moves one parking-lot
+  item into active subtasks, appends it to the task plan, and clears prior plan
+  approval so REVIEW_PLAN cannot proceed on stale scope.
+- **Research-agent localization quality can now be scored deterministically
+  (#200).** Maintainers can parse ResearchEvidence JSON or `path:line[-end]`
+  text citations, validate them against a fixture repo, and compute file-level
+  plus line-overlap precision/recall/F1 without live provider credentials.
+  The scorer is exposed as `mapify research-eval score` and covered by the
+  no-provider E2E artifact-contract suite.
+
+### Changed
+- **`/map-explain` now respects the user's language and scales depth to target
+  size (#224).** The skill writes prose in the user's established language
+  (code, identifiers, commands, and `file:line` refs stay English) instead of
+  always defaulting to English. The rigid always-emit-all-10-sections /
+  explain-every-line structure is replaced by a signal-first output spec:
+  size tiers with word-budget ceilings and load-bearing-line caps, a front-loaded
+  "Mental model in 60 seconds" block, read-tier section tags
+  (`[MUST READ]`/`[READ IF MODIFYING]`/`[SKIM]`), a single load-bearing-lines
+  table (merging the old "what every line does" + "why each line" sections,
+  repeated shapes explained once), before→after-first ordering for diffs,
+  adaptive sections with an `Omitted:` footer, and natural-language follow-up
+  offers. Applies to both the Claude and Codex surfaces.
+- **Research artifacts are now unified and consumed before broad search
+  (#209/#210).** Planning and per-subtask research now share a single artifact
+  shape across `/map-plan`, `/map-efficient`, and the research-agent, and Actor
+  is required to consume the persisted research artifact before launching its
+  own broad codebase search — enforced by `map_step_runner.py` so research spend
+  is not duplicated or ignored.
+
+## [3.16.0] - 2026-06-15
+
+### Added
+- **Research ROI is now visible in token and run-health diagnostics (#202).**
+  `token_accounting.json` records advisory `research_roi`, `/map-tokenreport`
+  prints per-agent cost plus research-vs-Actor/Monitor token share, and
+  `run_health_report.json` summarizes persisted research artifacts, parsed
+  status/confidence/location counts, low-confidence warnings, and token share.
+
+## [3.15.2] - 2026-06-15
+
+### Changed
+- **Codex `researcher` now shares the Claude `research-agent` ResearchEvidence
+  contract (#198).** Codex may use provider-specific search commands internally,
+  but `/map-efficient` research artifacts now explicitly preserve the same strict
+  JSON fields, bounded file-line evidence, and downstream Actor/Monitor
+  semantics across providers.
+
+## [3.15.1] - 2026-06-15
+
+### Fixed
+- **`/map-efficient` now distinguishes mandatory RESEARCH artifacts from
+  conditional research-agent delegation (#201).** Hook hints, Claude/Codex
+  workflow skills, orchestrator validation errors, and docs now tell operators
+  to persist a research artifact before Actor while using `research-agent` /
+  `researcher` only for broad, high-risk, or unclear discovery.
+
+## [3.15.0] - 2026-06-15
+
+### Added
+- **MAP RESEARCH artifacts are now validated before Actor work (#197).**
+  `validate_research` checks strict JSON, confidence/status/search stats,
+  bounded file-line evidence, safe relative paths, and over-broad location lists;
+  `validate_step 2.2` now blocks malformed or missing research before Actor can
+  consume it.
+
+## [3.14.0] - 2026-06-15
+
+### Added
+- **`/map-review` now runs an advisory what-to-delete lens when minimality is
+  enabled (#182).** Projects with `minimality: lite`, `full`, or `ultra` get an
+  extra complexity-only pass that reports `delete:`, `stdlib:`, `native:`,
+  `yagni:`, and `shrink:` opportunities plus a post-hoc `net: -N` estimate;
+  the output is never used as a verdict gate or Actor retry input.
+
+### Fixed
+- **`safety-guardrails.py` avoids regex/pathlib import overhead on common safe
+  file checks.** The hook now keeps `Read app.py`-style allow paths on a lighter
+  path while preserving regex checks for suspicious paths and custom config,
+  reducing macOS CI flake risk in the hook performance gate.
+
+## [3.13.1] - 2026-06-14
+
+### Fixed
+- **Release workflows now run `twine check` with modern packaging metadata
+  support.** CI, TestPyPI, and PyPI release jobs upgrade `packaging` alongside
+  `twine` using a `<26` upper bound for compatibility with environments that
+  still constrain `packaging`, avoiding `InvalidDistribution: ... license-file`
+  failures before publication (#195).
+
+## [3.13.0] - 2026-06-14
+
+### Added
+- **Minimality doctrine Phase 1 (#181)**: `.map/config.yaml` now supports a
+  `minimality` setting (`off`, `lite`, `full`, `ultra`). Existing projects with
+  no key preserve historical behavior (`off`), while freshly generated configs
+  opt into conservative `lite`. In `lite`, Actor receives smallest-sufficient
+  guidance, Monitor flags requirement-affecting over-engineering and risk drift,
+  Evaluator scores `simplicity` while keeping `completeness` highest-weight, and
+  Actor retries receive only BLOCKER-class Monitor feedback so non-blocking
+  style/docs/volume comments do not re-bloat the implementation.
+- **Repository licensing is explicit.** The source tree now includes the MIT
+  `LICENSE` file referenced by package metadata and project documentation.
+
+### Removed
+- **`deepwiki` MCP server is no longer installed, and `deepwiki`/`context7`
+  guidance is removed from all agent prompts.** `mapify init` no longer
+  configures the `deepwiki` MCP server in the project `.mcp.json`, the internal
+  `.claude/mcp_config.json`, the plugin manifests, or `.mcp.json.example`;
+  `--mcp all` and `--mcp essential` now install only `sequential-thinking`, and
+  `--mcp deepwiki` is treated as an unknown server. Every shipped agent prompt
+  (actor, monitor, predictor, evaluator, reflector, task-decomposer,
+  documentation-reviewer), the fallback agent generators, the MCP usage-examples
+  reference, the `map-debug` skill, and the user docs (INSTALL, USAGE,
+  ARCHITECTURE, CLI reference) had their `deepwiki` and `context7` references
+  removed; `sequential-thinking` is retained as the only MCP integration.
+
+### Changed
+- **Onboarding leads with the golden-path flow.** The ASCII banner now carries a
+  `/map-plan → /map-efficient → /map-check → /map-review → /map-learn` subtitle,
+  and the post-`init` "Next Steps" panel presents that loop in order (leading
+  with `/map-plan`) instead of leading with `/map-efficient`.
+- **README quick-start docs now show the `/map-plan` → `/map-efficient` flow
+  directly.** The README includes the terminal demo GIF and keeps the generated
+  `review-bundle.json` explanation in sync with the review workflow.
+- **Generated MAP scripts now read scalar `.map/config.yaml` settings without
+  importing `mapify_cli`.** Actor minimality context and subtask-boundary
+  compression advice now work in generated projects even when the `python3` used
+  to run `.map/scripts/*` cannot import the globally installed `mapify_cli`
+  package.
+
+### Fixed
+- **Release validation now uses the maintained project gate.** The shipped
+  `map-release` skill, release guide, and release checklist use `make check`
+  plus explicit `uv run --with build` / `uv run --with twine` package checks
+  instead of the stale Black-specific gate that failed on generated files (#186).
+- **Release changelog completeness checks ignore release-note maintenance commits.**
+  The `map-release` heuristic no longer counts `docs(changelog)` or
+  `chore(release)` commits as user-visible changes that need their own
+  changelog bullet (#191).
+- **Release tag annotations now include the versioned changelog excerpt.**
+  `scripts/bump-version.sh` extracts notes from the just-created release section
+  instead of the now-empty `[Unreleased]` section, avoiding fallback tag messages
+  such as `Release version X.Y.Z` (#194).
+
+## [3.12.1] - 2026-06-12
+
+### Changed
+- **Legacy unfenced managed files are now silently upgraded to the fenced
+  layout, removing the alarming `MIGRATION:` stderr flood on every `mapify
+  init`.** Previously a managed file that carried metadata but no `map:start` /
+  `map:end` fence (a pre-fence "Phase B" install) printed a scary per-file
+  `MIGRATION: … Re-install with mapify to add fence structure.` line to stderr —
+  yet the re-install never actually added the fence, so the file stayed
+  unfenced and the same lines re-appeared on **every** subsequent `mapify init`.
+  The copier now completes the migration in place: it writes the proper fence
+  markers around the managed region (exactly like a fresh install), so the
+  upgrade is genuinely one-time and the notice no longer reprints. The upgrade
+  is silent; drifted files are still backed up to `.bak.<ts>` before rewrite.
+
+## [3.12.0] - 2026-06-12
+
+### Changed
+- **`mapify upgrade` now self-upgrades the CLI to the latest release.**
+  Previously `mapify upgrade` refreshed the *current project's* shipped MAP
+  files (and, on Codex projects, only printed a re-init hint). It now upgrades
+  the installed `mapify-cli` package itself: it auto-detects the install method
+  and runs `uv tool upgrade mapify-cli` (uv tool installs) or
+  `python -m pip install --upgrade mapify-cli` (pip installs). The command is
+  now provider-agnostic and writes no project files. When already on the latest
+  release it does nothing; when run from a source checkout / editable install,
+  self-upgrade is disabled. To refresh a project's shipped MAP files with the
+  new templates after upgrading, run `mapify init . --force`.
+
+## [3.11.0] - 2026-06-12
+
+### Added
+- **Opt-in Stack Overflow for Agents (SOFA) integration (#169, #176, #177)**:
+  a new, **off-by-default, read-only** integration enabled with
+  `mapify init --sofa` (persisted as `MapConfig.sofa_enabled` /
+  `sofa.enabled` in `.map/config.yaml`). Ships a stdlib-only `sofa_client.py`
+  (interactive 7-step onboarding, session handling, 401-retry, credential
+  resolution) and a `/map-so-search` skill (`skillClass=hybrid`) that queries
+  SOFA and renders results behind an UNTRUSTED-content boundary, degrading to
+  a no-op when the feature is disabled or offline. Init idempotently merges
+  `.sofa/` into `.gitignore` only under `--sofa`. Credentials are never
+  auto-persisted — the user is instructed to export `SOFA_API_KEY` themselves.
+  Cross-cutting zero-network proofs assert no network call happens unless the
+  feature is explicitly enabled, and golden render-parity tests cover the new
+  surfaces across both provider trees.
+- **Cross-session memory + recall (#157)**: a write-ahead-log → lazy-digest →
+  recall pipeline so the framework carries learned context across sessions
+  instead of starting cold each run.
+- **Skill-evaluation harness + description optimizer (#158, #159, #160, #161)**:
+  a skill-eval engine (MVP) with outcome eval-sets, a skill-description
+  optimizer, and an HTML results viewer, plus a whole-skill outcome-eval
+  harness and `map-task` body hardening. The optimized `map-plan` description
+  is applied, and skill-eval/A-B polish trims ~1,000 lines of example bloat
+  from the MAP agent prompts.
+- **Personal/repo-global learned-rules layer (#153)**: a layered learned-rules
+  system under `.claude/rules/learned/*.md` (architecture/error/security
+  patterns) with a MONITOR-gate fix so captured rules feed back into the
+  workflow.
+- **Skill manifest dependencies (#156)**: declarative skill manifest
+  dependencies with a consistency test and a host-conditional install gate.
+- **`MAP_INVOKED_BY` recursion-guard contract for MAP hooks (#152)**: a
+  recursion guard wired into the shipped hooks to prevent self-triggering
+  loops, backed by a `lint-hooks.py` linter (wired into `make lint` /
+  `make check`) and a `hook-patterns.md` classification of all shipped hooks.
+- **MAP cross-workflow safety guards (#147)**: blast-radius checks, a
+  recommendation gate, and actor-mismatch detection so one workflow cannot
+  silently corrupt another's state.
+- **Single-source template render + fence-aware managed-file copier (#155)**:
+  consolidates every generated tree behind one `templates_src/` source with a
+  fence-aware copier; the render invariant is enforced by `make check-render`.
+- **Agent-review harness hardening (#145)**: a single source-of-truth for
+  agent output schemas, a retry-prompt builder derived from that schema, and
+  failure telemetry.
+- **`/map-efficient` learning-handoff (#154)**: emits a deferred `/map-learn`
+  handoff that auto-loads on the next run, plus a cross-subtask regression
+  gate (#143).
+- **Already-implemented gate in `/map-plan` (#150)** and a spec `file:line`
+  citation validator (#149).
+- **Clean retry quarantine (#140)** and **mutation-boundary prompt
+  guardrails (#139)**.
+- **Token-budget decision artifact (#136)** and **context-first XML prompt
+  envelopes (#131)** for MAP agent prompts.
+- **Codex `map-efficient` skill (#151)** and a skill IR audit for provider
+  templates (#132).
+- **Cross-cutting prep plumbing (#148)**: a `jinja2` runtime dependency, a
+  `host-paths.md` contract doc, and a `_locking.py` flock primitive.
+- **`normalize_blueprint` deterministic repair pass (#168)**: a new runner
+  function (and `/map-plan` Step 5.55) that fixes the two self-consistency
+  drifts the `task-decomposer` routinely emits, so planning is self-serve
+  (`decompose → normalize → validate → proceed`) instead of requiring manual
+  JSON surgery between Step 5 and the Step 5.6 contract gate. It (1) stably
+  topologically sorts `subtasks[]` so every dependency is declared before its
+  dependents — satisfying `validate_blueprint_contract`'s forward-dependency
+  invariant without reordering by hand (independent subtasks keep their order;
+  a true cycle is left for the validator to reject), and (2) for every
+  `coverage_map[req] = owner` whose owner's `validation_criteria` doesn't cite
+  `[req]`, appends a `[req]`-tagged criterion. It never invents `coverage_map`
+  ownership or rewrites dependency edges — genuine semantic gaps still fail
+  Step 5.6. Idempotent. Run via
+  `python3 .map/scripts/map_step_runner.py normalize_blueprint [<path>] [--check]`.
+- **Per-subtask token accounting**: a new `map-token-meter` hook (wired on
+  `SubagentStop` and `Stop`) reads each transcript's per-turn `usage` and
+  attributes input/output/cache-creation/cache-read tokens to the active
+  subtask, phase, and agent. Rows append to `.map/<branch>/token_log.jsonl`
+  (deduplicated by message id) and roll up into `token_accounting.json` with
+  `by_subtask`/`by_agent`/`by_phase` buckets, `est_cost_usd` (priced per model
+  in `MODEL_TOKEN_PRICES`), and `cache_hit_ratio`. Inspect via
+  `python3 .map/scripts/map_step_runner.py token_report <branch>`. The
+  parsing/recording/rollup logic is self-contained in `map_step_runner.py`
+  (stdlib only) so it works in generated projects without `mapify_cli`
+  importable; the meter is advisory and never blocks a turn.
+
+### Changed
+- **Agent prompt budgets tightened**: Actor context budget is now enforced
+  (#134), `/map-review` reviewer prompts are bounded (#135), and the MAP
+  harness context gates are hardened (#141).
+- **High-traffic skill bodies compacted**: the `map-resume` skill body (#137)
+  and other high-traffic MAP skill playbooks (#138) were slimmed down.
+- **Build/CI runs through `uv run`**: lint and tests invoke `uv run` and
+  `pyright` is pinned to the project venv, so a global interpreter on `PATH`
+  can no longer shadow the venv and produce phantom failures.
+- **Closed the shipped TDD handoff plan item (#133)**.
+
+### Fixed
+- **Token accounting double-counted ~2× (#165)**: the token-meter re-logged
+  repeated `msg_id` entries (one row per content block); rows are now
+  deduplicated by message id so `est_cost_usd` is no longer inflated.
+- **Co-authored test files no longer trip `validate_mutation_boundary`
+  (#163)**: files carrying a co-author trailer are recognised as in-scope
+  subtask work instead of being flagged as an out-of-boundary mutation.
+- **Eight framework gaps surfaced in a downstream run (#142)** plus
+  skill-routing, `conftest` PYTHONPATH, and pyright-gate fixes (#149).
+- **`/map-plan` resume-detection compares plan goals instead of branch-keying
+  alone (#166)**: a single git branch can host more than one sequential
+  planning effort over its lifetime, but the Resume-Detection preflight keyed
+  "plan complete" purely on `test -f .map/<branch>/step_state.json`. A
+  brand-new, unrelated request on a branch that already held a *completed* plan
+  was therefore falsely off-ramped as "plan complete" (no plan produced), and
+  proceeding anyway silently clobbered the prior plan's `spec`/`blueprint`/
+  `task_plan`. New `check_plan_resume "<request>" [--branch <b>]` runner
+  function reports the existing artifacts AND a `verdict`
+  (`no_plan`/`resume`/`goal_mismatch`) by comparing the prior plan's goal
+  (from `task_plan`/`spec`) against the incoming request via a deterministic
+  token-overlap (containment) heuristic. On `goal_mismatch` the skill no longer
+  prints "plan complete" and does not overwrite the prior artifacts — it
+  recommends archiving/renaming `.map/<branch>/` (or planning on a fresh
+  branch) with operator confirmation, then planning the new goal. Comparison is
+  intentionally conservative — both sides must carry ≥2 significant tokens and
+  fall below the containment threshold, so a legitimate resume with a shorter
+  paraphrase (or a bare `/map-plan` with no request text) is never falsely
+  diverted. Both provider surfaces (Claude + Codex `map-plan` SKILL) and
+  `plan-reference.md` document the single-plan-per-branch layout and the
+  `goal_mismatch` off-ramp.
+- **`workflow-gate` RESEARCH block scoped to the current subtask's
+  `affected_files` (#164)**: during the RESEARCH phase the gate used to block
+  *every* `Edit`/`Write`/`MultiEdit` (except docs-only surfaces), so orthogonal
+  out-of-band fixes — a repo-root config, an unrelated failing test, a hotfix
+  the operator explicitly asked for — had to be smuggled through `Bash`
+  heredocs, losing read-before-write safety and minimal-diff review. The gate
+  now lifts the RESEARCH block for any target that is *provably outside* the
+  current subtask's declared `affected_files` (resolved from `blueprint.json`),
+  while files inside that surface stay blocked so research-before-code is still
+  enforced where it matters. The relief is conservative — it falls back to the
+  strict block whenever the mutation surface can't be determined (no blueprint,
+  unknown subtask, empty `affected_files`, or an out-of-repo target) — and it
+  still honours `scope_glob`/constraints, so it can't silently widen scope. The
+  `Bash` write bypass noted in the issue is documented as a known limitation
+  and deferred (closing it needs shell write-target parsing that risks
+  false-positives across host repos).
+- **Structural create-vs-modify replaces magic-prose matching in
+  `validate_blueprint_contract` (#167)**: the `affected_files`-drift check used
+  to decide "this subtask creates a new file" by string-matching prose phrases
+  (`creates new` / `new file` / `introduces` / `adds new`) in the free-text
+  subtask `description` — brittle, and it forced authors to pollute descriptions
+  with boilerplate written for the parser. Subtasks now carry an optional
+  structural `creates_files: [...]` field (the subset of `affected_files` created
+  from scratch). The validator marks those paths *expected-absent* and only
+  warns drift for missing **modify-targets**; the deprecated prose heuristic
+  survives solely as a fallback for blueprints that predate the field. A
+  `creates_files` path not listed in `affected_files` is a hard error (a created
+  file is part of the mutation surface the scoped gates allow), and
+  `normalize_blueprint` self-heals it by unioning such paths into
+  `affected_files` so the `decompose → normalize → validate` loop stays
+  self-serve. The `task-decomposer` schema, field docs, and planning checklist
+  now point to `creates_files` instead of description prose.
+- **False-progress on every committed subtask (#162)**: `validate_step 2.4`
+  (which auto-runs `validate_mutation_boundary`) compared the *working tree*
+  against the contract's `affected_files`. In the documented per-subtask close
+  order — commit → `record_subtask_result --commit-sha` → `validate_step 2.4` —
+  the working tree is clean and `last_subtask_commit_sha` already points at the
+  subtask's OWN commit, so the diff was empty and the gate wrongly rejected
+  every committed subtask with *"MONITOR is closing ST-XXX but NO files
+  changed"*, forcing a redundant second call. The base-ref resolution now
+  re-bases onto the subtask commit's parent when the resolved base is the
+  subtask's own recorded commit, so the committed work counts as the mutation
+  surface. Resolution is shared by `validate_mutation_boundary` and
+  `_current_subtask_changed_files` via a new `_resolve_subtask_diff_base`
+  helper (root-commit safe).
+
+## [3.10.0] - 2026-05-19
+
 ### Added
 - **Persisted review bundle**: `create_review_bundle()` writes durable
   `review-bundle.json` and `review-bundle.md` under `.map/<branch>/` so
@@ -49,6 +838,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/compact` recommendation to stderr at every command. Provider-agnostic —
   works for both Claude Code and Codex sessions.
 - **Design doc**: `docs/context-compression-plan.md`.
+- **`/map-explain` skill**: new manual slash surface for deep code, PR, and
+  project walkthroughs. Synced into shipped templates so generated projects
+  get the same explainer workflow.
+- **`/map-review` order-bias hardening (Phase 1)**: review prompts now use
+  randomized agent order, evidence-tagged findings, and explicit anti-bias
+  checks so reviewer agents are less susceptible to ordering effects in
+  multi-agent fan-out.
+- **Skill `skillClass` runtime taxonomy**: `.claude/skills/skill-rules.json`
+  and the shipped template copy declare `task`, `reference`, or `hybrid` for
+  every shipped skill. Hybrid skills must enumerate `runtimeEffects`. The
+  skills README and user docs distinguish runtime boundaries instead of
+  treating every skill as passive documentation.
+- **Run health report artifact**: `write_run_health_report` in
+  `.map/scripts/map_step_runner.py` (and shipped template copy) emits
+  `.map/<branch>/run_health_report.json` with terminal status, step
+  progress, artifact presence, retry counters, Predictor/final-verifier
+  signals, and hook-injection state. Backed by `RUN_HEALTH_REPORT_SCHEMA`
+  and a new `run_health` stage in `artifact_manifest.json`.
+- **Run health closeout wiring**: `/map-efficient`, `/map-debug`,
+  `/map-check`, and `/map-review` write `run_health_report.json` after the
+  terminal verdict is known. Closeout snippets set `RUN_HEALTH_STATUS` from
+  the verdict instead of defaulting to `complete`, preserving `pending`,
+  `blocked`, `won't_do`, and `superseded` paths.
+- **Expanded hook degradation status coverage**: `workflow-context-injector.py`
+  now records explicit skipped-hook reasons for malformed input, non-object
+  payloads, non-injected tools, and insignificant Bash commands when an
+  existing branch `step_state.json` can be safely parsed and updated.
+- **Run health validator**: `validate_run_health_report` enforces required
+  fields, terminal-status enum, artifact inventory entries, resiliency
+  signal types, complete-without-pending-steps, complete-without-verification,
+  retry overflow, and hook degradation reasons. Works in generated projects
+  without `mapify_cli.schemas`.
+- **Contract-sized subtask guardrails**: `validate_blueprint_contract` fails
+  oversized, mixed-concern, untraceable, duplicate-ID, dangling-dependency,
+  or non-logical subtasks before implementation starts. Blueprint schema
+  gains `expected_diff_size`, `concern_type`, `one_logical_step`,
+  `aag_contract`, `validation_criteria`, and `coverage_map` (with nested
+  TaskDecomposer output support). Monitor and FinalVerifier prompts check
+  for scope drift after planning.
+- **Evidence-first prompt outputs**: `.claude/references/map-output-examples.md`
+  provides a shared evidence-first JSON examples file. `/map-review`
+  Monitor/Predictor/Evaluator, `/map-debug` investigation, and `/map-plan`
+  spec-review/decomposition prompts now require `evidence[]` (with concrete
+  quotes from logs, code, tests, or spec) before verdict, risk, or score
+  fields. HIGH/CRITICAL issues, breaking changes, and sub-7 scores must be
+  evidence-tied.
+- **JSON prompt-contract lint**: `.claude/references/map-json-output-contracts.md`
+  is the reusable backing reference for non-evidence JSON prompt sections.
+  `/map-fast`, `/map-debug`, and `/map-learn` non-evidence outputs declare
+  explicit contract references. `tests/test_skills.py` adds a generic
+  scanner over both `.claude/skills/` and the shipped templates that fails
+  if future JSON prompt sections lack either evidence or a contract
+  reference.
+- **Blueprint acceptance-criteria lineage**: every `coverage_map` key in
+  `blueprint.json` must now appear as a bracketed tag in the owning
+  subtask's `validation_criteria` (e.g., `VC1 [AC-1]: ...`).
+  `validate_blueprint_contract` fails untagged validation criteria before
+  Actor starts and names the missing tag.
+- **Hard/soft constraint typing**: blueprint schema adds `hard_constraints`
+  and `soft_constraints`. Hard constraint ids must appear in `coverage_map`
+  and the owning subtask's bracketed `validation_criteria`; soft
+  constraints may be omitted only with `tradeoff_rationale`. Planner and
+  decomposer prompts (Claude and Codex) ask for and validate the contract.
+- **Acceptance coverage reporting**: `write_verification_summary` and
+  `create_review_bundle` summarize every `blueprint.json` `coverage_map`
+  tag, marking each `covered` only when bracketed evidence (e.g., `[AC-1]`,
+  `[INV-1]`) appears in downstream verification, QA, test contract,
+  handoff, PR draft, or review artifacts. Otherwise outputs show
+  `missing_evidence`. `REVIEW_BUNDLE_SCHEMA`, review-bundle Markdown, and
+  manifest review-stage metadata surface both human and machine views.
+- **Prior-stage artifact consumption gates**:
+  `build_prior_stage_consumption_report` and
+  `validate_prior_stage_consumption <implementation|review>` prove whether
+  spec, task plan, blueprint, test contract, code diff, and review-time
+  verification summary were consumed. `write_verification_summary` and
+  `create_review_bundle` include `prior_stage_consumption`; review
+  manifest status downgrades to `warn` when required prior-stage inputs
+  are missing instead of hiding stage skipping.
+- **Workflow effort and parallelism policies**: every shipped MAP task
+  skill declares `## Effort and Parallelism Policy` with explicit
+  `thinking_policy` (low/medium/high) and `parallel_tool_policy`.
+  Lightweight workflows (`/map-fast`, `/map-check`, `/map-resume`) use
+  `low/direct`; implementation/learning workflows use `medium/adaptive`;
+  planning, review, and release use `high/adaptive`. Top-level
+  `workflow-rules.json` records execution policies for workflow-triggered
+  `/map-fast`, `/map-efficient`, and `/map-debug` suggestions.
 
 ### Changed
 - **Workflow gate `COMPLETE` phase is permissive**: post-workflow polish and
@@ -96,6 +971,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and strips the entire `\x00-\x1f\x7f` range so the bundle is robust
   through bash pipelines. Learned rule updated with WRONG/CORRECT
   example.
+- **Action-first lightweight workflows**: `/map-fast` and `/map-debug`
+  write-capable Actor steps edit files directly with Edit/Write tools and
+  return compact summaries (`files_changed`, `tests_run`,
+  `remaining_risks`) instead of serialized full-file `code_changes`.
+  Monitor prompts validate written repo state from `Written Files`, and
+  stale post-validation apply instructions are removed from workflow
+  overviews and decision points.
+- **Skill invocation metadata hardening**: regression tests now require
+  manual slash skill classification to match frontmatter, assert direct
+  invocation names appear in trigger keywords/patterns, verify selected
+  negative-trigger fixtures do not match noisy skills, check that local
+  Markdown supporting-file links resolve, validate hook commands using
+  `CLAUDE_PLUGIN_ROOT` point at bundled scripts, and confirm non-`SKILL.md`
+  supporting files stay synced into templates.
+- **Calibrated workflow prompt guardrails**: non-release MAP skills use
+  targeted guardrails and normal wording instead of blanket all-caps
+  prohibition blocks. `/map-release` keeps explicit hard-stop language
+  because tag pushes and PyPI publication are irreversible. Lightweight
+  and resume workflows now have explicit `When Not To Expand Scope`
+  clauses. Prompt-tone regression coverage rejects blanket prohibition
+  blocks in non-release task skills.
+
+### Fixed
+- **Codex provider polish**: deprecated `codex_hooks` references; documented
+  the required pre-tool-use hook configuration step in `docs/INSTALL.md`;
+  noted leading-slash usage for Codex users in `docs/USAGE.md`; fixed
+  `pyproject.toml` dev dependency declaration; aligned shipped Codex docs
+  and CI checks (`.codex/AGENTS.md`, `.codex/config.toml`,
+  `.github/workflows/ci.yml`).
 
 ## [3.9.0] - 2026-04-22
 

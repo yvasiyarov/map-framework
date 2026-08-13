@@ -49,6 +49,15 @@ coverage.json
 !.map/static-analysis/
 !.map/scripts/
 .map/scripts/.map/
+.map/personal/
+# ^ Personal/local learned-rules layer — user-local, never committed or shipped
+#   (redundant over .map/* above; kept explicit for intent + defense in depth)
+
+# Phase E cross-session memory: scratch WAL is transient (never commit)
+.map/*/sessions/scratch/
+# Digests (.map/*/sessions/*.md) are committed by default. To keep them
+# local, set MAP_MEMORY_COMMIT_DIGESTS=0 and uncomment the next line:
+# .map/*/sessions/
 
 # Temporary verification files
 mapify_cli_verification_*.json
@@ -71,8 +80,18 @@ docs/claude-code-prompt-improver
 .mcp.json
 .chunkhound/
 docs/planning-with-files.txt
+docs/map_framework_tech_directors.pptx
+docs/map-demo-real-case-plan.md
+uv.lock
 docs/research/
 docs/superpowers/
 
 # Hypothesis test cache
 .hypothesis/
+
+# Presentation materials (AIADOPTION-765 demo + tech-directors deck) — local only, never committed
+ai-yc-presetation/
+docs/map-framework-tech-directors-stackland1144-draft.md
+docs/map_framework_tech_directors_stackland1144_map_plan_draft.pptx
+# map:sofa — SOFA credential dir (opt-in); never commit. See docs/USAGE.md
+.sofa/

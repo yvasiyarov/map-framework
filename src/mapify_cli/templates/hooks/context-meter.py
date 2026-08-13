@@ -61,10 +61,11 @@ def _get_branch() -> str:
             text=True,
             cwd=PROJECT_DIR,
             timeout=2,
+            check=False,
         )
         if result.returncode == 0:
             return _sanitize_branch(result.stdout.strip())
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 -- deliberate fallback/resilience boundary, must not propagate
         pass
     return "default"
 
@@ -87,6 +88,8 @@ def _silent() -> None:
 
 
 def main() -> None:
+    if os.environ.get("MAP_INVOKED_BY"):
+        sys.exit(0)
     # Read input strictly as JSON. Anything malformed -> silent no-op.
     try:
         input_data = json.load(sys.stdin)

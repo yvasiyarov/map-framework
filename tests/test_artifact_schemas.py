@@ -3,7 +3,6 @@
 import importlib.util
 from pathlib import Path
 
-
 SCHEMAS_PATH = Path(__file__).resolve().parents[1] / "src" / "mapify_cli" / "schemas.py"
 SPEC = importlib.util.spec_from_file_location("artifact_schemas", SCHEMAS_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -47,6 +46,30 @@ def test_validate_workflow_fit_decision_schema():
             "needs_independent_review": True,
             "has_clear_acceptance_criteria": False,
             "test_first_required": True,
+            "depends_on_runtime_state": True,
+        },
+        "updated_at": "2026-04-12T13:30:00",
+    }
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.WORKFLOW_FIT_DECISION_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_workflow_fit_decision_schema_accepts_legacy_without_runtime_state():
+    """workflow-fit.json written before depends_on_runtime_state must still validate."""
+    artifact = {
+        "version": "1.0",
+        "recommended_workflow": "map-plan",
+        "needs_map": True,
+        "decision_summary": "Legacy decision predating the runtime-state signal.",
+        "signals": {
+            "expected_diff_size": "large",
+            "has_new_invariants": True,
+            "needs_independent_review": True,
+            "has_clear_acceptance_criteria": False,
+            "test_first_required": True,
         },
         "updated_at": "2026-04-12T13:30:00",
     }
@@ -76,10 +99,15 @@ def test_validate_artifact_manifest_schema():
             "implementation": stage,
             "review": stage,
             "verification": stage,
+            "retry_quarantine": stage,
+            "flaky_test_triage": stage,
+            "token_budget": stage,
             "run_health": stage,
             "learn_handoff": stage,
         },
     }
+
+    artifact["stages"]["implementer_readiness"] = stage
 
     is_valid, errors = MODULE.validate_artifact(
         artifact, MODULE.ARTIFACT_MANIFEST_SCHEMA
@@ -116,6 +144,67 @@ def test_validate_artifact_manifest_schema_accepts_legacy_without_run_health():
     assert is_valid, f"Errors: {errors}"
 
 
+def _minimal_blueprint_with_requiredness() -> dict:
+    return {
+        "subtasks": [
+            {
+                "id": "ST-001",
+                "title": "Fix checkout timeout message",
+                "description": "Make checkout timeout errors retryable.",
+                "dependencies": [],
+                "affected_files": ["src/checkout.py"],
+                "aag_contract": "CheckoutService -> handle_timeout() -> retryable error",
+                "expected_diff_size": "small",
+                "concern_type": "runtime",
+                "one_logical_step": True,
+                "requiredness": "explicit",
+                "pruneable": False,
+                "prune_rationale": "User explicitly requested this behavior.",
+                "validation_criteria": ["VC1 [AC-1]: timeout shows retryable message"],
+            }
+        ],
+        "coverage_map": {"AC-1": "ST-001"},
+        "hard_constraints": [
+            {"id": "AC-1", "description": "Timeouts must show a retryable message"},
+        ],
+        "soft_constraints": [],
+        "deferred_yagni": [
+            {
+                "id": "YG-001",
+                "title": "Add themed retry illustrations",
+                "rationale": "Not explicit or acceptance-critical.",
+                "restore_hint": "Restore as a new optional UI subtask if the user asks.",
+            }
+        ],
+    }
+
+
+def test_blueprint_schema_accepts_requiredness_and_deferred_yagni():
+    artifact = _minimal_blueprint_with_requiredness()
+
+    is_valid, errors = MODULE.validate_artifact(artifact, MODULE.BLUEPRINT_SCHEMA)
+
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_blueprint_schema_rejects_invalid_requiredness():
+    artifact = _minimal_blueprint_with_requiredness()
+    artifact["subtasks"][0]["requiredness"] = "nice_to_have"
+
+    is_valid = MODULE.validate_artifact(artifact, MODULE.BLUEPRINT_SCHEMA)[0]
+
+    assert not is_valid
+
+
+def test_blueprint_schema_rejects_invalid_deferred_yagni_id():
+    artifact = _minimal_blueprint_with_requiredness()
+    artifact["deferred_yagni"][0]["id"] = "ST-999"
+
+    is_valid = MODULE.validate_artifact(artifact, MODULE.BLUEPRINT_SCHEMA)[0]
+
+    assert not is_valid
+
+
 def test_validate_run_health_report_schema():
     artifact_entry = {
         "kind": "state",
@@ -128,6 +217,7 @@ def test_validate_run_health_report_schema():
         "generated_at": "2026-05-15T10:00:00Z",
         "workflow": "map-efficient",
         "branch": "test-branch",
+        "minimality": "lite",
         "terminal_status": "blocked",
         "current_step_id": "2.4",
         "current_step_phase": "MONITOR",
@@ -146,6 +236,23 @@ def test_validate_run_health_report_schema():
             "blueprint": artifact_entry,
             "active_issues": artifact_entry,
             "known_issues": artifact_entry,
+            "retry_quarantine": artifact_entry,
+            "flaky_test_triage": artifact_entry,
+        },
+        "research": {
+            "schema_version": "1.0",
+            "artifact_count": 1,
+            "valid_artifact_count": 1,
+            "invalid_artifact_count": 0,
+            "low_confidence_artifact_count": 0,
+            "location_count": 2,
+            "research_tokens": 100,
+            "research_est_cost_usd": 0.01,
+            "actor_monitor_tokens": 400,
+            "actor_monitor_est_cost_usd": 0.03,
+            "research_token_share": 0.2,
+            "by_subtask": {"ST-001": {"artifact_count": 1}},
+            "warnings": [],
         },
         "resiliency_signals": {
             "hook_injection": {"status": "injected"},
@@ -154,6 +261,9 @@ def test_validate_run_health_report_schema():
             "max_retries": 5,
             "subtask_retry_counts": {"ST-001": 1},
             "max_subtask_retry_count": 1,
+            "clean_retry_count": 1,
+            "contaminated_retry_count": 1,
+            "retry_isolation_status": {"ST-001": "clean_retry_required"},
             "guard_rework_counts": {},
             "predictor_called": False,
             "predictor_skipped": True,
@@ -163,6 +273,123 @@ def test_validate_run_health_report_schema():
 
     is_valid, errors = MODULE.validate_artifact(
         artifact, MODULE.RUN_HEALTH_REPORT_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_token_budget_report_schema():
+    artifact = {
+        "schema_version": "1.0",
+        "branch": "test-branch",
+        "updated_at": "2026-05-20T10:00:00Z",
+        "decisions": [
+            {
+                "recorded_at": "2026-05-20T10:00:00Z",
+                "path_name": "map-review.monitor_prompt",
+                "configured_budget_tokens": 1500,
+                "estimated_tokens_before": 5000,
+                "estimated_tokens_after": 1490,
+                "budget_action": "truncated",
+                "clipped_sections": ["git diff"],
+                "artifact_references": [
+                    {
+                        "path": ".map/test-branch/review-bundle.md",
+                        "kind": "review-bundle",
+                    }
+                ],
+                "metadata": {"role": "monitor"},
+            }
+        ],
+    }
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.TOKEN_BUDGET_REPORT_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_retry_quarantine_schema():
+    artifact = {
+        "schema_version": "1.0",
+        "branch": "test-branch",
+        "updated_at": "2026-05-20T10:00:00Z",
+        "quarantines": [
+            {
+                "subtask_id": "ST-001",
+                "retry_count": 2,
+                "isolation_mode": "clean_retry",
+                "failed_attempt": "retry_2",
+                "monitor_rejection_summary": "Actor repeated a rejected cache strategy.",
+                "rejected_assumptions": [],
+                "do_not_repeat": ["Do not reuse the cache strategy."],
+                "preserved_constraints": ["Preserve [AC-1] and hard constraints."],
+                "required_evidence": ["Run focused retry tests."],
+                "source_artifacts": [
+                    {"path": ".map/test-branch/step_state.json", "kind": "step-state"},
+                    {"path": ".map/test-branch/blueprint.json", "kind": "blueprint"},
+                ],
+            }
+        ],
+    }
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.RETRY_QUARANTINE_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_flaky_test_triage_schema():
+    artifact = {
+        "schema_version": "1.0",
+        "branch": "test-branch",
+        "updated_at": "2026-06-21T10:00:00Z",
+        "triages": [
+            {
+                "check_id": "pytest::test_checkout",
+                "command": "pytest tests/test_checkout.py::test_checkout",
+                "reason": "Inconsistent outcomes across repeated runs.",
+                "run_count": 3,
+                "pass_count": 1,
+                "fail_count": 2,
+                "outcome_sequence": ["failed", "passed", "failed"],
+                "disposition": "deferred_nondeterministic",
+                "recommended_next_action": "record_deferred_nondeterministic",
+                "monitor_verdict_policy": "not_valid_without_explicit_triage",
+                "operator_requirements": [
+                    "Do not weaken, skip, or delete the check.",
+                    "Do not treat this artifact as a passing gate.",
+                    "Record the deferred nondeterministic evidence in Monitor output or issue tracking.",
+                ],
+                "evidence": [
+                    {
+                        "run": 1,
+                        "status": "failed",
+                        "exit_code": 1,
+                        "summary": "AssertionError",
+                        "timed_out": False,
+                        "duration_seconds": 0.123,
+                        "stdout_tail": "",
+                        "stderr_tail": "AssertionError",
+                    },
+                    {
+                        "run": 2,
+                        "status": "passed",
+                        "exit_code": 0,
+                        "summary": "passed",
+                    },
+                    {
+                        "run": 3,
+                        "status": "failed",
+                        "exit_code": 1,
+                        "summary": "timeout",
+                    },
+                ],
+            }
+        ],
+    }
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.FLAKY_TEST_TRIAGE_SCHEMA
     )
     assert is_valid, f"Errors: {errors}"
 
@@ -184,6 +411,9 @@ def test_run_health_report_schema_rejects_missing_inventory_and_hook_status():
             "max_retries": 0,
             "subtask_retry_counts": {},
             "max_subtask_retry_count": 0,
+            "clean_retry_count": 0,
+            "contaminated_retry_count": 0,
+            "retry_isolation_status": {},
             "guard_rework_counts": {},
             "predictor_called": False,
             "predictor_skipped": False,
@@ -427,3 +657,80 @@ def test_validate_review_bundle_schema_with_manifest_status_error():
     }
     is_valid, errors = MODULE.validate_artifact(minimal, MODULE.REVIEW_BUNDLE_SCHEMA)
     assert is_valid, f"Errors: {errors}"
+
+
+def _minimal_implementer_readiness() -> dict:
+    return {
+        "schema_version": "1.0",
+        "branch": "test-branch",
+        "generated_at": "2026-07-13T10:00:00Z",
+        "verdict": "ready",
+        "blocking_questions": [],
+        "non_blocking_risks": [],
+        "summary": "All acceptance criteria are fully specified.",
+    }
+
+
+def test_validate_implementer_readiness_schema_ready():
+    artifact = _minimal_implementer_readiness()
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.IMPLEMENTER_READINESS_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_implementer_readiness_schema_needs_clarification_with_blocking_questions():
+    artifact = _minimal_implementer_readiness()
+    artifact["verdict"] = "needs_clarification"
+    artifact["blocking_questions"] = [
+        {
+            "question": "What timeout value should be used for the retry loop?",
+            "spec_reference": "AC-3",
+            "category": "nfr",
+        }
+    ]
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.IMPLEMENTER_READINESS_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_implementer_readiness_schema_accepted_with_risk():
+    artifact = _minimal_implementer_readiness()
+    artifact["verdict"] = "accepted_with_risk"
+    artifact["acceptance_rationale"] = "Risk is acceptable given the short release window."
+
+    is_valid, errors = MODULE.validate_artifact(
+        artifact, MODULE.IMPLEMENTER_READINESS_SCHEMA
+    )
+    assert is_valid, f"Errors: {errors}"
+
+
+def test_validate_implementer_readiness_schema_missing_required_fields():
+    artifact = {"schema_version": "1.0", "branch": "test-branch"}
+
+    is_valid = MODULE.validate_artifact(artifact, MODULE.IMPLEMENTER_READINESS_SCHEMA)[0]
+
+    assert not is_valid
+
+
+def test_validate_implementer_readiness_schema_rejects_unknown_verdict():
+    artifact = _minimal_implementer_readiness()
+    artifact["verdict"] = "maybe"
+
+    is_valid = MODULE.validate_artifact(artifact, MODULE.IMPLEMENTER_READINESS_SCHEMA)[0]
+
+    assert not is_valid
+
+
+def test_validate_implementer_readiness_schema_rejects_additional_properties():
+    artifact = _minimal_implementer_readiness()
+    artifact["unexpected_field"] = "should_fail"
+
+    is_valid = MODULE.validate_artifact(
+        artifact, MODULE.IMPLEMENTER_READINESS_SCHEMA
+    )[0]
+
+    assert not is_valid

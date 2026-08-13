@@ -3,17 +3,18 @@
 import copy
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any
 
 import typer
+
 from mapify_cli.cli_ui import console
 
 
-def create_mcp_config(project_path: Path, mcp_servers: List[str]) -> None:
+def create_mcp_config(project_path: Path, mcp_servers: list[str]) -> None:
     """Create MCP configuration file"""
-    config: Dict[str, Any] = {
+    config: dict[str, Any] = {
         "mcp_servers": {},
         "agent_mcp_mappings": {
             "task-decomposer": [],
@@ -23,8 +24,6 @@ def create_mcp_config(project_path: Path, mcp_servers: List[str]) -> None:
             "evaluator": [],
             "reflector": [],
             "documentation-reviewer": [],
-            "debate-arbiter": [],
-            "synthesizer": [],
             "research-agent": [],
             "final-verifier": [],
         },
@@ -48,11 +47,6 @@ def create_mcp_config(project_path: Path, mcp_servers: List[str]) -> None:
                 "hypothesis_verification": True,
             },
         },
-        "deepwiki": {
-            "enabled": True,
-            "description": "GitHub repository intelligence",
-            "config": {"auto_structure": True, "max_depth": 3, "cache_repos": True},
-        },
     }
 
     # Add selected servers
@@ -67,14 +61,9 @@ def create_mcp_config(project_path: Path, mcp_servers: List[str]) -> None:
             "monitor",
             "evaluator",
             "reflector",
-            "debate-arbiter",
         ]:
             if agent in config["agent_mcp_mappings"]:
                 config["agent_mcp_mappings"][agent].append("sequential-thinking")
-
-    if "deepwiki" in mcp_servers:
-        for agent in config["agent_mcp_mappings"]:
-            config["agent_mcp_mappings"][agent].append("deepwiki")
 
     # Write config file
     config_file = project_path / ".claude" / "mcp_config.json"
@@ -87,7 +76,7 @@ def create_mcp_config(project_path: Path, mcp_servers: List[str]) -> None:
 # =============================================================================
 
 
-def build_standard_mcp_servers() -> Dict[str, Dict[str, Any]]:
+def build_standard_mcp_servers() -> dict[str, dict[str, Any]]:
     """Build standard MCP server configurations for Claude Code .mcp.json format.
 
     Returns dict mapping server names to their Claude Code MCP configurations.
@@ -101,14 +90,10 @@ def build_standard_mcp_servers() -> Dict[str, Dict[str, Any]]:
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
         },
-        "deepwiki": {
-            "type": "http",
-            "url": "https://mcp.deepwiki.com/mcp",
-        },
     }
 
 
-def read_project_mcp_json(path: Path) -> Optional[Dict[str, Any]]:
+def read_project_mcp_json(path: Path) -> dict[str, Any] | None:
     """Read .mcp.json from project root.
 
     Args:
@@ -132,7 +117,7 @@ def read_project_mcp_json(path: Path) -> Optional[Dict[str, Any]]:
         console.print(f"[yellow]Warning:[/yellow] Invalid JSON in {path.name}: {e}")
         # Create backup with timestamp + UUID to prevent race conditions
         # UUID ensures unique names even with concurrent processes
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         unique_id = uuid.uuid4().hex[:8]
         backup_path = path.with_suffix(f".backup.{timestamp}_{unique_id}.json")
         try:
@@ -155,7 +140,7 @@ def read_project_mcp_json(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def write_project_mcp_json(path: Path, config: Dict[str, Any]) -> None:
+def write_project_mcp_json(path: Path, config: dict[str, Any]) -> None:
     """Write .mcp.json to project root with proper formatting.
 
     Args:
@@ -176,8 +161,8 @@ def write_project_mcp_json(path: Path, config: Dict[str, Any]) -> None:
 
 
 def merge_mcp_json(
-    existing: Dict[str, Any], new_servers: Dict[str, Dict[str, Any]]
-) -> Dict[str, Any]:
+    existing: dict[str, Any], new_servers: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
     """Merge new MCP servers into existing .mcp.json configuration.
 
     Args:
@@ -207,13 +192,13 @@ def merge_mcp_json(
 
 
 def create_or_merge_project_mcp_json(
-    project_path: Path, mcp_servers: List[str]
+    project_path: Path, mcp_servers: list[str]
 ) -> None:
     """Create or merge .mcp.json in project root for Claude Code.
 
     Args:
         project_path: Project root directory
-        mcp_servers: List of MCP server names to configure (e.g., ["sequential-thinking", "deepwiki"])
+        mcp_servers: List of MCP server names to configure (e.g., ["sequential-thinking"])
 
     Behavior:
         - If mcp_servers is empty: No file created/modified (early return)
@@ -278,7 +263,7 @@ def create_or_merge_project_mcp_json(
                 )
         else:
             # Create mode - new file
-            new_config: Dict[str, Any] = {"mcpServers": selected_servers}
+            new_config: dict[str, Any] = {"mcpServers": selected_servers}
             write_project_mcp_json(mcp_json_path, new_config)
             console.print(
                 f"[green]✓[/green] Created .mcp.json with {len(selected_servers)} server(s)"

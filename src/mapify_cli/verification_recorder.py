@@ -10,7 +10,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, TypedDict, List
+from typing import TypedDict, cast
 
 # Maximum number of recipes to retain (older entries are trimmed)
 MAX_RECIPES = 1000
@@ -30,7 +30,7 @@ class VerificationResults(TypedDict):
     """Type definition for verification results file."""
 
     overall: str  # 'pass', 'fail', or 'unknown'
-    recipes: List[RecipeResult]
+    recipes: list[RecipeResult]
 
 
 def _sanitize_branch_name(branch: str) -> str:
@@ -68,8 +68,8 @@ def record_verification_result(
     recipe_id: str,
     status: str,
     summary: str,
-    duration_ms: Optional[int] = None,
-    skip_reason: Optional[str] = None,
+    duration_ms: int | None = None,
+    skip_reason: str | None = None,
 ) -> Path:
     """Record a verification recipe result to branch-specific results file.
 
@@ -172,7 +172,7 @@ def record_verification_result(
     return results_path
 
 
-def _compute_overall_status(recipes: List[RecipeResult]) -> str:
+def _compute_overall_status(recipes: list[RecipeResult]) -> str:
     """Compute overall verification status from recipe list.
 
     Contract enforcement:
@@ -234,17 +234,20 @@ def _validate_verification_results_schema(data: VerificationResults) -> None:
         if not isinstance(recipe, dict):
             raise ValueError(f"Recipe {idx} must be a dictionary")
 
+        typed_recipe = cast(RecipeResult, recipe)
+
         # Check required fields in recipe
         required_fields = ["id", "status", "summary"]
         for field in required_fields:
-            if field not in recipe:
+            if field not in typed_recipe:
                 raise ValueError(f"Recipe {idx} missing required field: {field}")
 
-        # Validate recipe status
+        # Validate recipe status (presence already checked above via required_fields loop)
         valid_statuses = {"pass", "fail", "skipped"}
-        if recipe["status"] not in valid_statuses:
+        recipe_status = typed_recipe.get("status", "")
+        if recipe_status not in valid_statuses:
             raise ValueError(
-                f"Recipe {idx} has invalid status '{recipe['status']}'. "
+                f"Recipe {idx} has invalid status '{recipe_status}'. "
                 f"Must be one of: {valid_statuses}"
             )
 
@@ -294,7 +297,7 @@ def _atomic_write_json(file_path: Path, data: VerificationResults) -> None:
         # Clean up temp file on error
         try:
             Path(temp_path).unlink(missing_ok=True)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 -- deliberate fallback/resilience boundary, must not propagate
             pass  # Best-effort cleanup
         raise
 
@@ -333,7 +336,7 @@ def main() -> int:
     summary = sys.argv[4]
 
     # Parse optional duration_ms with validation
-    duration_ms: Optional[int] = None
+    duration_ms: int | None = None
     if len(sys.argv) > 5:
         try:
             duration_ms = int(sys.argv[5])
@@ -361,7 +364,7 @@ def main() -> int:
         # Success (silent on success for hook integration)
         return 0
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- deliberate fallback/resilience boundary, must not propagate
         print(f"Error recording verification result: {e}", file=sys.stderr)
         return 1
 

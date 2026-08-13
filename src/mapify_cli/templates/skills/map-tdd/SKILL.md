@@ -17,6 +17,58 @@ argument-hint: "[task description]"
 
 **Key insight:** If implementation is in context when writing tests, AI writes tests that confirm the implementation — including its bugs. By writing tests FIRST from the spec only, tests become an independent correctness oracle.
 
+## The Iron Law
+
+```
+NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST
+```
+
+When `tdd.enforce: true` is set in `.map/config.yaml`, this law is mandatory — not advisory. Code written before a failing test is **deleted**. Not refactored. Not adapted. Deleted. Start over.
+
+### RED-GREEN-REFACTOR (mandatory cycle)
+
+| Phase | Action | Verification |
+|-------|--------|--------------|
+| **RED** | Write a failing test | VERIFY it fails for the right reason — not import error, not typo |
+| **GREEN** | Write minimal code to pass | VERIFY all tests pass |
+| **REFACTOR** | Clean up | VERIFY tests still pass after each change |
+
+Never skip the RED phase. A test that is "obviously going to fail" still needs a run to confirm it fails for the right reason.
+
+### Red Flags (self-detection)
+
+Stop immediately and restart if you notice any of these:
+1. Writing implementation before running any test
+2. "Just this once" — there are no exceptions
+3. "This is different because..." — it is not different
+4. "The test is obvious" — then it takes 30 seconds
+5. "I'll add tests after" — you will not, or they will confirm bugs
+6. "The spec is clear enough" — tests make it executable
+7. "TDD slows me down" — you are paying for it later
+8. "This is configuration, not code" — configuration breaks too
+9. "I already know it works" — the test proves it
+10. "I'll refactor into testability later" — now is later
+11. Writing tests AFTER implementation and calling it TDD
+12. Fixing tests to match buggy implementation
+13. "There's no way to test this" — extract the testable core
+14. Checking "tests pass" without checking they fail first
+
+### Rationalization Table
+
+| Rationalization | Counter |
+|-----------------|---------|
+| "Too simple to test" | Simple code breaks. Test takes 30 seconds. |
+| "I'll add tests after, I promise" | You won't. Or they'll confirm your bugs. |
+| "Deleting N hours of work is wasteful" | Sunk cost fallacy. The waste was writing untested code. |
+| "TDD is dogmatic" | TDD IS pragmatic — it forces a debuggable interface. |
+| "I don't know how to test this yet" | That's a spec clarity problem. Clarify the spec first. |
+| "The test would just mock everything" | Mock the boundary, not the behavior. Restructure. |
+| "Tests slow down the deadline" | Debugging untested code slows it down more. |
+| "The framework handles this" | Prove it with a test. |
+| "I need to spike first" | Spikes are throwaway. Write the test on the real implementation. |
+| "This is an integration concern" | Extract the unit. Integration tests come after unit tests. |
+| "The existing codebase doesn't have tests" | You're adding tests now. One change at a time. |
+
 **What this command does NOT do:**
 - Does NOT replace /map-efficient — it augments the Actor/Monitor loop with test-first phases
 - Does NOT work without a spec or plan — requires spec_<branch>.md or clear acceptance criteria
@@ -37,7 +89,7 @@ parallel_tool_policy: sequential_red_green_gate
 ## Execution Flow
 
 ```
-Standard:          DECOMPOSE → ACTOR (code+tests) → MONITOR
+Non-TDD baseline:  DECOMPOSE → ACTOR (code+tests) → MONITOR   (= /map-efficient, shown for contrast — NOT a /map-tdd mode)
 Targeted TDD:      DECOMPOSE → TEST_WRITER → TEST_FAIL_GATE → CONTRACT_HANDOFF → STOP
 Targeted Resume:   /map-task ST-001 → ACTOR (code only) → MONITOR
 Full-workflow TDD: DECOMPOSE → TEST_WRITER → TEST_FAIL_GATE → ACTOR (code only) → MONITOR
@@ -103,6 +155,27 @@ python3 .map/scripts/map_orchestrator.py set_tdd_mode true
 
 This inserts TEST_WRITER (2.25) and TEST_FAIL_GATE (2.26) phases before ACTOR (2.3) in the step sequence.
 
+### Check tdd.enforce Configuration
+
+```bash
+TDD_ENFORCE=$(python3 -c "
+import sys; sys.path.insert(0,'src')
+try:
+    from mapify_cli.config.project_config import load_map_config
+    from pathlib import Path
+    cfg = load_map_config(Path('.map/config.yaml'))
+    print('true' if cfg.tdd_enforce else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null || echo 'false')
+```
+
+When `TDD_ENFORCE=true`:
+- The Iron Law applies: any code written before a failing test is **deleted**
+- Spec compliance reviewer and code quality reviewer run after each ACTOR phase (mandatory)
+- Monitor enforces the TDD violation check
+- The rationalization table above is your reference — no excuse survives it
+
 ---
 
 ## Step 1: State Machine Loop
@@ -137,7 +210,7 @@ Task(
 
 <TDD_Mode>test_writer</TDD_Mode>
 
-STRICT RULES:
+Code-only rules:
 1. Write ONLY test files. Do NOT create or modify implementation files.
 2. Tests must be derived from the SPECIFICATION (AAG contract + validation_criteria + test_strategy).
 3. You have NO knowledge of the implementation. Do not assume implementation details.
@@ -281,7 +354,6 @@ Task(
   description="TDD: Implement subtask [ID] to make tests green",
   prompt=f"""You are in TDD CODE_ONLY mode.
 
-
 <MAP_Contract>
 [AAG contract from decomposition]
 </MAP_Contract>
@@ -289,25 +361,98 @@ Task(
 <TDD_Mode>code_only</TDD_Mode>
 
 <TDD_Tests>
-[List test files created by TEST_WRITER]
+{test_files_list}
 </TDD_Tests>
 
 STRICT RULES:
-1. Write ONLY implementation code. Do NOT modify test files.
+1. Write ONLY implementation code. Do NOT modify test files (the files in <TDD_Tests> are READ-ONLY).
 2. Your goal: make ALL existing tests pass (turn Red → Green).
 3. Read the test files first to understand what behavior is expected.
 4. Implement the minimum code needed to satisfy the tests.
 5. Follow the AAG contract as your specification.
 
-Test files (READ-ONLY):
-{test_files_list}
-
 Output: standard Actor output (approach + code + trade-offs)
-
+"""
 )
 ```
 
-**CRITICAL: After ACTOR returns, run the TDD Refactor step below, then call Monitor (2.4). Do NOT skip Monitor. Do NOT mark the subtask complete without Monitor validation.** This is not optional — Monitor is a mandatory phase in every workflow, including TDD.
+After Actor returns, run the spec compliance reviewer and code quality reviewer (if `tdd.enforce: true`), then run the TDD Refactor step, then call Monitor (2.4).
+
+### Spec Compliance Reviewer (adversarial, MANDATORY when tdd.enforce=true)
+
+Spawn this BEFORE code quality review. The two reviews cannot be swapped.
+
+**Adversarial framing:** The implementer finished suspiciously quickly. Do NOT trust the Actor summary. Read the actual code.
+
+```python
+Task(
+  subagent_type="actor",
+  description="Spec compliance review: subtask [ID]",
+  prompt=f"""You are an adversarial spec compliance reviewer.
+
+You have been told the implementer finished subtask [ID]. Do NOT trust their summary.
+Read the actual code diff. Compare every requirement in the spec to the actual diff.
+
+<subtask_spec>
+[paste AAG contract + validation_criteria from decomposition]
+</subtask_spec>
+
+<actual_diff>
+[paste git diff for this subtask]
+</actual_diff>
+
+Check EVERY requirement:
+1. Is each requirement implemented? Show file:line evidence.
+2. Is there extra work not in the spec? (Scope creep, gold-plating)
+3. Are there misunderstandings? (Implemented the wrong thing)
+4. Are all edge cases from the spec covered?
+
+Output:
+- SPEC-COMPLIANT: YES or NO
+- If NO: list each gap with exact file:line reference and the spec line it violates
+"""
+)
+```
+
+**Gate**: If the reviewer returns `SPEC-COMPLIANT: NO`, route back to ACTOR with the specific gaps listed. Do NOT proceed to code quality review until spec passes.
+
+### Code Quality Reviewer (runs ONLY after spec reviewer passes)
+
+```python
+Task(
+  subagent_type="actor",
+  description="Code quality review: subtask [ID]",
+  prompt=f"""You are a code quality reviewer. Spec compliance is already verified.
+
+Review the implementation quality only.
+
+<actual_diff>
+[paste git diff for this subtask]
+</actual_diff>
+
+Check:
+1. **File responsibility**: Does each file do one thing?
+2. **Unit decomposition**: Are functions small and independently testable?
+3. **Plan conformance**: Does structure match the architectural plan?
+4. **Size discipline**: No functions > 40 lines without documented justification
+5. **Error handling**: All error paths handled explicitly
+6. **Type safety**: No untyped `Any` without justification
+7. **Naming**: Names describe behavior, not structure
+
+Output:
+**Strengths**: (what is done well — be specific)
+**Issues**:
+- CRITICAL: [blocks proceeding — must fix before Monitor]
+- IMPORTANT: [should fix in this subtask]
+- MINOR: [acceptable to defer]
+**Assessment**: PASS | PASS_WITH_MINOR | FAIL
+"""
+)
+```
+
+**Sequential gate**: Spec compliance review MUST complete with `SPEC-COMPLIANT: YES` before code quality review starts. Running them in parallel bypasses the gate.
+
+If code quality review returns `FAIL` (CRITICAL issues), route back to ACTOR. Once it returns `PASS` or `PASS_WITH_MINOR`, proceed to TDD Refactor and then Monitor.
 
 ### TDD Refactor: Clean Stale Red-Phase Comments
 
@@ -326,7 +471,7 @@ Rewrite matched comments as permanent, implementation-neutral descriptions. If a
 # Validate Actor step, then get_next_step will return MONITOR (2.4)
 python3 .map/scripts/map_orchestrator.py validate_step "2.3"
 NEXT_STEP=$(python3 .map/scripts/map_orchestrator.py get_next_step)
-# NEXT_STEP.phase MUST be "MONITOR" — execute it before proceeding
+# NEXT_STEP.phase should be "MONITOR" — execute it before proceeding
 ```
 
 Monitor verifies both implementation correctness AND that all tests pass.
@@ -378,9 +523,12 @@ In TDD mode, `TEST_WRITER` and `TEST_FAIL_GATE` still write into the same branch
 ## Examples
 
 ```
-/map-tdd <typical args>
+/map-tdd ST-003                         # write spec-derived tests for one planned subtask, then stop
+/map-tdd add idempotency keys to the payment capture endpoint
 ```
 
 ## Troubleshooting
 
-- **Issue:** Workflow doesn't behave as expected. **Fix:** Re-read the section above titled 'What this command CANNOT do' (if present) and ensure prerequisites are met. Run `/map-resume` to recover from interruptions.
+- **Issue:** Invoked without a spec or acceptance criteria. **Fix:** Run `/map-plan` first, or use `/map-efficient` (see "What this command does NOT do").
+- **Issue:** Tests pass trivially / mirror the implementation. **Fix:** Ensure TEST_WRITER derives tests from the spec only, before any implementation is in context (see "Key insight").
+- **Issue:** The session was interrupted between the red-phase contract and implementation. **Fix:** Resume with `/map-task ST-00N`.

@@ -29,6 +29,22 @@ parallel_tool_policy: sequential_by_default
 - Do not add research, Predictor, Evaluator, Reflector, or extra self-audit steps unless the task no longer fits `/map-fast`; switch to `/map-efficient` instead.
 - Run agent phases sequentially. Parallelize only independent read-only file inspection or independent check commands when there are no state transitions or edits involved.
 
+## When Not To Expand Scope
+
+- Do not add discovery, design review, impact analysis, or learning steps to keep this workflow busy.
+- Do not refactor nearby code unless the selected small task cannot work without that exact change.
+- Do not edit unrelated files or add, remove, or upgrade dependencies unless the task explicitly requires that exact change.
+- If the task becomes risky, multi-stage, or ambiguous, stop using `/map-fast` and switch to `/map-efficient` or `/map-plan` instead.
+
+## Mutation Boundary Constraints
+
+These constraints apply to the Actor implementation prompt:
+
+- Do not edit unrelated files, even if they are nearby or easy to clean up.
+- Do not add, remove, or upgrade dependencies unless the current task explicitly names that dependency change.
+- Do not refactor neighboring code unless the acceptance criteria cannot pass without that exact refactor.
+- If a dependency change, broad refactor, or scope expansion seems necessary, report it as a blocker/tradeoff instead of doing it silently.
+
 ## Workflow Overview
 
 Minimal agent sequence (token-optimized, reduced analysis depth):
@@ -46,7 +62,7 @@ Minimal agent sequence (token-optimized, reduced analysis depth):
 - Predictor (no impact analysis)
 - Reflector (no lesson extraction)
 
-**⚠️ CRITICAL:** This is NOT the full MAP workflow. Learning and impact analysis are disabled.
+**Scope boundary:** This is not the full MAP workflow. Learning and impact analysis are disabled by design.
 
 ## Step 1: Task Decomposition
 
@@ -96,7 +112,8 @@ Output JSON with:
   - trade_offs: array of strings
   - remaining_risks: array of strings
 
-Apply changes directly with Edit/Write tools. Do not serialize full file contents in your response."
+Apply changes directly with Edit/Write tools. Do not serialize full file contents in your response.
+Do not edit unrelated files, add or upgrade dependencies, or refactor neighboring code unless the current subtask explicitly requires it. Report any required scope expansion as a blocker/tradeoff."
 )
 ```
 
@@ -161,9 +178,12 @@ Begin now with minimal workflow.
 ## Examples
 
 ```
-/map-fast <typical args>
+/map-fast add a --verbose flag to the status command
+/map-fast fix the off-by-one error in the pagination offset
 ```
 
 ## Troubleshooting
 
-- **Issue:** Workflow doesn't behave as expected. **Fix:** Re-read the section above titled 'What this command CANNOT do' (if present) and ensure prerequisites are met. Run `/map-resume` to recover from interruptions.
+- **Issue:** Task turns out risky, multi-stage, or ambiguous. **Fix:** Stop using `/map-fast`; switch to `/map-efficient` or `/map-plan` (see "When Not To Expand Scope").
+- **Issue:** A subtask exceeds 3 iterations without passing Monitor. **Fix:** Report it as a blocker/tradeoff — do not loop or fake-complete (see "Critical Constraints").
+- **Issue:** The session was interrupted mid-workflow. **Fix:** Run `/map-resume` to recover.

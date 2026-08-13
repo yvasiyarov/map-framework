@@ -60,6 +60,10 @@
 **Reasoning**: The brief highlights token economics and context-window problems: long command files cause attention dilution, and the system relies on context injection to keep goals fresh (“Hook Output Example… reminder before EVERY tool call”; “command file tokens… down from ~5.4K to ~1.75K”; “Recitation Pattern… -20–30% token usage”; “active window injection… only relevant context”). However, the brief also describes best-effort context blocks (“best-effort” target <=4000 tokens in Context-Aware Step Injection) and does not state a hard, deterministic enforcement that guarantees `|C| ≤ T` prior to every tool call. Deterministic token budget enforcement directly operationalizes the architecture’s token-management intent.
 **Why Not Already Tried**: The current architecture already implements token reductions through step-aware injection, recitation, compaction resilience, and template optimization, but it does not explicitly guarantee an invariant via deterministic counting before each tool call. The described mechanisms are optimizations; deterministic enforcement is a stricter missing layer.
 
+**Execution note:** Do not execute directly. This umbrella item is decomposed into follow-up slices. `2604.023-1` shipped deterministic budget enforcement for `/map-efficient` Actor `<map_context>` blocks, `2604.023-2` shipped deterministic budget enforcement for `/map-review` reviewer fan-out prompts, and `2604.023-3` shipped the compact `token_budget.json` decision artifact for those active prompt paths. Execute future child slices only when they protect a current prompt path or operator decision; do not add token-budget telemetry for dormant REGISTRY/FOCUS mechanisms before those mechanisms prove useful.
+
+**Field evidence (2026-05-19)**: A scan of `/Users/azalio/gitroot/src.yandex.cloud` found 37 `.map` directories and 8 current-format runs with `.map/<branch>/blueprint.json`. Replaying `build_context_block()` with the same deterministic `ceil(chars / 4)` estimator showed Actor `<map_context>` blocks are well below the new 4,000-token default on those runs: max 1,255 estimated tokens (`STACKLAND-921-p2-2`), 1,193 (`STACKLAND-1591-crd`), and 849 (`STACKLAND-921-p2-105191705053013442`), with 0/63 sampled subtask contexts over 4,000. The same tree contains raw artifacts far above 4,000 tokens, including `STACKLAND-921-p2-2` `blueprint.json` at ~16,013 tokens and `task_plan` at ~11,819 tokens, `STACKLAND-921-p2-105191705053013442` review bundle at ~13,240 tokens, and `STACKLAND-1591-crd` task plan/blueprint at ~7,531/~7,291 tokens. This supports keeping Actor context compact via summaries while prioritizing follow-up budgeting for prompt paths that still consume large raw artifacts, especially review fan-out.
+
 ### Proposed Changes
 
 - Implement a deterministic token-budget enforcer in the context builder path that runs before every LLM/agent tool call (the architecture already emphasizes structured state, hook injection, and pre-tool-call reminders; this adds a hard constraint). Integrate it into the place where map_step_runner.py builds map_context blocks (“Built by build_context_block() in map_step_runner.py”).
@@ -103,18 +107,47 @@
 
 ## Family-specific scaling analysis for LLM evaluation [2604.014]
 
-**Benefit Hypothesis**: For at least one agent role (e.g., Predictor or Evaluator), family-specific analysis will reduce the average number of Actor→Monitor iterations per subtask by >=10% (or increase Monitor approval rate by >=5 percentage points) compared to decisions made using cross-family/general heuristics, evaluated over the same set of workflows and compared via `python scripts/analyze-metrics.py` outputs.
-**Confidence**: 0.62
-**Reasoning**: This project explicitly relies on per-agent model selection and quality/cost tradeoffs: it lists current model assignments (TaskDecomposer/Actor/Monitor/Predictor/Evaluator/Reflector etc.) and the ability to downgrade models (“Safe to downgrade to Haiku: Predictor, Evaluator…”). It also defines KPI targets and tracking via `python scripts/analyze-metrics.py` and mentions metrics stored in `.claude/metrics/agent_metrics.jsonl` plus workflow logs in `.map/workflow_logs/`. However, the architecture brief does not describe any method for analyzing scaling behavior by model family; the pre-approved idea argues parameter count/family effects matter more than size alone. Therefore, adding family-specific scaling analysis aligns with the architecture’s existing metrics/selection mechanisms and improves the model-choice loop that drives token/performance tradeoffs.
-**Why Not Already Tried**: The brief provides a roadmap for context engineering (checkpointing, MCP caching, search, pattern variation) and template maintenance, but it does not mention any prior analytics that segment performance by model family. The only analytics mentioned are general KPI tracking (`scripts/analyze-metrics.py`) without family-stratified scaling curves, so this family-specific scaling approach has not yet been implemented.
+**Source Idea Reference**: [[model-tier-vs-prompt-for-llm-skill-routing-map-replication]] (source note); [[measuring-the-sensitivity-of-llm-based-structured-extraction-to-prompt-model-and-86e5e4142058]] (paper note); [[more-skills-worse-agents-skill-shadowing-degrades-performance-when-expanding-skill-libraries]] (paper note; arXiv 2605.24050)
+**Implementation Layer**: `src/mapify_cli/skills_eval/`, `src/mapify_cli/templates/skills/*/SKILL.md`, `src/mapify_cli/skill_ir.py`, skill-eval artifacts under `.map/eval-runs/<skill>/`, and metrics analysis/reporting helpers.
+**Missing Capability**: The skill-eval and model-selection loop does not yet separate four decisions that the MAP replication and skill-shadowing paper show behave differently: skill-routing model tier, skill description quality, library-size/distractor pressure, and execution-agent model tier. The newer actor-direct replication adds another gap: per-agent `model:` assignments in provider skill/agent files are not proven to affect headless execution, so MAP cannot yet guarantee that Actor, Monitor, research, or verifier phases actually run on their intended tier.
+**Architecture Evidence**: `docs/architecture.md` documents `mapify skill-eval run/optimize/view`, durable `.map/eval-runs/<skill>/` artifacts, optional template patching for optimized skill descriptions, SkillIR/template audits, generated provider surfaces, and per-agent effort/model policy surfaces.
+**Benefit Hypothesis**: For skill routing, recording model-tier sweeps, description-quality diagnostics, and library-size/shadowing diagnostics will keep the dispatcher on the cheapest reliable tier for each skill class and prevent wasted model upgrades when the real bottleneck is a weak or overlapping `description:`. For execution, a direct per-phase harness will prove whether configured agent tiers are actually enforced and whether Actor can safely run below Sonnet. Pass criteria: a held-out skill-eval suite records per-skill Haiku/Sonnet/Opus trigger accuracy and latency, flags descriptions whose accuracy stays below threshold across all tiers, measures pass-rate drift as distractor skills are added, records invoked-skill sets for false routes, and demonstrates that accepted description edits improve held-out trigger accuracy without increasing negative-trigger false positives; a separate actor-direct fixture proves the selected phase model appears in the transcript/artifact and preserves hidden edge-case quality.
+**Confidence**: 0.72
+**Reasoning**: The MAP replication gives project-specific evidence instead of a generic scaling claim: in skill routing, Haiku underperformed, Sonnet was the best accuracy/latency point overall, Opus did not dominate Sonnet, and weak descriptions such as `map-explain` remained low-accuracy across every tier. The skill-shadowing paper adds the missing failure mode for MAP's growing provider surface: expanding a skill library can reduce pass rate because distractor skills displace the intended skill, while context overhead is not the dominant cause. The expanded actor-direct result is even more actionable for MAP: when the agent prompt was invoked directly with `claude -p --append-system-prompt ... --model <tier>`, Haiku systematically missed edge cases while Sonnet/Opus were stable, and the source note records that headless skill/subagent dispatch can otherwise mask per-agent model assignments. Murin's broader extraction result explains the same pattern as "redistribution, not uniform improvement" when model operating points change. This maps directly to MAP because the architecture now owns skill trigger evaluation, optimizer train/test splits, HTML reports, SkillIR checks, provider template patching, and generated provider surfaces. The useful product move is not just "try bigger models"; it is to make routing tier, description edits, distractor overlap, execution model choice, and enforcement path separately measurable.
+**Why Not Already Tried**: The current plan item asked for generic model-family scaling curves. The shipped architecture added skill-eval run/optimize/view, but there is no acceptance contract that stores a tier sweep per skill, detects all-tier description failures before model escalation, measures whether adding nearby/distractor skills changes the invoked skill set, writes model-tier guidance back into skill/template maintenance docs, or verifies that generated agent model assignments are honored in the actual headless execution path.
 
 ### Proposed Changes
 
-- Add a per-agent, per-model-family evaluation mode to `scripts/analyze-metrics.py` that groups metrics by the agent’s configured model (from `.claude/agents/{agent}.md` frontmatter) and by a “model family” label (derived from model IDs).
-- Extend the logged metrics schema inputs (from the existing `.claude/metrics/agent_metrics.jsonl` and the workflow logs in `.map/workflow_logs/*.json`) to include `model_id`, `model_family`, and `agent_name` for each agent run; ensure these values are captured at orchestration time (where the architecture already tracks metrics under `.claude/metrics/agent_metrics.jsonl`).
-- Introduce a new report command: `python scripts/scale_analysis.py --metric monitor_approval_rate --group-by model_family --workflow map-efficient` that outputs family-specific curves such as (a) first-try Monitor approval rate vs. model_family/model_id, and (b) “iterations per subtask” vs. model_family/model_id, using the existing KPIs: Monitor approval rate >80%, Evaluator >7.0/10, iterations <3 per subtask.
-- Update model selection guidance in `Customization Guide`/`USAGE` so that when choosing between models for Predictors/Evaluators (already described as `Sonnet` with `Opus` for `DebateArbiter` and the ability to downgrade to `Haiku`), the decision is based on family-specific baselines rather than general parameter-count assumptions; the selection heuristic should use the new family reports to decide “downgrade within same family is safe” vs “cross-family downgrade is risky.”
-- Add regression tests for the analytics tooling (not the agents) that validate the grouping logic and curve output determinism using a small fixture dataset that mimics `.claude/metrics/agent_metrics.jsonl` records and workflow-log JSON structure from `.map/workflow_logs/`.json.
+- Extend `mapify skill-eval run` with an explicit tier-sweep mode that records `model_tier`, `model_id`, trigger accuracy, negative-trigger false positive rate, timeout count, and per-case latency in the existing eval-run JSONL.
+- Add a description-diagnostic report that identifies skills whose positive-trigger accuracy remains below threshold across all tested tiers; route those to description optimization instead of recommending Opus or another stronger routing model.
+- Add a library-size and distractor-shadowing eval mode: run the same held-out cases against oracle-only, current installed, and expanded/distractor skill sets; record pass rate, selected/invoked skill set, false-positive triggers, and which descriptions overlapped enough to shadow the oracle skill.
+- Keep routing-model guidance separate from execution-model guidance: skill dispatch reports should recommend the routing tier, while workflow execution metrics should continue to evaluate Actor/Monitor/Predictor/Evaluator outcome quality.
+- Add an actor-direct execution harness that renders the same agent prompt MAP would use, calls the provider runtime with an explicit `--model`/tier override, verifies the selected model in the transcript or run artifact, and evaluates hidden edge-case fixtures before changing default agent tier guidance.
+- Add a provider-surface audit that marks per-agent `model:` metadata as advisory unless the corresponding provider path proves enforcement. If enforcement is unavailable, route model-sensitive phases through the direct invocation path instead of relying on dead config.
+- Extend `mapify skill-eval optimize` acceptance so a description edit must improve held-out trigger accuracy or reduce false positives under the selected routing tier, not merely overfit the train split.
+- Add a shadowing-risk report to SkillIR/template maintenance: flag pairs or clusters whose names/descriptions overlap across workflow phases, require either clearer descriptions or explicit negative-trigger fixtures before adding new high-overlap skills.
+- Update SkillIR or template-maintenance docs with a small model-tier decision table: default routing tier, default execution tiers by phase, when to run a fresh sweep, how to verify model enforcement, and how to treat all-tier description failures.
+- Add regression fixtures that reproduce the source-note patterns: one skill where Sonnet beats Haiku for routing, one where Opus does not improve over Sonnet, one weak-description skill whose failure persists across tiers until the description changes, and one library-expanded case where a distractor skill shadows the oracle until descriptions/negative triggers are tightened.
+
+## Protocol-aligned workflow lift benchmark for MAP agent topologies [2606.05670]
+
+**Source Idea Reference**: [[do-more-agents-help-controlled-and-protocol-aligned-evaluation-of-llm-agent-workflows]] (paper note); [[entropy-based-evaluation-of-ai-agents-a-lightweight-framework-for-measuring-behavioral-patterns]] (paper note)
+**Implementation Layer**: `src/mapify_cli/templates/skills/*/SKILL.md`, `.map/scripts/` workflow runners, `.map/<branch>/` run artifacts, `.map/workflow_logs/`, `token_accounting.json`, and future eval/report helpers next to `src/mapify_cli/skills_eval/`.
+**Missing Capability**: MAP can measure skill-trigger routing, token budgets, and per-run artifacts, but it does not yet have a protocol-aligned workflow benchmark that proves when a heavier multi-agent MAP surface beats a cheaper single-agent or lightweight workflow anchor under the same task, tool permissions, answer contract, accounting, and trace schema.
+**Architecture Evidence**: `docs/architecture.md` defines MAP as a local workflow/tooling layer for `SPEC -> PLAN -> TEST -> CODE -> REVIEW -> LEARN`, with multiple workflow surfaces (`/map-fast`, `/map-efficient`, `/map-review`, `/map-check`, `/map-skill-eval`), durable `.map/<branch>/` artifacts, structured workflow logs, token accounting, review/verification gates, and a quality goal of low overhead. It also states that `map-skill-eval` is measurement-only and focused on trigger/cost behavior, not end-to-end workflow lift.
+**Benefit Hypothesis**: A MAP workflow-lift benchmark will prevent multi-agent ceremony from becoming default without evidence. Pass criteria: for a fixed repo-task fixture set, the report compares a single-agent/lightweight anchor against selected MAP workflows using the same permissions, validation contract, token accounting, and trace schema; reports success, validation quality, cost, latency, retry count, and trajectory/tool entropy; and keeps or promotes a heavier workflow only when it wins on reviewer-visible quality or failure recovery enough to justify its cost.
+**Confidence**: 0.63
+**Reasoning**: BenchAgent's useful mechanism is not its exact benchmarks; it is controlled comparison of agent workflow topologies after normalizing tools, answer contracts, usage accounting, and trajectory logging. EEA adds a low-cost trace layer that can distinguish rigid, over-exploratory, or tool-inefficient behavior when pass/fail is tied. This maps directly to MAP because the architecture already owns workflow prompts, generated hooks/scripts, run artifacts, token accounting, structured logs, and verification gates. The missing product decision is whether `/map-efficient`, `/map-review`, or future multi-agent topologies earn their extra coordination cost against `/map-fast` or a direct provider run on the same task.
+**Why Not Already Tried**: Existing MAP evaluation surfaces cover skill triggering, prompt/template validation, token-budget invariants, and selected context experiments. The planning history does not define a same-task workflow benchmark with a matched single-agent anchor, normalized permission/tool profile, shared final-output contract, and trajectory entropy/cost reporting.
+
+### Proposed Changes
+
+- Add a small benchmark fixture format for repository tasks with the same input, allowed tools, validation command, expected artifact contract, and hidden quality checks across all workflow variants.
+- Implement a workflow runner that can execute at least three variants: direct/single-agent anchor, `/map-fast` or equivalent lightweight MAP path, and one heavier multi-agent workflow such as `/map-efficient` or `/map-review` when applicable.
+- Normalize accounting across variants by writing duration, model tier, token/cost estimates, retry count, validation result, and terminal status into one report schema. Reuse `token_accounting.json` and `.map/workflow_logs/` rather than inventing a separate observability path.
+- Add trajectory metrics derived from the normalized trace: action/tool entropy, repeated-action rate, validation-loop count, and exploration efficiency. Treat these as diagnostics alongside task success, not as standalone success criteria.
+- Add a protocol-alignment checklist to every benchmark run: same task input, same permission profile, same validation command, same final-output contract, same accounting estimator, and no hidden extra tools for the heavier workflow.
+- Document a decision rule for workflow defaults: heavier MAP surfaces stay recommended only when the benchmark shows measurable lift in success, review quality, failure recovery, or auditability that outweighs added cost/latency for the target task class.
 
 
 ## Address observability and resiliency as critical API NFRs [2604.017]
@@ -134,44 +167,14 @@
 - Add CI assertions that the resiliency artifacts are always produced: for workflows using AI agents (/map-efficient, /map-debug, /map-review, /map-learn), validate the health report JSON exists and includes terminal_status values (pending/complete/blocked/won't_do/superseded) exactly as specified in the state artifact section.
 - Create a small set of resiliency regression tests: (1) simulate compaction/no checkpoint and confirm hook injection continues without blocking session start (architecture explicitly says session start must always succeed), (2) simulate oversized checkpoint file >256KB and confirm injection is skipped but workflow proceeds, (3) simulate invalid UTF-8 and confirm injection is rejected but session continues, using the existing security validation rules and stated performance characteristics (e.g., <0.5s total hook time).
 
-## Claude 4.6 command simplification and verb calibration [2604.025]
-
-**Benefit Hypothesis**: Rewriting MAP slash-command prompts to use targeted, high-signal guardrails instead of blanket prohibitions will reduce unnecessary subagent/tool overtriggering and lower median workflow latency without hurting sequencing compliance. A reasonable target is a 10-15% reduction in average tool calls for `/map-fast`, `/map-debug`, and `/map-review` while preserving the current hard-stop guarantees for Monitor failures and irreversible release actions.
-**Confidence**: 0.76
-**Reasoning**: Anthropic’s prompting guidance for Claude 4.6 explicitly warns that prompts written to fight under-triggering in older models can now cause overtriggering. MAP’s command set still leans heavily on that older style: a quick audit of `.claude/commands/*.md` found 40 occurrences of `CRITICAL`, `MUST`, `ABSOLUTELY FORBIDDEN`, or `STRICTLY PROHIBITED`. This is especially visible in `/map-debug`, `/map-release`, `/map-efficient`, and `/map-tdd`, where large “forbidden” blocks are mixed with command semantics that are not actually high-risk. Some hard constraints are valid, but the current wording likely amplifies Claude 4.6’s tendency to over-explore, over-call agents, and spend tokens policing itself instead of executing.
-**Why Not Already Tried**: These command prompts appear to have been tuned around earlier MAP pain points such as skipped steps, skipped research, and missing Monitor passes. The architecture solved those failures with state machines and hooks, but the prompt language remained maximally forceful. The missing adaptation is recalibrating prompt tone now that orchestration safety is enforced elsewhere.
-
-### Proposed Changes
-
-- Create a shared “command guardrail baseline” snippet used by all slash commands, with normal language such as “Use the required agent when…” and “Ask before irreversible actions…”, and reserve all-caps hard-stop phrasing for true hard-stop cases only: `Monitor.valid=false`, tag push/release, destructive state resets, and user-confirmation gates.
-- Rewrite command intros to replace negative framing (“ABSOLUTELY FORBIDDEN”, “NO ADDITIONAL OPTIMIZATION ALLOWED”) with positive, contextual instructions that explain why the rule exists. Anthropic’s guidance explicitly recommends motivation/context over bare prohibitions.
-- Split each command’s safety policy into two tiers: `non_negotiable_rules` and `default_behavior`. This keeps truly critical constraints visible without making every instruction look equally severe.
-- Add a targeted “when not to do extra work” clause to `/map-fast`, `/map-check`, `/map-resume`, and `/map-task`, so the model does not over-research or over-decompose simple requests just because a long prompt exists.
-- Add prompt-lint checks that fail if command files exceed a configurable threshold of blanket modal language (`MUST`, `NEVER`, `ALWAYS`) without being under a whitelisted section such as release safety or workflow gate enforcement.
-
-
-## Context-first XML envelopes for slash commands [2604.026]
-
-**Benefit Hypothesis**: Standardizing MAP command prompts around a shared XML envelope and moving long-form context above instructions will improve requirement retention and reduce ambiguous agent output on long-context tasks such as `/map-plan`, `/map-review`, `/map-debug`, and `/map-efficient`. The success metric is fewer dropped acceptance criteria in decompositions and fewer review/debug outputs that miss the primary artifact set.
-**Confidence**: 0.79
-**Reasoning**: Anthropic’s guide is explicit on two points: for long contexts, put documents/data first and put the query at the end; and structure mixed prompt content with consistent XML tags. MAP only applies that pattern partially today. `/map-efficient` and `/map-tdd` use some XML blocks (`<MAP_Contract>`, `<map_context>`, `<MAP_Written>`), but most commands still rely on ad hoc prose and markdown. `/map-review`, `/map-debug`, `/map-fast`, and large parts of `/map-plan` pass instructions, policies, and data in inconsistent layouts, which increases prompt ambiguity exactly in the commands that carry the most context.
-**Why Not Already Tried**: MAP already invested in state injection and context-window management, so the next iteration naturally focused on orchestration and hooks rather than prompt formatting. The remaining gap is not “more context”, but a more consistent and parseable arrangement of the context that already exists.
-
-### Proposed Changes
-
-- Introduce a shared slash-command prompt envelope with tags such as `<task>`, `<workflow_policy>`, `<artifacts>`, `<constraints>`, `<expected_output>`, and `<decision_rule>`, and apply it consistently across all `.claude/commands/map-*.md`.
-- For any prompt that includes large artifacts, move those artifacts to the top of the actual subagent prompt. For example, wrap plan specs, diffs, findings files, and prior review handoffs in `<documents>` or `<artifacts>` blocks before the instructions and query.
-- Refactor `/map-review` so the canonical handoff, diff, and review preferences are passed as separate tagged sections rather than inline prose. Do the same for `/map-plan` when passing spec + findings + architecture graph to the decomposer.
-- Replace ad hoc markdown headings like “**Context:**” or “**Task:**” inside quoted subagent prompts with explicit machine-readable tags. This aligns with Anthropic’s guidance that XML reduces misinterpretation when instructions and variable input are mixed.
-- Centralize the common envelope in a small template helper or generator so the structure is maintained in one place and synced into `src/mapify_cli/templates/commands/`.
-
-
 ## Supporting-file and lifecycle optimization for skills [2604.033]
 
 **Benefit Hypothesis**: Restructuring MAP skills around the official skill content lifecycle and supporting-file model will keep invoked skill bodies lean, reduce compaction loss, and make long-running skills more durable across sessions. The measurable outcome is a smaller average SKILL body with equal or better task completion quality.
 **Confidence**: 0.77
 **Reasoning**: The official docs emphasize that invoked skill content stays in the conversation, is reattached after compaction within a token budget, and should therefore keep `SKILL.md` focused while moving detailed material into supporting files. MAP already does this reasonably well for `map-state` and parts of `map-learn`, but the skills still contain a lot of command-like procedural detail that can drift away from supporting templates and increase retained token load. The same docs also recommend referencing supporting files explicitly so Claude knows when to load them.
 **Why Not Already Tried**: MAP adopted supporting scripts and templates, but not yet a systematic skill-body minimization pass informed by Claude Code’s persistence and compaction behavior.
+
+**Execution note:** Do not execute directly. This parent is decomposed into child slices. `2604.033-1` shipped the compact `/map-resume` recovery surface by moving low-frequency examples, state-file notes, token-budget notes, and troubleshooting into a bundled supporting file while preserving the active checkpoint-recovery flow in `SKILL.md`. `2604.033-2` shipped compact high-traffic playbooks for `/map-plan`, `/map-efficient`, `/map-check`, and `/map-review`, each with a bundled supporting reference and source/template compactness regression. Execute future child slices only when they reduce always-loaded context for a current workflow users invoke directly; do not move mandatory phase instructions out of the active body without a same-PR regression or operator smoke proving the workflow still has a clear next action.
 
 ### Proposed Changes
 
@@ -181,21 +184,18 @@
 - Add a “retained after invocation” lint heuristic for skills: flag large sections that are better expressed as supporting files because they do not need to remain in-context across the whole task.
 - If MAP later adds more task skills, evaluate whether some should use `context: fork` and `agent` to isolate long procedures into subagent execution, as supported by the official docs.
 
+## Retained skill body lint for task workflows [2604.033-3]
 
-## Clean-session TEST→CODE handoff for TDD workflows [2604.036]
-
-**Benefit Hypothesis**: Forcing test authoring and implementation to happen in separate sessions/contexts will reduce “tests that merely bless the implementation”, catch spec misunderstandings earlier, and improve contract quality on risky subtasks. The measurable target is fewer trivial/pass-without-code tests and fewer post-implementation revisions caused by weak test contracts.
-**Confidence**: 0.82
-**Reasoning**: The philosophy document is explicit that tests should be written in a clean session, reviewed by a human, and then implemented in another session so the model does not see its own code while inventing tests. MAP is test-first, but not context-isolated: `map-tdd` and `map-efficient --tdd` run `TEST_WRITER → TEST_FAIL_GATE → ACTOR` inside the same workflow state machine, and `map-tdd.md` explicitly says test phases should append to the same branch workspace rather than creating a separate artifact universe. That preserves convenience, but it does not preserve the clean-room property the philosophy relies on.
-**Why Not Already Tried**: Current TDD design optimizes for continuity, lower friction, and fewer restarts. It assumes phase separation inside one workflow is enough, but the presentation’s claim is stronger: the value comes from separating contexts, not just labels.
+**Benefit Hypothesis**: A maintainer-facing retained-body lint will prevent future task skills from growing large low-frequency sections in `SKILL.md`, reducing context retention regressions for installed users.
+**Confidence**: 0.64
+**Reasoning**: MAP already has skill metadata, prompt-tone, XML-envelope, and template-sync tests. A narrow lint over task-skill body size and section types would turn the official “keep `SKILL.md` focused” guidance into a release guardrail after the highest-traffic workflows have supporting-file structure.
 
 ### Proposed Changes
 
-- Add a split-session TDD mode that stops after `TEST_FAIL_GATE`, writes a persisted `test_contract_<branch>.md` and `test_handoff_<subtask>.json`, and exits instead of continuing directly into implementation.
-- Add a resume path for code generation (`/map-task`, `/map-efficient --resume-contract`, or equivalent) that loads only spec, plan, failing tests, and concise contract notes, not the full TEST_WRITER deliberation.
-- Optionally require a commit checkpoint for generated tests before code implementation begins, so the test contract becomes a reviewable artifact instead of transient context.
-- Introduce separate prompt personas and success criteria for test-authoring versus code-authoring, with explicit guarantees that the implementer step does not author or silently weaken tests.
-- Add regression tests proving that split-session TDD survives context reset/compaction and still resumes deterministically from persisted test artifacts.
+- Add a skill-body lifecycle test or Skill IR audit field that reports line/token estimates for task skills.
+- Fail only on sections proven safe to externalize, such as long examples, troubleshooting appendices, and rationale blocks, not on mandatory phase instructions.
+- Document the maintainer rule in skill/template maintenance docs and learned rules.
+- Keep thresholds path-specific until more large workflows have been safely split into supporting files.
 
 
 ## Artifact lineage and hard/soft constraint typing [2604.039-followup]
@@ -219,39 +219,71 @@
 - Require complex workflows to consume the prior stage artifact explicitly before proceeding; for example, review should load spec + tests + diff, and code execution should record which test/spec contract it is satisfying. Shipped as `2604.039-followup-3` via `prior_stage_consumption` reports in verification summaries and review bundles plus an explicit validator command.
 - Update canonical docs so MAP has a visible default artifact pipeline even if individual commands still differ in internal implementation details.
 
-## Constraint-first provider rule templates
 
-**Source**: [[do-agent-rules-shape-or-distort-guardrails-beat-guidance-in-coding-agents]] (paper note)
-**Implementation Layer**: `src/mapify_cli/templates/`, generated `.claude/commands/`, generated `.codex/` surfaces, and template regression tests
-**Missing Capability**: A template lint/evaluation pass that distinguishes negative constraints from broad positive directives before MAP installs provider rule files.
-**Architecture Evidence**: `docs/ARCHITECTURE.md` identifies provider scaffolding, generated command/skill surfaces, deterministic guardrails, reviewable diffs, and template drift as core concerns.
-**Benefit Hypothesis**: Rewriting MAP’s generated provider rules to prefer concrete constraints over broad directives will reduce unrelated-file edits and dependency churn in MAP-driven workflows. Pass criteria: template snapshot tests classify new/changed rule lines, and a small golden workflow fixture shows generated prompts include explicit “do not change unrelated files/dependencies” constraints at high-risk stages.
-**Confidence**: 0.67
-**Reasoning**: MAP owns the generated rule/prompt surfaces consumed by coding agents. The source idea is not generic here: MAP’s value is shaping agent behavior through generated workflow artifacts, so rule structure directly affects product quality and user trust.
-**Why Not Already Tried**: Existing plan entries cover command examples, skill architecture, workflow fit, and artifact gates, but do not include a structural rule-quality check over generated templates.
+---
 
-### Proposed Changes
+## Phase B run — framework gate findings (2026-05-30)
 
-- Add a template linter that tags generated instruction lines as constraint, directive, context, or example; fail or warn when high-risk workflow templates add broad positive directives without a paired constraint.
-- Refactor generated provider rules toward concrete negative constraints at mutation boundaries, especially around unrelated refactors, dependency changes, artifact deletion, and stage skipping.
-- Add snapshot tests for representative Claude and Codex scaffolds to keep constraint-first wording stable across `mapify init`.
-- Document rule-writing guidance in template maintenance docs so manual edits preserve the same constraint-first style.
+Discovered while running `/map-efficient` for the personal-rules layer. Each
+item: defect, fix approach, and how to test after the fix.
 
-## Compile-time skill IR and anti-injection audit for provider surfaces [2605.221]
+### DONE (this change) — MONITOR-phase Edit gate now permissive by default
 
-**Source**: [[2605.221]], [[2605.222]], [[2605.223]], [[2605.226]] (ideas from vault)
-**Implementation Layer**: `src/mapify_cli/templates/skills/`, `src/mapify_cli/delivery/`, generated `.claude/skills/` and `.codex/skills/` surfaces, template lint tests, and release validation commands
-**Missing Capability**: A compile-time representation and audit pass that validates shipped skill semantics before emitting provider-specific `SKILL.md` / prompt surfaces.
-**Architecture Evidence**: `docs/architecture.md` defines provider portability as a quality goal; `Core Structure` identifies `src/mapify_cli/templates/` and generated `.claude/.codex` provider surfaces; `Known Risks/Gaps` names prompt/template drift and provider runtime constraints.
-**Benefit Hypothesis**: A shared skill IR plus anti-injection/static-validation pass will reduce template drift and unsafe community/template edits before `mapify init` emits them. Pass criteria: template tests parse every shipped skill into the IR, reject forbidden instruction patterns and unresolved supporting-file references, and produce byte-stable provider emissions for Claude and Codex fixtures.
-**Confidence**: 0.73
-**Reasoning**: MAP already owns the provider-emission layer: `mapify init` copies skill, command, hook, and rule templates into target repos for Claude Code and Codex. Existing plan items cover skill taxonomy, lifecycle optimization, trigger testing, and constraint-first rule wording, but they still treat each provider file as a hand-authored Markdown artifact. The SkCC ideas add a concrete missing layer for this repo: parse skill intent once, validate it, then emit provider-specific formats while retaining hashes/audit metadata.
-**Why Not Already Tried**: Completed work fixed frontmatter hygiene and consolidated `/map-learn` into a skill-backed surface; active plan items test triggers and supporting files. None of the plan or done entries introduces a typed intermediate representation, content hashing, or a compile-time anti-skill-injection gate across generated provider outputs.
+`MAP_MONITOR_HOTFIX` defaults to **on**: `.claude/hooks/workflow-gate.py` (and
+the `.codex/` copy) allow Edit/Write/MultiEdit during MONITOR by default;
+`MAP_MONITOR_HOTFIX=0` restores strict read-only MONITOR. The operator stays
+responsible for re-running `validate_step("2.4")` after a MONITOR-phase edit.
 
-### Proposed Changes
+Why: Actor routinely appends a test / lands a nit while the Monitor verdict is
+being captured. The old default-off forced an escape-hatch env var — the gate
+fired where the write was legitimate.
 
-- Define a minimal `SkillIR` schema for shipped skills: name, trigger/description, invocation mode, allowed tools, supporting-file references, safety constraints, emitted provider targets, and content hash.
-- Add a parser/linter that lowers existing `src/mapify_cli/templates/skills/**/SKILL.md` files into `SkillIR`, fails on unresolved relative references, unsupported frontmatter keys, hidden prompt-injection patterns, or safety constraints buried only in prose.
-- Add provider emitters that render Claude and Codex skill/prompt surfaces from the IR or validate current hand-authored files against the IR until full generation is worth the migration.
-- Store or print deterministic content hashes for emitted skill artifacts so release checks can detect drift between development `.claude/` surfaces and `src/mapify_cli/templates/`.
-- Extend template snapshot tests to cover a safe skill, a malicious/injection-like skill fixture, a nested supporting-file reference, and byte-stable Claude/Codex emission.
+Tested in `tests/test_workflow_gate.py`:
+- `test_allows_edit_during_monitor_phase_by_default` (allow with no env)
+- `test_monitor_strict_mode_blocks_edit` (`MAP_MONITOR_HOTFIX=0` blocks; deny
+  message documents the opt-out + `monitor_failed`)
+
+### OPEN — Strict-scope gate enforcement (`MAP_STRICT_SCOPE`)
+
+Two related defects: phase gates trust a "checkmark" instead of actual repo
+state. Fix extends the EXISTING opt-in `MAP_STRICT_SCOPE=1` (already used by
+`validate_mutation_boundary` in `validate_step("2.4")`); default off →
+non-breaking.
+
+**#4 — `validate_step("2.3")` (ACTOR) doesn't verify Actor wrote anything.**
+`map_orchestrator.py::validate_step` closes ACTOR without checking the diff; the
+machine can reach MONITOR while edits are pending. `files_changed` is only
+reconciled later in `record_subtask_result` (warn-only).
+Fix (under `MAP_STRICT_SCOPE=1`): in `validate_step("2.3")`, diff the current
+subtask vs its baseline SHA; empty diff → `valid=false`, `reason="actor_no_diff"`.
+Subtasks closed via `mark_subtask_complete` (synthetic no-op) are exempt.
+
+**#6 — `validate_step("2.4")` doesn't confirm the MANDATORY `detect_*` gates ran.**
+`detect_actor_files_changed_mismatch`, `detect_symbol_blast_radius`,
+`detect_cross_subtask_regression_risk` are skill-MANDATORY but unenforced.
+Fix (under `MAP_STRICT_SCOPE=1`): each `detect_*` helper writes a receipt keyed
+by `(subtask_id, gate_name)` into `step_state.json`; `validate_step("2.4")`
+rejects (`valid=false`, `reason="gates_not_run"`, listing missing gates) when
+receipts are absent. Mirror the `validate_mutation_boundary` reject path.
+
+**How to test after the fix.** Single-source render invariant: run `make render-templates`
+before pytest (suite imports from `src/mapify_cli/templates/map/scripts/`).
+Strict ON: (1) empty-diff 2.3 → `actor_no_diff`; (2) real edit → pass; (3) no-op
+exempt; (4) each `detect_*` writes a receipt; (5) missing receipts → 2.4
+`gates_not_run` naming the missing gates; (6) all receipts + clean rec → pass.
+Strict OFF (regression guard): (7) empty diff still closes 2.3; (8) missing
+receipts don't block 2.4. Then `python3 -m pytest -q` (full suite must stay
+green) and `python3 scripts/lint-hooks.py`.
+
+### NOT FIXING (recorded, out of scope here)
+
+- **state ↔ git reconciliation (#1):** orchestrator trusts `step_state.json`
+  over git; no "working tree disagrees with state" detector. Needs a dedicated
+  `reconcile` command — not bundled here.
+- **idempotency asymmetry (#3):** re-running `validate_step("2.4")` after an
+  advance hard-errors "Step mismatch" while `2.2` returns a clean no-op.
+  Smoothing it risks masking genuine out-of-order calls; left until #1 lands.
+- **baseline `status` (originally flagged #2):** NOT a bug. `record_test_baseline`
+  returns `"skipped"` when no harness is found and `"success"` only on a real
+  `returncode==0` run. The earlier `{"runner":null,...}` was an operator-side
+  extractor error, not a framework defect.

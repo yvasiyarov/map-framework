@@ -50,7 +50,7 @@ parallel_tool_policy: validation_gates_only
 
 - Use deeper reasoning for version selection, release safety, CI interpretation, and rollback decisions.
 - Parallelize only independent pre-release validation gates when their outputs do not depend on one another.
-- Keep version bumping, commits, tags, pushes, GitHub release creation, PyPI verification, and any irreversible or state-mutating operation sequential with the required user confirmation gates.
+- Keep version bumping, commits, tags, pushes, PyPI verification, and any irreversible or state-mutating operation sequential with the required user confirmation gates.
 
 ## Workflow Overview
 
@@ -65,7 +65,7 @@ Phase 3: Execute Version Bump Script (updates code + git commit + tag)
    ↓
 Phase 4: Push Commit and Tag ⚠️ IRREVERSIBLE - triggers CI/CD
    ↓
-Phase 5: GitHub Release and CI/CD Monitoring (watch pipeline)
+Phase 5: CI/CD Monitoring (watch pipeline — GitHub Release created automatically)
    ↓
 Phase 6: Post-Release Verification (PyPI + installation test)
    ↓
@@ -87,18 +87,14 @@ Execute all validation gates in parallel where possible:
 #### Gate 1-4: Code Quality Checks
 
 ```bash
-# Run checks sequentially (all must succeed)
-pytest tests/ --cov=src/mapify_cli --cov-report=term-missing && \
-black src/ tests/ --check && \
-ruff check src/ tests/ && \
-mypy src/
+# Run the maintained project gate (all checks must succeed)
+make check
 ```
 
 **Expected Results:**
 - ✅ All tests pass (100% success rate)
-- ✅ No black formatting issues
-- ✅ No ruff linting errors
-- ✅ No mypy type checking errors
+- ✅ `ruff`, `mypy`, `pyright`, and hook linting pass
+- ✅ Rendered templates match `templates_src`
 
 **If any check fails:** ABORT release, fix issues first.
 
@@ -106,10 +102,10 @@ mypy src/
 
 ```bash
 # Build package
-python -m build
+uv run --with build python -m build
 
 # Verify package integrity
-twine check dist/*
+uv run --with twine twine check dist/*
 ```
 
 **Expected Results:**
@@ -198,13 +194,19 @@ LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 if [[ -n "$LAST_TAG" ]]; then
   echo "Checking CHANGELOG completeness since $LAST_TAG..."
 
-  # Get commits since last tag (exclude merge commits)
-  COMMITS_SINCE=$(git log ${LAST_TAG}..HEAD --oneline --no-merges | wc -l | tr -d ' ')
+  # Get user-visible commits since last tag. Exclude merge commits plus release-note
+  # maintenance commits, which otherwise make this heuristic chase its own fixes.
+  COMMITS_SINCE=$(git log ${LAST_TAG}..HEAD --no-merges --format="%s" | awk '!/^(docs\(changelog\)|chore\(release\):)/ { count++ } END { print count + 0 }')
 
-  # Count CHANGELOG entries in [Unreleased] section
-  CHANGELOG_ENTRIES=$(awk '/## \[Unreleased\]/,/## \[/' CHANGELOG.md | grep -cE "^- " || echo "0")
+  # Count CHANGELOG entries in [Unreleased] section.
+  # NOTE: a range-pattern awk (/start/,/end/) collapses to the single
+  # matching line when start and end match the SAME line — and "##
+  # [Unreleased]" matches both "/## \[Unreleased\]/" and "/## \[/". Use an
+  # explicit flag instead so the range spans past the heading line itself.
+  CHANGELOG_ENTRIES=$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md | grep -cE "^- " || echo "0")
 
-  echo "Commits since $LAST_TAG: $COMMITS_SINCE"
+  echo "Counted commits since $LAST_TAG: $COMMITS_SINCE"
+  echo "(excluding docs(changelog) and chore(release) maintenance commits)"
   echo "CHANGELOG entries: $CHANGELOG_ENTRIES"
 
   # If significant gap, show commits for review
@@ -218,7 +220,7 @@ if [[ -n "$LAST_TAG" ]]; then
     echo "════════════════════════════════════════════════════════"
     echo ""
     echo "Current CHANGELOG [Unreleased] content:"
-    awk '/## \[Unreleased\]/,/## \[/' CHANGELOG.md | sed '$d'
+    awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md
     echo ""
 
     # Ask user to update CHANGELOG
@@ -291,7 +293,7 @@ Read CHANGELOG.md [Unreleased] section to determine bump type:
 
 ```bash
 # Extract unreleased changes
-UNRELEASED_CHANGES=$(awk '/## \[Unreleased\]/,/## \[/' CHANGELOG.md | sed '$d')
+UNRELEASED_CHANGES=$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)
 ```
 
 **Semantic Versioning Rules:**
@@ -592,7 +594,7 @@ case "$USER_RESPONSE" in
     echo "════════════════════════════════════════════════════════"
     echo "CHANGELOG EXCERPT:"
     echo "════════════════════════════════════════════════════════"
-    awk "/## \[$TAG_VERSION\]/,/## \[/" CHANGELOG.md | sed '$d'
+    awk -v ver="$TAG_VERSION" 'index($0, "## [" ver "]") == 1 {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md
 
     # Ask again after review
     # (recursive call to AskUserQuestion)
@@ -653,9 +655,9 @@ echo "Tag pushed at: $(date)"
 
 ---
 
-## Phase 5: GitHub Release and CI/CD Monitoring
+## Phase 5: CI/CD Monitoring
 
-**Purpose:** Create GitHub release and monitor CI/CD pipeline until completion.
+**Purpose:** Monitor CI/CD pipeline until completion. The GitHub Release is created automatically by the release workflow (no manual step needed).
 
 ### 5.1 Wait for CI/CD Workflow to Start
 
@@ -714,36 +716,6 @@ if [[ "$FINAL_STATUS" != "success" ]]; then
 fi
 
 echo "✅ Release workflow completed successfully"
-```
-
-### 5.4 Create GitHub Release
-
-Extract changelog excerpt and create GitHub release:
-
-```bash
-# Get version from tag
-TAG_VERSION="${LAST_TAG#v}"
-
-# Extract changelog excerpt for this version
-CHANGELOG_EXCERPT=$(awk "/## \[$TAG_VERSION\]/,/## \[/" CHANGELOG.md | sed '$d')
-
-# Create GitHub release
-echo ""
-echo "Creating GitHub release..."
-gh release create "$LAST_TAG" \
-  --title "MAP Framework $LAST_TAG" \
-  --notes "$CHANGELOG_EXCERPT"
-
-if [[ $? -ne 0 ]]; then
-  echo "❌ ERROR: Failed to create GitHub release"
-  echo "You can create manually: gh release create $LAST_TAG"
-else
-  echo "✅ GitHub release created: $LAST_TAG"
-fi
-
-# Get release URL
-RELEASE_URL=$(gh release view "$LAST_TAG" --json url --jq '.url')
-echo "Release URL: $RELEASE_URL"
 ```
 
 ---
@@ -884,7 +856,7 @@ echo "Version Released: $TAG_VERSION"
 echo "Bump Type: $BUMP_TYPE"
 echo "Release Tag: $LAST_TAG"
 echo ""
-echo "GitHub Release: $RELEASE_URL"
+echo "GitHub Release: https://github.com/azalio/map-framework/releases/tag/$LAST_TAG"
 echo "PyPI Package: $PYPI_URL"
 echo ""
 echo "CI/CD Workflow: Run ID $RUN_ID"
@@ -944,7 +916,7 @@ echo ""
 echo "MAP Framework $TAG_VERSION successfully released!"
 echo ""
 echo "Package: https://pypi.org/project/mapify-cli/$TAG_VERSION/"
-echo "Release: $RELEASE_URL"
+echo "Release: https://github.com/azalio/map-framework/releases/tag/$LAST_TAG"
 echo ""
 echo "Install: pip install mapify-cli==$TAG_VERSION"
 echo ""
@@ -1178,7 +1150,7 @@ Use these MCP tools throughout the workflow:
 | Gate # | Gate Name | Failure Impact | Can Proceed? | Fix Action |
 |--------|-----------|----------------|--------------|------------|
 | 1 | Pytest tests | High | ❌ NO | Fix failing tests |
-| 2 | Black format | Medium | ❌ NO | Run black --fix |
+| 2 | Pyright + hook lint | Medium | ❌ NO | Fix pyright / hook-lint errors (part of `make lint`) |
 | 3 | Ruff lint | Medium | ❌ NO | Fix linting errors |
 | 4 | Mypy types | Low | ⚠️ Review | Fix type errors (recommended) |
 | 5 | Package build | High | ❌ NO | Fix build config |
@@ -1205,7 +1177,7 @@ You should:
 1. **Phase 1 - Pre-Release Validation:**
    ```bash
    # Run all 12 validation gates
-   pytest tests/ && black --check src/ && ruff check src/ && mypy src/ && ...
+   make check && uv run --with build python -m build && uv run --with twine twine check dist/* && ...
    # Verify CI passed on main
    gh run list --branch main --limit 1
    ```
@@ -1239,8 +1211,7 @@ You should:
    ```bash
    gh run list --workflow=release.yml --limit 1
    gh run watch <run-id>
-   # Create GitHub release
-   gh release create v1.0.1 --title "MAP Framework v1.0.1" --notes "$(awk ...)"
+   # GitHub Release is created automatically by the workflow
    ```
 
 6. **Phase 6 - Verify PyPI:**
@@ -1267,9 +1238,11 @@ Begin now with the release request above.
 ## Examples
 
 ```
-/map-release <typical args>
+/map-release                            # full release workflow; bump type is chosen at the confirmation gate
 ```
 
 ## Troubleshooting
 
-- **Issue:** Workflow doesn't behave as expected. **Fix:** Re-read the section above titled 'What this command CANNOT do' (if present) and ensure prerequisites are met. Run `/map-resume` to recover from interruptions.
+- **Issue:** `make check` (Gate 1) fails. **Fix:** Stop — fix every lint/type/test failure before any tag or publish step; the release gates are hard stops, not warnings.
+- **Issue:** `__version__` is out of sync after `bump-version.sh`. **Fix:** Apply the documented `__version__` sync workaround in Phase 1 before continuing.
+- **Issue:** A tag or PyPI publish step failed midway. **Fix:** Follow the rollback scenario for that phase; never re-run an irreversible step blindly.

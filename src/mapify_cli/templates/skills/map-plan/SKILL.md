@@ -1,15 +1,17 @@
 ---
 name: map-plan
 description: |
-  ARCHITECT phase only: decompose a complex task into atomic subtasks via task-decomposer. Use when starting a feature, refactor, or complex bug fix and you need a plan first. Do NOT use to execute work; use map-task or map-efficient.
+  ARCHITECT phase only: produce an upfront plan by decomposing a complex task into atomic subtasks with clear dependencies, via task-decomposer. Use when the user asks to plan, create a structured plan, break down, decompose, or stage work — e.g. planning a feature, refactor, migration, API/versioning upgrade, or incremental/phased rollout into smaller independent steps before any code is written. Trigger on phrasing like "plan a…", "create a plan for…", "decompose…into tasks", "break this into steps", "roll out incrementally", or "smaller independent steps". Do NOT use to execute work; use map-task or map-efficient.
 effort: high
 argument-hint: "[task description]"
 ---
-# /map-plan — ARCHITECT Phase (Decomposition Only)
+# /map-plan - ARCHITECT Phase (Decomposition Only)
 
-**Purpose:** Plan and decompose complex tasks into atomic subtasks. This command ONLY plans - it does NOT execute or verify.
+Purpose: plan and decompose complex tasks into atomic subtasks. This command records artifacts and then stops; it does not implement or verify.
 
-Use compact evidence-first examples from [Evidence-First Output Examples](../../references/map-output-examples.md) when spec review or decomposition output depends on quoted requirements, source files, or prior artifacts.
+Use compact evidence-first examples from [Evidence-First Output Examples](../../references/map-output-examples.md). Use the shared [XML Prompt Envelope](../../references/map-xml-prompt-envelopes.md) for long prompts so source artifacts appear before task instructions and output contracts.
+
+Use [plan-reference.md](plan-reference.md) for spec templates, architecture graph examples, full output examples, and troubleshooting. When a workflow step points to a reference section, read that section before executing the step; supporting files are not assumed to be in context automatically.
 
 ## Effort and Parallelism Policy
 
@@ -22,856 +24,465 @@ parallel_tool_policy: discovery_only
 - Do not over-plan tiny work: honor the workflow-fit off-ramp when the task is a direct edit or `/map-fast` fit.
 - Parallelize only independent discovery reads/searches. Keep interview decisions, spec writing, decomposition, blueprint validation, and state initialization sequential.
 
-**When to use:**
-- Starting a new feature, refactoring, or complex bug fix
-- Need to break down work into manageable pieces
-- Want to establish clear task boundaries before execution
+## When to use
 
-**What this command does:**
-- Records a workflow-fit decision before planning so trivial work can exit early
-- Optionally runs a short discovery pass (research-agent) to identify key files/patterns
-- Calls task-decomposer agent to break down the user's request into subtasks
-- Creates `.map/<branch>/task_plan_<branch>.md` with subtask list
-- Initializes `.map/<branch>/step_state.json` with subtask sequence
-- Updates `.map/<branch>/artifact_manifest.json` with the planning artifacts
-- **STOPS** after planning (forces context flush)
+- Starting a feature, refactor, or complex bug fix.
+- Need a spec and task boundaries before execution.
+- Need reviewable contracts with clear validation criteria.
 
-**What this command CANNOT do:**
-- ❌ Execute implementation
-- ❌ Verify completion (use /map-check for that)
-- ❌ Edit code directly
+## What this command does
 
----
+- Records workflow fit before planning.
+- Optionally runs discovery.
+- Writes `.map/<branch>/spec_<branch>.md`.
+- Calls task-decomposer to produce `.map/<branch>/blueprint.json`.
+- Validates blueprint contract metadata.
+- Writes `.map/<branch>/task_plan_<branch>.md`.
+- Initializes planning artifacts and stops at a checkpoint.
+
+## What this command cannot do
+
+- Execute implementation.
+- Verify completion.
+- Edit code directly except planning artifacts.
 
 ## Workflow Steps
 
-### Pre-flight: Resume Detection
+### Pre-flight: Mode Detection
 
-Before starting ANY step, check which artifacts already exist for this branch:
+Read `$ARGUMENTS` for mode flags **before any other action**. Strip detected flags from `$ARGUMENTS` before using the remainder as the task description.
+
+| Flag | Mode | Effect |
+|------|------|--------|
+| `--light` | LIGHT | Spec-only, no research. **Skip** Step 0, Step 0.5 (Always-Implemented Gate), and Step 2b (Devil's Advocate Review). Limit decomposition to 2–5 minimal subtasks. Fastest plan mode — use when scope is small and well-understood. |
+| `--deep` | DEEP | Full research + architecture review. Add extended research sweep **before** Step 0 and an architecture review step **after** Step 4. Use when scope is large or risk is high. |
+| `--force-full` | DEEP alias | Identical to `--deep`. Overrides any scale auto-advisory toward maximum planning depth. |
+| `--force-fast` | FAST exit | Recommend `/map-fast` and STOP. Use when the task is clearly trivial and MAP planning overhead is not warranted. |
+
+If **no flag** is present (standard mode), run all steps as written. The Scale Advisory in the Workflow-Fit Gate may suggest a mode when scope is clear from the task description.
+
+### Pre-flight: Resume Detection
 
 ```bash
 BRANCH=$(git rev-parse --abbrev-ref HEAD | sed -E 's|/|-|g; s|[^a-zA-Z0-9_.-]|-|g; s|-{2,}|-|g; s|^-||; s|-$||')
-echo "findings:    $(test -f .map/${BRANCH}/findings_${BRANCH}.md && echo EXISTS || echo MISSING)"
-echo "spec:        $(test -f .map/${BRANCH}/spec_${BRANCH}.md && echo EXISTS || echo MISSING)"
-echo "task_plan:   $(test -f .map/${BRANCH}/task_plan_${BRANCH}.md && echo EXISTS || echo MISSING)"
-echo "state:       $(test -f .map/${BRANCH}/step_state.json && echo EXISTS || echo MISSING)"
+python3 .map/scripts/map_step_runner.py check_plan_resume "$ARGUMENTS"
 ```
 
-**Resume rules:**
-- If `findings` EXISTS → skip Step 0 (discovery), read existing findings instead
-- If `spec` EXISTS → skip Steps 1-2 (interview), read existing spec instead
-- If `task_plan` EXISTS → skip Steps 4-6 (decomposition), read existing plan instead
-- If `step_state.json` EXISTS → plan is already complete, print checkpoint and STOP
+This reports the existing artifacts (`plan__discovery` or legacy `findings`/`spec`/`task_plan`/`step_state`) AND a `verdict` that compares the prior plan's goal against the current request — so a branch that already hosts a *completed* plan for a different goal is not mistaken for "this plan is done". Branch on `verdict`:
 
-This prevents redundant work when the user restarts Claude mid-plan.
+- `no_plan` → no prior artifacts; plan fresh from Step 0.
+- `goal_mismatch` → the branch already holds a plan for a **different** goal (a single branch can host several sequential plans over its lifetime). Do **NOT** print "plan complete" and do **NOT** overwrite the prior `spec`/`blueprint`/`task_plan`. Follow the `recommendation`: archive or rename the existing `.map/<branch>/` artifacts (or run `/map-plan` on a fresh branch) — confirm with the operator first — then plan the new goal.
+- `resume` → the request matches the existing plan (or no request text was supplied to compare). Apply the per-artifact resume rules below.
+
+Per-artifact resume rules (only when `verdict` is `resume`):
+- Existing plan discovery: prefer `.map/<branch>/research/plan__discovery.md`. If only legacy `.map/<branch>/findings_<branch>.md` exists, read it as a compatibility fallback and migrate it to the canonical research path only if it has an `Already Implemented` section. If the discovery artifact predates that format, re-run discovery (see Step 0).
+- Existing `spec`: skip interview/spec writing.
+- Existing `task_plan`: skip decomposition and plan creation.
+- Existing `step_state.json`: plan is complete; print checkpoint and STOP.
+
+### Pre-flight: Wayfinding Handoff (optional)
+
+If a `/map-wayfind` map already resolved the key decisions, seed this plan from its handoff instead of re-deciding them.
+
+**Precedence over resume:** a handoff seeds a *fresh* plan, so this step only applies when the Resume Detection verdict is `no_plan` (or `goal_mismatch` after you archive the prior artifacts). On a `resume` verdict the branch already has a `spec`/`task_plan` — that existing artifact wins and the handoff is NOT re-consumed (re-seeding would silently overwrite in-progress work). To plan from a handoff, run `/map-plan --wayfind <slug>` on a branch with no in-progress plan (or archive/rename the existing `.map/<branch>/` artifacts first, with operator confirmation).
+
+- If `$ARGUMENTS` contains `--wayfind <slug>`, read `.map/wayfind/<slug>/handoff.json` (repo-level, not branch-scoped).
+- Otherwise run `python3 .map/scripts/wayfind_runner.py list_handoffs`. If exactly one completed handoff exists, OFFER it to the user ("found a completed wayfinding map `<slug>` — seed the plan from it?") and use it only on an explicit yes. Never match a handoff to the request by guessing; with zero or multiple handoffs and no explicit `--wayfind`, skip this step.
+
+When a handoff is used, pre-seed the spec: `decisions[]` → **Decisions Made** (settled — the interview must NOT re-ask them; carry them as a do-not-re-ask list), `out_of_scope[]` → **Out of Scope**, `remaining_risks[]` → **Open Questions**. Then continue below for anything the handoff did not settle. Do not modify the wayfinding map.
 
 ### Pre-flight: Workflow-Fit Gate
 
-Before discovery or interview, decide whether MAP planning is actually warranted for this task.
+Decide whether MAP planning is warranted before discovery or interview.
 
-Assess these signals explicitly:
-- `expected_diff_size`: `tiny` / `small` / `medium` / `large`
-- `has_new_invariants`: does the task introduce or change domain model / contracts / schema rules?
-- `needs_independent_review`: would this change be risky enough that independent review should be required?
-- `has_clear_acceptance_criteria`: can the task already be executed without a planning pass?
-- `test_first_required`: should later implementation use TDD because the behavior contract matters more than code speed?
+Signals:
+- `expected_diff_size`: tiny | small | medium | large
+- `has_new_invariants`: true | false
+- `needs_independent_review`: true | false
+- `has_clear_acceptance_criteria`: true | false
+- `test_first_required`: true | false
+- `depends_on_runtime_state`: true | false — does the plan's **correctness** depend on **current production/runtime state** (applied migration head, a table/column/index/enum value that exists in the live DB, current row counts / backfill volume, the actual value of a feature flag or config, runtime capacity/traffic)? Ask the operator directly when unsure — **if unsure, set it true.** Set it `false` for refactors, tests, docs, and static-config edits: "the code will eventually run in prod" is NOT runtime-dependence. When true, Step 0.6 runs.
 
-For `/map-plan`, pick one of these outcomes:
-- `direct-edit` — tiny, isolated work with clear acceptance criteria and no new invariants
-- `map-fast` — small bounded change where MAP planning overhead is not justified
-- `map-plan` — non-trivial work that should go through `SPEC + PLAN` before execution
-
-Persist the decision:
+Persist the decision (use the keyword form so the new signal is unambiguous):
 
 ```bash
-python3 .map/scripts/map_step_runner.py record_workflow_fit "<direct-edit|map-fast|map-plan>" "<tiny|small|medium|large>" "<true|false>" "<true|false>" "<true|false>" "<true|false>" "<one-sentence decision summary>"
+python3 .map/scripts/map_step_runner.py record_workflow_fit "<direct-edit|map-fast|map-wayfind|map-plan>" \
+  --diff-size "<tiny|small|medium|large>" \
+  --has-new-invariants <0|1> --needs-independent-review <0|1> \
+  --has-clear-acceptance-criteria <0|1> --test-first-required <0|1> \
+  --depends-on-runtime-state <0|1> \
+  --summary "<one-sentence decision summary>"
 ```
 
-**Decision rules:**
-- If the outcome is `direct-edit`: print a short off-ramp message explaining MAP is not needed and STOP.
-- If the outcome is `map-fast`: recommend `/map-fast` and STOP.
-- If the outcome is `map-plan`: continue with the steps below.
+Outcomes:
+- `direct-edit`: explain MAP is not needed and STOP.
+- `map-fast`: recommend `/map-fast` and STOP.
+- `map-wayfind`: too foggy to specify — you cannot write sharp acceptance criteria because several core decisions are still unresolved and entangled (not merely "needs a little research"). Recommend `/map-wayfind chart "<loose idea>"` to resolve the decision frontier first, then return with `/map-plan --wayfind <slug>`. STOP. (This is the inverse of the Wayfinding Handoff pre-flight: that consumes a finished map; this sends you to create one.)
+- `map-plan`: continue.
 
-This is not a black box. The decision summary must state which signal(s) forced planning or justified the off-ramp.
-
-### Step 0: Quick Discovery (Optional but Recommended)
-
-**IMPORTANT — Check for existing discovery first:**
-
-Before running discovery, check if `.map/<branch>/findings_<branch>.md` already exists:
+**Scale Advisory (standard mode only, when no `--light`/`--deep` flag was given):** After recording a `map-plan` outcome, estimate the task's scope (files to change, lines to add/modify) and run:
 
 ```bash
-BRANCH=$(git rev-parse --abbrev-ref HEAD | sed -E 's|/|-|g; s|[^a-zA-Z0-9_.-]|-|g; s|-{2,}|-|g; s|^-||; s|-$||')
-test -f ".map/${BRANCH}/findings_${BRANCH}.md" && echo "EXISTS" || echo "MISSING"
+python3 .map/scripts/classify_scope.py --files ESTIMATED_FILES --lines ESTIMATED_LINES
 ```
 
-- If **EXISTS**: Read the file, print "Discovery already completed — reusing existing findings", and skip to Step 1.
-- If **MISSING**: Run discovery below.
+If `auto_enabled: true` in the JSON result, surface an advisory based on `bracket` (do not block):
 
-This prevents redundant discovery when the user restarts a Claude session mid-plan.
+- `trivial` → advise `/map-fast` instead (already covered by the `map-fast` outcome above).
+- `small` → advise re-invoking as `/map-plan --light` for a lighter-weight plan.
+- `large` → advise re-invoking as `/map-plan --deep` for full research + architecture review.
+- `medium` → no advisory; standard mode is appropriate.
 
----
+The advisory is informational — the user's flags or your judgment prevail. If the user accepts, add the flag and restart; otherwise continue in standard mode.
 
-If the request touches an existing codebase (most do), do a short discovery pass to avoid planning in a vacuum.
+### Step 0: Quick Discovery (Optional but Recommended; SKIP in LIGHT mode)
 
-Use research-agent to find:
-- the most relevant files/dirs
-- existing patterns to follow
-- obvious integration points and risks
+> **LIGHT mode:** Skip this step entirely — proceed directly to Step 1. The spec is written from the stated requirements without a prior research phase.
+>
+> **DEEP mode:** Before this step, run an extended research sweep (SOFA search if available, full codebase exploration, dependency and hotspot analysis). Dispatch a research-agent with a wider scope than the standard Step 0 prompt below; cover recent-change hotspots, dependency graph, existing test coverage gaps, and architectural friction points. Save findings to `.map/$BRANCH/research/plan__deep_discovery.md` in addition to the standard `plan__discovery.md`. Then continue with Step 0 as written.
 
-Example:
+Use `.map/<branch>/research/plan__discovery.md` as the canonical plan-scope discovery artifact. If it exists, read it and skip discovery — but ONLY if it contains an `Already Implemented` section (the format this skill now requires). If the canonical file is absent but legacy `.map/<branch>/findings_<branch>.md` exists, read that fallback and migrate it to the canonical path with `save_research "$BRANCH" plan discovery` only if it has the required section. A discovery file written before this format existed lacks that section; in that case re-run discovery with the prompt below so the Step 0.5 gate has the evidence it requires. Otherwise (no discovery file at all) run discovery to find relevant files, existing patterns, risks, and confirmed new files.
 
-```
+```text
 Task(
   subagent_type="research-agent",
   description="Quick discovery for planning",
-  prompt=f"""
-Locate the most relevant code for this request and return:
-- 5-15 key file paths (with 1-line why each matters)
-- any existing similar implementations/patterns
-- risks/unknowns and what to verify
+  prompt="""
+<documents>
+  <document source="user-request"><document_content>$ARGUMENTS</document_content></document>
+</documents>
+<task>Locate relevant code and return verified existing files, new files confirmed absent, patterns, risks, and unknowns. Also determine, with `file:line` evidence, which parts of the request are ALREADY IMPLEMENTED in the codebase (whole feature, or specific behaviors/acceptance criteria) versus genuinely missing. Do not assume absence — search for existing implementations before reporting a part as missing.
 
-CRITICAL: For EVERY file path you mention:
-1. Use Glob to verify the file actually exists
-2. If the spec/requirements say "create new file X" — CHECK if X already exists
-3. Clearly mark each file as EXISTING (verified via Glob) or NEW (confirmed not found)
-4. For existing files, note approximate LOC and key classes/functions
-
-Do NOT trust the spec's claims about which files are new vs existing.
-Always verify with Glob before reporting.
-
-User request:
-{user_requirements}
+**MANDATORY artifact write:** When your research is complete, write the FULL detailed report (not a summary) directly to `.map/$BRANCH/research/plan__discovery.md` using the Write tool. Every `file:line` reference you found must appear in that file — downstream steps (Step 0.5 and Step 2a.5) read this file directly and will fail if it contains only a summary. After writing, confirm: "Written full discovery report to .map/$BRANCH/research/plan__discovery.md".</task>
+<expected_output>Write `.map/$BRANCH/research/plan__discovery.md` containing Markdown sections: Already Implemented (each entry cites the feature part + `file:line` proof), Existing Files, Files to Create, Patterns Found, Risks / Unknowns. If nothing matching the request exists, write "Already Implemented: none found (searched: &lt;queries&gt;)". Then return a brief confirmation to the parent (not a re-summary — the file is the canonical artifact).</expected_output>
 """
 )
 ```
 
-**Save discovery results:** The research-agent returns findings inline. Use the **Write** tool to save them to `.map/<branch>/findings_<branch>.md` so they persist across sessions.
+**Note on continuation:** If you need the research agent to elaborate on its findings after the Task returns, use `SendMessage` to the agent's task id — do NOT spawn a new `Agent` call, which starts with no prior context and will produce a hallucinated unrelated report.
 
-**Discovery output format** (in findings file):
-```markdown
-## Existing Files (verified via Glob)
-- `path/to/file.py` (1200 LOC) — contains ClassX, relevant because...
-- `path/to/other.py` (300 LOC) — integration point for...
+After the Task returns, verify the artifact was written directly (preferred path). Fall back to saving the returned text only if the agent did not write the file:
 
-## Files to Create (confirmed not found)
-- `path/to/new_file.py` — needed for...
-
-## Patterns Found
-- ...
-
-## Risks / Unknowns
-- ...
+```bash
+if [ ! -f ".map/$BRANCH/research/plan__discovery.md" ]; then
+  printf '%s' "$PLAN_DISCOVERY" | \
+    python3 .map/scripts/map_step_runner.py save_research "$BRANCH" plan discovery
+fi
 ```
 
-If discovery is not needed (new greenfield code or already-provided spec), skip to Step 1.
+### Step 0.5: Already-Implemented Gate (MANDATORY when discovery ran; SKIP in LIGHT mode)
+
+> **LIGHT mode:** Skip this step — no discovery was run, so there is no evidence base for the gate. Rely on the user's statement that the feature is new; if you discover overlap during spec writing, surface it there.
+
+Before interviewing or writing the spec, reconcile the request against the discovery `Already Implemented` section. Do not plan work the codebase already does. This gate runs whenever Step 0 produced findings; if discovery was intentionally skipped (greenfield or fully-provided spec), state that the gate was skipped and why. If the findings file lacks an `Already Implemented` section (it predates this format), do NOT run the gate on incomplete evidence — re-run Step 0 discovery first.
+
+Classify the request:
+
+- **Whole feature already implemented** — every observable behavior the user asked for exists, with `file:line` proof. Off-ramp: report what already satisfies the request (cite the evidence), state that no plan is needed, and STOP. Do not write a spec or blueprint. If the user may want changes to the existing implementation, ask them to restate the gap rather than re-planning what exists.
+- **Partially implemented** — some behaviors/acceptance criteria exist, others are missing. Carry the already-done parts into the spec's **Out of Scope** under an `Already Implemented` subsection (with `file:line` evidence) so decomposition plans ONLY the remaining work. Re-scope the request to the gap before continuing.
+- **Not implemented** — nothing matching exists (or only unrelated patterns). Continue normally.
+
+When in doubt about whether an existing implementation truly satisfies a request, treat it as partially implemented and surface the ambiguity in the interview or Open Questions — never silently re-plan code that already exists, and never silently assume an existing file already covers a behavior.
+
+### Step 0.6: Verify Live/Runtime State Gate (MANDATORY when `depends_on_runtime_state=true`)
+
+The runtime analogue of Step 0.5: that gate stops you re-planning code that already exists; this one stops you planning against **runtime facts that have drifted** from the design docs / memory the plan copied them from. Skip this step only when `depends_on_runtime_state=false`; if it is true, **read [plan-reference.md](plan-reference.md#verify-liveruntime-state) before Step 1** and run this gate.
+
+Caution — Step 0.5 ≠ Step 0.6: code can exist in the repo (already-implemented) while its migration / feature-flag is **not yet applied in prod**. A `file:line` proof does not prove the live state; verify runtime separately.
+
+For each assumption the plan's correctness rests on (counts, enum/label sets, an existing column, the applied migration head, a live flag/config value, capacity):
+
+- **Verifiable now (read-only):** confirm it empirically through an approved read-only source (read replica, dashboard, runbook, metadata query such as `INFORMATION_SCHEMA` / `pg_enum` / migration-head introspection). Cite the **fact**, not the raw query result. Never write/mutate, and never paste PII, secrets, or bulky prod output into the spec or `.map/<branch>/` artifacts (they may be committed). This skill is a planning-time gate, **not** a runtime tool — it does not run the query itself; defer execution to the operator or an authorized sub-agent.
+- **Prod unreachable / unverified:** do NOT bake the assumption in as fact. Record it under the spec's **Open Questions / Risks** as an `Unverified Runtime Assumption` with the **exact read-only check to run** (and the safe source), and mark every subtask that depends on it `provisional` until verified.
+
+Do not hard-stop merely because prod is unreachable — record-the-check is the contract. If a runtime dependency only surfaces later (during decomposition), loop back and verify-or-record it the same way.
 
 ### Step 1: Assess Scope and Decide Interview Depth
 
-Read the user's requirements and decide if deep interview is needed.
+Interview is required when the user explicitly invites clarification (`ask if unclear`, `do not assume`, `спрашивай`, `уточняй`, etc.) or when requirements are broad, vague, risky, or underspecified.
 
-**Override (always wins, evaluate FIRST):**
-If the user prompt contains explicit clarification-invitation language, the interview is REQUIRED regardless of any other signal. The user has explicitly opened the door; not walking through it is a bug, not a judgment call.
+Skip interview only when the task is already well-defined with clear acceptance criteria and no critical open product decisions.
 
-Trigger patterns (case-insensitive, English + Russian):
-- English: `ask if unclear`, `ask if not clear`, `ask before`, `do not assume`, `don't assume`, `clarify`, `feel free to ask`, `if anything is unclear`
-- Russian: `если что-то непонятно`, `если не ясно`, `спрашивай`, `уточняй`, `задавай вопросы`, `не предполагай`
+**Auto-Mode reconciliation.** Auto-mode tells the harness to "minimize interruptions"; this skill tells you to interview on vague scope. Both rules hold — auto-mode does NOT override the interview gate when scope is truly vague. Resolution:
 
-If any of these phrases appear in the user's prompt, skip the heuristic below and go straight to Step 2.
-
-**Interview REQUIRED when (heuristic, used only if Override did not fire):**
-- Large increment: 2+ features in one request
-- Vague product idea without clear technical approach
-- New project (stack + features undefined)
-- Batch of bugs/issues to fix together
-- User's requirements have obvious gaps or unstated assumptions
-
-**Interview SKIPPED when (heuristic, used only if Override did not fire):**
-- Task is already well-defined with clear acceptance criteria
-- Small isolated change (single bug fix, test update)
-- User explicitly provided a spec or detailed description
-
-If interview is not needed, skip to Step 2a (write spec without interview).
+- Roadmap-class input (>3 acceptance criteria absent, multiple feature ideas in one prompt, "explore options X/Y") → interview is REQUIRED even under auto-mode. Use a single batched `AskUserQuestion` (3-5 high-leverage questions at once) rather than a back-and-forth dialog so you minimize round-trips while still resolving ambiguity.
+- Narrow task with explicit ACs / clear file scope → interview SKIPPED, proceed straight to spec/blueprint.
+- When in doubt, batched interview wins; a wrong skip cascades into 12 subtasks of misaligned work.
 
 ### Step 2: Deep Interview (Spec Discovery)
 
-Use AskUserQuestion to systematically interview the user. The goal is to surface non-obvious decisions and tradeoffs BEFORE planning.
+Ask only non-obvious questions. Cover technical choices, UX, tradeoffs, risks, scope, integration, contract clarity, and durable state lifecycle for operations longer than one request.
 
-**Rules:**
-- Questions must be NON-OBVIOUS (don't ask what the user already stated)
-- Cover all dimensions: technical implementation, UI/UX, risks, tradeoffs, edge cases, data model, performance, security
-- Ask in small rounds (1-2 high-signal questions; up to 2-4 if needed) using AskUserQuestion
-- Continue iterating until all critical decisions are captured
-- After each round, assess: are there still unresolved architectural decisions?
+Write `.map/<branch>/spec_<branch>.md`. The full spec template is in [plan-reference.md](plan-reference.md#spec-template); the active spec must include decisions, contradiction, invariants, constraints, edge cases, acceptance criteria, security boundaries, out of scope, and open questions.
 
-**Interview dimensions checklist:**
-1. **Technical:** Stack choices, data model, API contracts, state management
-2. **UX:** User flows, error states, edge cases, accessibility
-3. **Tradeoffs:** Performance vs simplicity, flexibility vs speed, build vs buy
-4. **Risks:** What can break? What's the blast radius? Rollback strategy?
-5. **Scope:** What's explicitly OUT of scope? Minimal scope vs extended scope?
-6. **Integration:** How does this interact with existing code? Migration needed?
-7. **Contract Clarity:** Are ALL goals stated as outcomes (not processes)? Reject "improve auth" — require "AuthService returns 401 for expired tokens". Every goal must be verifiable.
-8. **Durability & State Lifecycle:** For any operation longer than a request-response cycle (>5 s), where does state live? Does it survive process restart, redeploy, host migration, or autoscaler eviction? What is the recovery contract on crash mid-operation? What identifier lets a caller resume a result that was started before a session boundary? In-process memory is NOT a valid answer for any operation that may outlive a single request.
-
-**Example AskUserQuestion call:**
-```
-AskUserQuestion(questions=[
-  {
-    "question": "Should refresh tokens be stored server-side (Redis/DB) or stateless (signed JWT)?",
-    "header": "Token store",
-    "options": [
-      {"label": "Server-side (Redis)", "description": "More secure, revocable, but adds infra dependency"},
-      {"label": "Stateless JWT", "description": "No infra needed, but harder to revoke"},
-      {"label": "Hybrid", "description": "Access=stateless, Refresh=server-side"}
-    ],
-    "multiSelect": false
-  },
-  {
-    "question": "What happens when a user's session expires mid-action (e.g., filling a form)?",
-    "header": "Session UX",
-    "options": [
-      {"label": "Silent refresh", "description": "Auto-refresh token in background, user doesn't notice"},
-      {"label": "Modal prompt", "description": "Show re-login dialog, preserve form state"},
-      {"label": "Redirect", "description": "Redirect to login, lose form state"}
-    ],
-    "multiSelect": false
-  }
-])
-```
-
-**After interview is complete**, write the spec to `.map/<branch>/spec_<branch>.md`:
-
-```markdown
-# Spec: [Title]
-
-**Date:** $(date -u +%Y-%m-%d)
-**Branch:** ${BRANCH}
-
-## Decisions Made
-
-| # | Question | Decision | Rationale |
-|---|----------|----------|-----------|
-| 1 | Token storage | Server-side (Redis) | Need revocation support |
-| 2 | Session expiry UX | Silent refresh | Better UX, no data loss |
-
-## Contradiction
-
-State the central design tension in TRIZ form. Every non-trivial spec should hold a tension that naive trade-off cannot resolve — that tension is what makes the design choices meaningful.
-
-> **The system must `<X>` AND NOT `<X>`.**
-
-- **Side A (functional requirement):** [what the system must achieve]
-- **Side B (constraint to preserve):** [what the obvious solution would violate]
-- **Why naive trade-off fails:** [cost, UX, safety, latency, or another reason "just pick one" is unacceptable here]
-- **Ideal Final Result (optional):** [what the system looks like if both sides hold without added complexity — function present, mechanism absent]
-
-Examples from prior MAP runs (for shape, not copy-paste):
-- "Plan must be reviewable AND not block fast iteration on small edits." → resolved via the workflow-fit off-ramp above.
-- "Monitor must reject incomplete diffs AND not punish surfaced pre-existing failures." → resolved via CLARIFICATION_NEEDED escalation.
-- "Long-running operations must survive `kill -9` AND not add transaction overhead per call." → resolved via durable `run_id` + idempotent writes.
-
-If, after honest analysis, no non-trivial contradiction exists, write:
-
-> No non-trivial contradiction. Single dominant requirement.
-
-and re-check whether the workflow-fit gate above should have returned `direct-edit` or `map-fast`. An empty Contradiction section is a signal, not a shortcut.
-
-Cross-reference relevant TRIZ principles from `docs/triz-cheatsheet.md` if a known principle (1–40) maps cleanly onto the chosen resolution; this makes the design discoverable by the Reflector and reusable across the codebase.
-
-## Invariants
-
-Conditions that MUST remain true throughout implementation and after deployment.
-These are hard constraints — violating any invariant is a blocker.
-
-- [e.g., "All API endpoints require authentication except /health and /login"]
-- [e.g., "Database migrations must be backward-compatible (no column drops)"]
-- [e.g., "Response time for any endpoint must stay under 500ms p95"]
-
-## Constraints
-
-Workflow execution limits. When no constraints specified, all default to null (unlimited) and the enforcement hook skips checks.
-
-```yaml
-constraints:
-  max_files: null        # Maximum files Actor can modify per workflow (int or null)
-  max_subtasks: null     # Maximum subtasks in decomposition (int or null)
-  scope_glob: null       # File glob restricting Actor's edit scope (string or null)
-```
-
-## Edge Cases
-
-Enumerate boundary conditions and unusual inputs that implementation must handle.
-
-| # | Edge Case | Expected Behavior | Priority |
-|---|-----------|-------------------|----------|
-| 1 | [e.g., Empty input array] | [Return empty result, not error] | must-handle |
-| 2 | [e.g., Concurrent updates to same resource] | [Last-write-wins with conflict detection] | must-handle |
-| 3 | [e.g., Unicode in usernames] | [Accept, normalize to NFC] | should-handle |
-
-Priority levels: `must-handle` (blocks release), `should-handle` (best effort), `won't-handle` (documented limitation).
-
-## Acceptance Criteria
-
-Formal, testable conditions that define "done". Each criterion must be verifiable by automated test or manual check.
-
-| ID | Criterion | Verification Method |
-|----|-----------|-------------------|
-| AC-1 | [e.g., User can log in with valid credentials] | `pytest tests/test_auth.py::test_login` |
-| AC-2 | [e.g., Invalid token returns 401] | `pytest tests/test_auth.py::test_invalid_token` |
-
-## Security Boundaries
-
-*(Include for security-critical tasks; omit for purely internal/cosmetic changes)*
-
-- **Trust boundary:** [e.g., "All user input is untrusted; validate at API layer"]
-- **Auth model:** [e.g., "RBAC with role checks at service layer, not just route level"]
-- **Data sensitivity:** [e.g., "PII fields encrypted at rest, never logged"]
-- **Attack surface:** [e.g., "Public API exposed to internet; internal services behind VPN"]
-
-## Out of Scope
-
-- [Explicitly excluded items]
-
-## Open Questions
-
-- [Anything still unresolved]
-```
+**Requirements Index (MANDATORY):** After writing the spec, populate the `mapify:requirements-index:v1` sentinel-wrapped fenced YAML block (defined in the spec template) with exactly ONE `{id, kind}` entry per acceptance criterion, invariant, hard constraint, and cross-cutting requirement. `kind` must be one of `acceptance_criterion | invariant | hard_constraint | cross_cutting`. IDs must be canonical: prefix in `{AC, INV, HC, CCR}`, no leading zeros, uppercase (e.g. `AC-1`, `INV-2`, `HC-3`). These IDs are **exactly** the keys the decomposer must map in `coverage_map` — the forward-completeness gate diffs the index IDs against `coverage_map` keys to detect uncovered requirements.
 
 ### Step 2a: Write Spec (when interview was skipped)
 
-If interview was skipped (task is well-defined), still write `spec_<branch>.md` using the same template as Step 2. Populate it from the user's requirements and discovery findings:
+Write the same spec artifact from the provided requirements and discovery evidence. Do not invent unresolved decisions; put them in Open Questions.
 
-- **Decisions Made**: extract from user's request (may be short or N/A)
-- **Contradiction**: REQUIRED — state the design tension in `<X> AND NOT <X>` form, or explicitly write "No non-trivial contradiction" and verify the workflow-fit gate should not have off-ramped this task
-- **Invariants**: derive from existing code patterns found in discovery
-- **Edge Cases**: identify from the task description and affected code
-- **Acceptance Criteria**: REQUIRED — must be testable conditions that define "done"
-- **Security Boundaries**: include if task touches auth/validation/user input
-- **Out of Scope**: explicitly state what is NOT being changed
+### Step 2a.5: Validate Spec Citations (MANDATORY)
 
-**Acceptance Criteria completeness rule:**
+Before the devil's-advocate review, gate on `file:line` citation correctness — stale citations in the spec ship to every downstream phase (research, Actor, Monitor) and cause real bugs (e.g., the hogback-gap ST-002 cited `src/mapify_cli/__init__.py:96` for `MAP_DEBUG` when the symbol had moved to :207). The validator finds every `<path>:<line>[-<line>]` pattern, checks the path exists and line is in range, and — when a backticked identifier sits next to the citation — verifies the cited line contains it.
 
-If the source document (spec, issue, PRD, etc.) defines explicit acceptance criteria, enumerate ALL of them in the spec — either copy them verbatim or reference them by file + line range (e.g., `SPEC.md lines 2946-2988, 37 criteria`). Do NOT summarize N criteria as "key M" — the decomposer will treat M as the full scope, and uncovered criteria will silently drop from the plan.
-
-The same rule applies to result schema fields, invariants, and any other enumerated contract. If the source lists 20 fields in a result type, the spec must list all 20 or reference the authoritative list — not "key fields include X, Y, Z".
-
-This ensures every `/map-plan` run produces a spec, regardless of whether interview happened.
-
-### Step 2b: Devil's Advocate Review (SPEC_REVIEW)
-
-**Skip ONLY if no cross-cutting concerns are involved.** Length and subtask-count are NOT skip signals — durability bugs hide in short specs and small task graphs. The previous "<200 lines AND <5 subtasks" gate is removed because it caused 5-minute async tool integrations to skip review entirely.
-
-**Cross-cutting concerns (presence of ANY blocks the skip):**
-- Observability, security
-- Concurrency, recovery, durability
-- Asynchronous operations longer than 30 seconds (long-running tools, batch jobs, polling, webhook delivery, callbacks)
-- Multi-service coordination, retry/backoff logic, queueing
-- Any operation where state must survive a single request-response cycle
-
-**ALWAYS run if ANY of these is true:**
-- Source spec/requirements exceed 500 lines
-- Source defines 10 or more acceptance criteria
-- Multiple subgraphs, services, or subsystems involved
-- Task includes concurrency, recovery, or multi-transport requirements
-- Subtask description or user prompt matches `/async|long.running|background|webhook|callback|poll|durab|persist|state.*survive|run.*id/i`
-
-After writing the spec, invoke Monitor agent to adversarially review it. The goal is to surface gaps, contradictions, and missing edge cases BEFORE decomposition.
-
+```bash
+python3 .map/scripts/validate_spec_citations.py --branch "$BRANCH"
 ```
+
+- Exit 0 + `"passed": true` → proceed to Step 2b.
+- Exit 1 + `"failures": [...]` with `status` in `{stale-citation, error}` → fix the spec (correct the line number, update the symbol name, or remove the citation) and re-run. Do NOT proceed to decomposition with red failures.
+- Exit 2 → invocation error (missing branch / spec file); fix invocation, do not skip.
+
+### Step 2b: Devil's Advocate Review (SPEC_REVIEW; SKIP in LIGHT mode)
+
+> **LIGHT mode:** Skip this step. The spec is written from well-understood requirements; a lightweight self-review of the open-questions list and acceptance criteria suffices before decomposition.
+
+Run Monitor as a spec reviewer before decomposition.
+
+```text
 Task(
   subagent_type="monitor",
-  description="Devil's Advocate spec review",
-  prompt=f"""You are reviewing a SPECIFICATION (not code). Act as Devil's Advocate.
-
-Read the spec file: .map/<branch>/spec_<branch>.md
-
-Check for:
-1. **Race conditions / concurrency gaps**: Are there shared resources without defined conflict resolution?
-2. **Ownership ambiguity**: Are responsibilities clearly assigned? Could two components both assume the other handles something?
-3. **Missing edge cases**: Compare the Edge Cases section against Invariants — are there invariant violations not covered by edge cases?
-4. **Decision/invariant contradictions**: Do any decisions contradict invariants or acceptance criteria?
-5. **Security gaps**: Are trust boundaries complete? Are there injection vectors not addressed?
-6. **Implicit assumptions**: What is assumed but not stated?
-7. **Trivial or false design contradiction**: Does the `## Contradiction` section state a real tension (both sides have independent forces — separate stakeholders, conflicting cost axes, or genuine physics) or a tautology like "fast AND correct" with no constraint binding the trade-off? If trivial, demand a sharper formulation or explicit "No non-trivial contradiction" with justification.
-
-Output format:
-- Evidence first: for every finding, include `evidence` with `file_path`, `line_range` or section, `quote`, and `relevance`. HIGH-severity findings must cite the exact spec section or source lines that make the gap concrete.
-- For each finding: severity (HIGH/MEDIUM/LOW), category, description, suggested fix
-- If NO high-severity issues found: output "SPEC APPROVED"
-- If HIGH-severity issues found: list them clearly for user resolution
+  description="Review spec before decomposition",
+  prompt="""
+<documents>
+  <document source="spec"><document_content>{spec_content}</document_content></document>
+  <document source="plan-discovery"><document_content>{plan_discovery_content}</document_content></document>
+</documents>
+<task>
+Review the spec for ambiguity, missing invariants, impossible acceptance criteria, and risky assumptions.
+Evidence first: for every finding, quote the spec or plan discovery before judgment.
+HIGH-severity findings must cite the exact spec section.
+</task>
+<expected_output>
+Return JSON with evidence before verdict fields, issues, and required spec revisions.
+</expected_output>
 """
 )
 ```
 
-**After Devil's Advocate review:**
-- If **SPEC APPROVED** (no HIGH-severity findings): proceed to Step 3.
-- If **HIGH-severity findings**: present them to the user via AskUserQuestion. Update the spec with resolutions before proceeding. Do NOT silently proceed past HIGH findings.
-- MEDIUM/LOW findings: note them in the spec's Open Questions section but proceed.
+Fix blocking spec issues before decomposition.
 
 ### Step 3: Create Branch Directory
 
 ```bash
-BRANCH=$(git rev-parse --abbrev-ref HEAD | sed -E 's|/|-|g; s|[^a-zA-Z0-9_.-]|-|g; s|-{2,}|-|g; s|^-||; s|-$||')
-mkdir -p .map/${BRANCH}
+mkdir -p ".map/${BRANCH}"
 ```
 
 ### Step 4: Explore Approaches + Architecture Graph
 
-If there are multiple valid designs (and the user didn't specify the approach), propose 2-3 approaches with tradeoffs and capture the chosen direction before decomposition.
+Add an architecture graph to the spec or plan when the implementation has multiple components, state boundaries, or dependencies. See [plan-reference.md](plan-reference.md#architecture-graph) for examples.
 
-Skip approach exploration if the approach is obvious or the task is a clear bug fix with a known solution.
+### Step 4.5: Architecture Review (DEEP mode only)
 
-**Architecture Graph (REQUIRED for complexity >= 3):**
-Before calling the decomposer, write a brief architecture graph to `spec_<branch>.md` (append if spec exists, create if not). This gives the decomposer a "skeleton" to attach subtasks to.
+> **DEEP mode:** Before decomposition, dispatch Monitor as an architecture reviewer over the spec + deep discovery findings. Focus on component boundaries, dependency flow, state ownership, testability, and whether the proposed approach is consistent with the existing architecture documented in `docs/ARCHITECTURE.md`.
 
-```markdown
-## Architecture Graph
-
+```text
+Task(
+  subagent_type="monitor",
+  description="Architecture review before decomposition (DEEP mode)",
+  prompt="""
+<documents>
+  <document source="spec"><document_content>{spec_content}</document_content></document>
+  <document source="deep-discovery"><document_content>{deep_discovery_content}</document_content></document>
+</documents>
+<task>
+Review the proposed architecture for: component boundary clarity, dependency direction violations, state ownership ambiguity, untestable seams, and conflicts with the existing system described in docs/ARCHITECTURE.md.
+Evidence first: cite the spec or discovery before each finding.
+CRITICAL findings must identify the exact spec section and the specific risk.
+</task>
+<expected_output>
+Return JSON: {"valid": bool, "findings": [{"severity": "critical|high|medium", "section": "...", "finding": "...", "recommendation": "..."}], "summary": "..."}.
+</expected_output>
+"""
+)
 ```
-UserModel -[has_many]-> Project -[has_one]-> ArchiveState
-ProjectService -[calls]-> ProjectModel.update()
-api/routes/projects.py -[uses]-> ProjectService
-GET /projects -[filters_by]-> archived_at
-```
 
-Format: `ClassA -[relationship]-> ClassB` (arrow notation)
-Relationships: has_many, has_one, calls, extends, uses, creates
-Keep under 200 tokens — only include nodes touched by the feature.
-```
+Fix any CRITICAL or HIGH findings before proceeding to Step 5. Add unresolved architecture risks to the spec's Open Questions.
+
+> **Standard / LIGHT mode:** Skip this step.
 
 ### Step 5: Call Task Decomposer
 
-Use the task-decomposer agent to break down the work. Pass spec, discovery, and architecture graph as context:
-
-```
+```text
 Task(
   subagent_type="task-decomposer",
-  description="Decompose task into subtasks",
-  prompt=f"""
-Break down this task into atomic, testable subtasks:
-
-{user_requirements}
-
-{"Spec with decisions + Architecture Graph: .map/<branch>/spec_<branch>.md" if spec_exists else ""}
-
-{"Discovery notes from research-agent are available in this chat" if discovery_done else ""}
-
-Output requirements:
-- Include an `evidence` array before `subtasks`: quote the spec, user request, discovery notes, or source files that justify the decomposition boundaries
-- Each subtask MUST include an aag_contract: "Actor -> Action(params) -> Goal"
-- Each subtask MUST include `expected_diff_size`: `tiny`, `small`, `medium`, or `large`
-- Each subtask MUST include `concern_type`: `api`, `config`, `data`, `docs`, `infra`, `observability`, `refactor`, `release`, `runtime`, `security`, `tests`, `ui`, or `mixed`
-- Each subtask MUST include `one_logical_step: true`
-- If `expected_diff_size` is `large`, split the subtask unless it has a concrete `split_rationale`
-- If `concern_type` is `mixed`, split the subtask unless it has a concrete `concern_justification`
-- Each subtask should be completable within ~4000 tokens (SFT comfort zone)
-- Include acceptance criteria for each
-- Each subtask should include an explicit verification approach (tests/commands)
-- Identify dependencies between subtasks
-- Estimate complexity (low/medium/high)
-- Use architecture_graph_summary to map subtasks to affected modules
-- Output `hard_constraints`: non-negotiable requirements that must block or force replanning if omitted
-- Output `soft_constraints`: negotiable preferences with `tradeoff_rationale` when intentionally not covered
-
-Coverage requirements:
-- CRITICAL: Every acceptance criterion from the spec must appear as a validation_criteria in exactly one subtask. Do NOT silently drop spec criteria that seem minor.
-- Each `validation_criteria` item that proves a mapped requirement must cite the stable requirement ID in brackets, e.g. `VC1 [MVP-AC-1]: checkout timeout shows retryable message`. The `coverage_map` key and bracket tag must match exactly.
-- Every `hard_constraints[].id` must appear in `coverage_map` and as a matching bracket tag in the owning subtask's `validation_criteria`.
-- Every `soft_constraints[].id` must either appear in `coverage_map` or include `tradeoff_rationale` explaining the conscious tradeoff/defer decision.
-- For cross-cutting requirements (observability, error handling, budget tracking, structured logging), either create a dedicated subtask or explicitly add them as validation criteria to the subtask that implements the relevant infrastructure.
-- For each structured result type in the spec, verify ALL fields (including optional envelope fields like budget_state, deferred_work, recovery_state) are covered in validation criteria.
-- Output a `coverage_map` field: a dict mapping each spec AC identifier to the subtask ID that owns it, e.g. {{"MVP-AC-1": "ST-007", "MVP-AC-2": "ST-005", ...}}.
-- The `coverage_map` is mandatory and must include acceptance criteria, invariants, and cross-cutting requirements that a reviewer would expect to trace before implementation.
+  description="Decompose approved spec",
+  prompt="""
+<documents>
+  <document source="spec"><document_content>{spec_content}</document_content></document>
+  <document source="plan-discovery"><document_content>{plan_discovery_content}</document_content></document>
+</documents>
+<task>
+Break the spec into atomic subtasks. Include an `evidence` array before `subtasks` so every boundary is grounded in the spec or repo findings.
+</task>
+<constraints>
+Each subtask must include expected_diff_size, concern_type, one_logical_step, validation_criteria, dependencies, complexity_score, risk_level, test_strategy, and aag_contract.
+Split large subtasks unless split_rationale explains why the user payoff requires that scope in one subtask.
+Split mixed-concern subtasks unless concern_justification explains why separation would lose user value.
+Top-level coverage_map must map each acceptance criterion, invariant, and cross-cutting requirement to an owning subtask. Each key must appear as a bracketed tag in that subtask's validation_criteria, e.g. VC1 [AC-1]: retryable checkout timeout.
+Top-level hard_constraints are non-negotiable: every hard_constraints id must appear in coverage_map and bracketed validation_criteria.
+Top-level soft_constraints are negotiable only with coverage or tradeoff_rationale.
+Do NOT create subtasks for behavior listed under the spec's "Out of Scope > Already Implemented" subsection; that work already exists in the codebase. Plan only the remaining gap.
+LIGHT mode: target 2–5 minimal, bite-sized subtasks. Prefer merging related concerns into one subtask rather than splitting them. Do not over-decompose well-understood small tasks.
+</constraints>
+<expected_output>Return only blueprint JSON.</expected_output>
 """
 )
 ```
 
 ### Step 5.5: Save Blueprint JSON
 
-Save the raw decomposer output as `.map/<branch>/blueprint.json` using the **Write** tool. This file is required by `/map-efficient` for wave computation (`set_waves`).
+Write decomposer output to `.map/<branch>/blueprint.json` exactly once. Preserve evidence and metadata.
 
-The blueprint JSON must include at minimum:
-```json
-{
-  "summary": "<goal description>",
-  "hard_constraints": [{"id": "HC-1", "description": "Non-negotiable requirement"}],
-  "soft_constraints": [{"id": "SC-1", "description": "Preference", "tradeoff_rationale": "Only if not covered"}],
-  "subtasks": [
-    {
-      "id": "ST-001",
-      "title": "<title>",
-      "aag_contract": "Actor -> Action(params) -> Goal",
-      "dependencies": [],
-      "affected_files": ["path/to/file.py"],
-      "expected_diff_size": "small",
-      "concern_type": "runtime",
-      "one_logical_step": true,
-      "complexity_score": 5,
-      "risk_level": "medium",
-      "validation_criteria": ["VC1 [HC-1] [AC-1]: ...", "VC2 [INV-1]: ..."],
-      "test_strategy": {"unit": ["test description"]}
-    }
-  ],
-  "coverage_map": {"HC-1": "ST-001", "AC-1": "ST-001", "INV-1": "ST-001"}
-}
+### Step 5.55: Normalize Blueprint (MANDATORY)
+
+```bash
+python3 .map/scripts/map_step_runner.py normalize_blueprint
 ```
 
-If the decomposer returned structured JSON, save it directly. If it returned markdown, construct the JSON from the decomposed subtasks. **This step is mandatory** — without `blueprint.json`, `/map-efficient` cannot compute parallel execution waves.
+A deterministic repair pass that fixes the two self-consistency drifts the decomposer routinely emits — so you don't hand-edit `blueprint.json` between decompose and validate:
+
+- **Forward-dependency ordering:** stably topologically sorts `subtasks[]` so every dependency is declared before its dependents (independent subtasks keep their order; a true cycle is left for the validator to reject).
+- **coverage_map bracket-tags:** for every `coverage_map[req] = owner` whose owner's `validation_criteria` doesn't already cite `[req]`, appends a `[req]`-tagged criterion.
+
+It never invents `coverage_map` ownership or rewrites dependency edges — genuine semantic gaps still fail Step 5.6. Idempotent (`changed: false` if nothing needed fixing).
 
 ### Step 5.6: Post-Save Blueprint Validation (MANDATORY)
-
-After writing `blueprint.json`, run this deterministic shell check to verify the
-file contains contract-sized subtasks with size, concern, one-logical-step, AAG,
-validation, hard/soft constraint, and coverage ownership metadata. Do NOT
-proceed to Step 5.7 if the check reports a problem.
-
-Use the **Bash** tool:
 
 ```bash
 python3 .map/scripts/map_step_runner.py validate_blueprint_contract
 ```
 
-**On failure (exit code != 0):**
-- The decomposer wrote an empty, malformed, oversized, mixed-concern, or
-  untraceable blueprint. Read the JSON output's `errors` and `warnings`. Re-run
-  **Step 5** with the same prompt, but explicitly paste the validation errors
-  and ask the decomposer to fix them.
-- After the second decomposer run, save the new output to `blueprint.json` and
-  re-run this validation. If it fails a second time, STOP and report the exact
-  validator errors to the user — do not proceed to plan-write or downstream steps.
-
-**On success (exit code 0):** proceed to Step 5.7.
+Do not proceed until this passes. The validator protects `coverage_map`, `validation_criteria`, bracket tags like `[AC-1]`, hard/soft constraints, `tradeoff_rationale`, `expected_diff_size`, `concern_type`, `one_logical_step`, `split_rationale`, and `concern_justification`.
 
 ### Step 5.7: Decomposition Coverage Check
 
-Before writing the human-readable plan, verify the decomposition covers the full spec. The decomposer agent works with limited context and may silently drop requirements.
-
-**1. Acceptance criteria mapping:**
-For each acceptance criterion in the spec (or referenced source), identify which ST-XXX covers it. If an AC has no owner subtask, either add it to an existing subtask's validation_criteria or create a new subtask.
-
-**2. Result schema field check:**
-For each structured result type defined in the spec (e.g., IngestResult, ProjectSynthesisResult, ArchitectureRefreshResult, etc.), verify that ALL fields — including optional envelope fields like `budget_state`, `deferred_work`, `recovery_state` — appear in at least one subtask's validation criteria. Missing fields cause schema drift between implementation and spec.
-
-**3. Cross-cutting concerns scan:**
-Check whether these concerns have an explicit owner subtask or are distributed as validation criteria across subtasks:
-- Observability / structured logging
-- Error codes and structured error types
-- Concurrency / locking
-- Budget tracking and exhaustion
-- Recovery state for all write-capable workflows
-
-If any concern is orphaned (no subtask owns it), either create a dedicated subtask or explicitly add it as a deliverable to the most relevant existing subtask.
-
-**4. Invariant coverage:**
-For each invariant in the spec, verify at least one subtask's acceptance criteria would catch a violation.
-
-**5. Edge case / overflow rules:**
-Scan the spec for boundary conditions (format overflows, threshold transitions, fallback behaviors). Verify each has a corresponding test in at least one subtask's test_strategy.
-
-**6. Contradiction preservation:**
-Read the spec's `## Contradiction` section. For each side of the stated tension (A and B), identify at least one subtask whose validation criteria would catch a regression on that side. If a side has no defender subtask, the decomposition risks silently dropping it during implementation — that is the typical failure mode that turns a TRIZ-style design into a one-sided trade-off in the diff. Either add validation criteria to an existing subtask or create a new one. If the spec stated "No non-trivial contradiction", skip this check.
-
-If gaps are found, update the decomposition (add validation criteria to existing subtasks or create new subtasks) BEFORE proceeding to Step 6.
+Read validation output and confirm every acceptance criterion/invariant has an owning subtask and executable validation criteria.
 
 ### Step 6: Create Human-Readable Plan
 
-Write the plan to `.map/<branch>/task_plan_<branch>.md` using the **Write** tool. Wrap content in `<MAP_Plan_v1_0>` semantic brackets for machine-parseable handoff to executors.
+Write `.map/<branch>/task_plan_<branch>.md`.
 
-First, get the branch name:
-```bash
-git rev-parse --abbrev-ref HEAD | sed -E 's|/|-|g; s|[^a-zA-Z0-9_.-]|-|g; s|-{2,}|-|g; s|^-||; s|-$||'
-```
-
-Then use the **Write** tool to create `.map/<branch>/task_plan_<branch>.md` with this structure:
+Required plan shape:
 
 ```markdown
-<MAP_Plan_v1_0 branch="<branch>" created="YYYY-MM-DD">
-
 # Task Plan: [Brief Title]
 
-**Workflow:** map-plan
-
 ## Overview
-
-[1-2 sentence description of the overall goal]
+- Goal: ...
+- Source spec: .map/<branch>/spec_<branch>.md
 
 ## Subtasks
 
 ### ST-001: [Subtask Title]
-- **Status:** pending
-- **AAG Contract:** `Actor -> Action(params) -> Goal`
-- **Complexity:** [low/medium/high]
-- **Expected Diff Size:** [tiny|small|medium|large]
-- **Concern Type:** [api|config|data|docs|infra|observability|refactor|release|runtime|security|tests|ui|mixed]
-- **One Logical Step:** [true|false]
-- **Dependencies:** [none | ST-XXX, ST-YYY]
-- **Description:** [What needs to be done]
-- **Acceptance Criteria:**
-  - [ ] Criterion 1
-  - [ ] Criterion 2
-- **Verification:**
-  - [ ] Tests added/updated for new/changed behavior
-  - [ ] Test command(s) to run: [e.g., pytest -k ...]
-
-### ST-002: [Next Subtask]
-...
+- **Status:** in_progress
+- **Expected Diff Size:** small|medium|large
+- **Concern Type:** runtime|tests|docs|...
+- **One Logical Step:** true
+- **AAG Contract:** Actor -> Action -> Goal
+- **Validation Criteria:** VC1 [AC-1]: ...
+- **Dependencies:** []
 
 ## Execution Order
-
-1. ST-001 → ST-002 (ST-002 depends on ST-001)
-2. ST-003 (can run in parallel)
+- ST-001 -> ST-002
 
 ## Spec Coverage
-
-Map every spec requirement to the subtask that owns its verification. This table is the primary review artifact — if a row has no owner, the plan has a gap.
-
-| Spec Section | Requirement ID | Description | Owner ST | Verified By |
-|-------------|---------------|-------------|----------|-------------|
-| MVP AC | AC-1 | [criterion text] | ST-XXX | [test or check] |
-| Invariant | INV-5 | [invariant text] | ST-YYY | [test or check] |
-| Result Schema | IngestResult.budget_state | [field exists and populated] | ST-ZZZ | [test] |
-| Cross-cutting | Observability | [structured logs with run_id] | ST-WWW | [test or check] |
-
-**Rules for this table:**
-- Every acceptance criterion from the spec MUST have a row
-- Every result schema field MUST have a row (group trivial fields if needed)
-- Every invariant MUST have a row
-- Cross-cutting concerns (observability, error codes, locking, budget) MUST have rows
-- If a row has no Owner ST, the plan is incomplete — add the requirement to a subtask before finalizing
+- AC-1 -> ST-001
 
 ## Notes
-
-[Any important context, gotchas, or design decisions]
-
-</MAP_Plan_v1_0>
+- risks, assumptions, or tradeoffs
 ```
-
-**AAG Contract is REQUIRED** for every subtask. Copy directly from task-decomposer output's `aag_contract` field. This is the primary handoff to the Actor agent — without it, the Actor reasons instead of compiles.
 
 ### Step 6.5: Validate Constraints
 
-If the spec includes a `## Constraints` section with non-null values, validate before finalizing the planning artifacts:
-
-**scope_glob validation** (REQUIRED if scope_glob is non-null):
-- Reject if contains `..` (path traversal)
-- Reject if starts with `/` (absolute path)
-- Reject if contains `{` (brace expansion — Python version-dependent behavior)
-- On validation failure: print error and STOP — do not finalize the plan handoff
-
-```bash
-# Example validation (run in Bash)
-SCOPE_GLOB="src/auth/**"  # from spec constraints
-if echo "$SCOPE_GLOB" | grep -qE '(\.\.)|^/|\{'; then
-  echo "ERROR: Invalid scope_glob '$SCOPE_GLOB'. Must be relative, no '..' or brace expansion."
-  exit 1
-fi
-```
+Rerun blueprint validation after writing the human-readable plan if any decomposition data was transformed.
 
 ### Step 7: Record Planning Artifacts (Do This Last)
 
-Do **NOT** create `step_state.json` in `/map-plan`.
-
-`step_state.json` is the execution runtime state owned by `map_orchestrator.py`. Writing a planning-only state file here creates a contract mismatch with `/map-efficient` and can cause execution to skip the first subtask or bypass `resume_from_plan`.
-
-`/map-plan` must stop after producing planning artifacts only:
-
-- `spec_<branch>.md`
-- `task_plan_<branch>.md`
-- `blueprint.json`
-- `artifact_manifest.json`
-- optional `findings_<branch>.md` and `workflow-fit.json`
-
-The execution state must be initialized later by:
-
-```bash
-python3 .map/scripts/map_orchestrator.py resume_from_plan
-```
-
-After writing `spec_<branch>.md`, `task_plan_<branch>.md`, and `blueprint.json`, record everything in the manifest:
+Record planning artifacts in the branch manifest after spec, blueprint, and task plan exist. Use the named CLI — don't introspect the script:
 
 ```bash
 python3 .map/scripts/map_step_runner.py record_plan_artifacts
 ```
 
+`/map-plan` deliberately stops BEFORE `INIT_STATE` (that step belongs to `/map-efficient`), so `plan_status: "ready"` requires only `task_plan_<branch>.md` + `blueprint.json` — `step_state.json` will land later. Don't be alarmed by `has_step_state: false` in the response; it's the expected planning-complete state.
+
+Runner functions you'll commonly need from `/map-plan`:
+
+| Function | Purpose |
+|---|---|
+| `record_plan_artifacts` | Persist spec/blueprint/task-plan into `artifact_manifest.json`. |
+| `record_workflow_fit <workflow> [--diff-size SIZE] [--has-new-invariants 0\|1] [--needs-independent-review 0\|1] [--has-clear-acceptance-criteria 0\|1] [--test-first-required 0\|1] [--depends-on-runtime-state 0\|1] [--summary "..."]` | Persist the workflow-fit decision. Use the named flags — bool order is easy to confuse otherwise. `--depends-on-runtime-state 1` arms Step 0.6 (defaults `0`; the legacy positional form always records it `0`). |
+| `normalize_blueprint [<path>] [--check]` | Deterministically repair decomposer drift before validation: topo-sort `subtasks[]` so deps precede dependents + inject missing `coverage_map` bracket-tags. `--check` reports without writing. |
+| `validate_blueprint_contract <path>` | Run schema + semantic checks on `blueprint.json`. |
+| `list_plans` | List per-branch plan artifacts under `.map/` to pick scope from a multi-roadmap workspace. |
+| `check_plan_resume "<request>" [--branch <b>]` | Resume preflight: reports existing artifacts + a `verdict` (`no_plan`/`resume`/`goal_mismatch`) comparing the prior plan's goal against the incoming request, so a branch hosting a *completed* plan for a different goal isn't falsely treated as "complete". |
+| `save_research <branch> <subtask_id> [kind]` | Persist research-agent findings (stdin-fed). `/map-plan` uses `save_research "$BRANCH" plan discovery`; execution subtasks use `save_research "$BRANCH" "$SUBTASK_ID"`. |
+| `validate_research <branch> <subtask_id>` | Validate strict JSON research evidence before `validate_step 2.2`. |
+
 ### Step 8: Output Checkpoint
 
-Print a clear checkpoint showing the plan is complete:
+Print a concise checkpoint:
 
-```
-═══════════════════════════════════════════════════
-WORKFLOW CHECKPOINT: PLAN PHASE COMPLETE
-═══════════════════════════════════════════════════
-✅ Deep interview completed (N decisions captured)
-✅ Devil's Advocate review completed (or skipped — state reason)
-✅ Architecture graph written to spec_${BRANCH}.md
-✅ Task decomposed into N subtasks with AAG contracts
-✅ Blueprint contract validated: size/concern/coverage metadata present, 0 oversized or unjustified mixed-concern subtasks
-✅ Coverage check passed: M/M spec ACs mapped, 0 orphaned cross-cutting concerns
-✅ Blueprint saved to .map/${BRANCH}/blueprint.json
-✅ Plan written to .map/${BRANCH}/task_plan_${BRANCH}.md
-✅ artifact_manifest.json updated for spec + plan artifacts
-✅ Context distilled (plan files ≤4000 tokens per subtask)
-
-Next Steps:
-1. Review the plan in task_plan_${BRANCH}.md
-2. If approved, start executing subtasks sequentially
-3. After completing all subtasks, verify:
-   /map-check
-
-📋 Subtask Sequence: [ST-001, ST-002, ST-003]
-═══════════════════════════════════════════════════
+```text
+PLAN COMPLETE
+Spec: .map/<branch>/spec_<branch>.md
+Blueprint: .map/<branch>/blueprint.json
+Task plan: .map/<branch>/task_plan_<branch>.md
+Mode: [standard | light | deep]
+Next: /map-efficient or /map-task for a selected subtask
 ```
 
-**Note:** If interview was skipped (small/well-defined task), the spec line will not appear.
+Include the active mode (`light` / `deep` / `standard`) so the operator knows which steps ran.
 
 ### Step 8.5: Execution Handoff Note
 
-Before stopping, print a short handoff note that execution must start by rehydrating runtime state from the saved plan:
-
-```text
-Execution state was intentionally NOT initialized by /map-plan.
-Start execution with:
-  /map-efficient
-
-The executor must call:
-  python3 .map/scripts/map_orchestrator.py resume_from_plan
-
-This ensures runtime state is derived from task_plan_<branch>.md and blueprint.json,
-not from a stale planning-state snapshot.
-```
+Name the recommended execution workflow and any high-risk first subtask. Do not start implementation.
 
 ### Step 9: Context Distillation + STOP
 
-**Before stopping, verify the distilled state is self-contained.** The next session starts fresh — it will ONLY see files, not this conversation. Ensure these files contain everything needed:
-
-```
-DISTILLATION CHECKLIST:
-  [x] task_plan_<branch>.md — has AAG contracts for every subtask + Spec Coverage table
-  [x] blueprint.json     — raw decomposer output for wave computation (with coverage_map and per-subtask aag_contract)
-  [x] spec_<branch>.md      — has architecture graph + decisions + COMPLETE acceptance criteria + Contradiction section (or explicit "No non-trivial contradiction")
-  [x] artifact_manifest.json — records workflow_fit + spec + plan stage artifacts
-  [x] findings_<branch>.md  — has research pointers (if discovery was done)
-
-TARGET: Executor reads ≤4000 tokens of distilled state to start any subtask.
-If plan files exceed this, condense — remove redundant descriptions, keep AAG contracts + criteria.
-The Spec Coverage table in task_plan should NOT be condensed — it is the review contract.
-```
-
-**This phase ends here.** Do NOT proceed to execution. The context should be flushed, and execution will start fresh with focused attention on individual subtasks.
-
----
+Summarize decisions, constraints, and next command. Then STOP.
 
 ## Design Rationale
 
-**Why deep interview before decomposition?**
-
-1. **Surface Hidden Decisions:** Users often have unstated assumptions. Non-obvious questions force these to the surface before code is written.
-
-2. **Self-Checklist Effect:** The interview benefits the user as much as the AI — it's a structured walkthrough of factors that are easy to forget.
-
-3. **Reduce Rework:** Decisions made during interview prevent costly pivots mid-implementation.
-
-**Why separate planning from execution?**
-
-1. **Context Isolation:** Planning requires broad analysis; execution requires deep focus. Mixing them causes attention dilution.
-
-2. **Forced Checkpoint:** By stopping after planning, we ensure the plan is reviewed before execution begins.
-
-3. **Token Efficiency:** Planning context can be large (requirement analysis, codebase exploration). Execution doesn't need this context.
-
-4. **Cognitive Load:** LLMs perform better on single-phase tasks. Multi-phase instructions get semantically compressed.
-
----
+Detailed rationale moved to [plan-reference.md](plan-reference.md#design-rationale). The key runtime rule remains: planning moves engineering judgment earlier and stops before implementation.
 
 ## Related Commands
 
-- **/map-check** - Verify all subtasks completed successfully
-- **/map-efficient** - Initialize runtime state from the saved plan and execute subtasks
-
----
+- `/map-efficient`: implement an approved plan.
+- `/map-task`: execute one selected subtask.
+- `/map-check`: verify completion.
+- `/map-review`: review the diff.
+- `/map-learn`: preserve reusable learnings.
+- `/map-plan --light`: spec-only mode, no research, 2–5 minimal subtasks (small, well-understood tasks).
+- `/map-plan --deep`: full research + architecture review mode (large or risky tasks). Also `--force-full`.
+- `/map-plan --force-fast`: skip planning; recommend `/map-fast` and stop.
 
 ## State Machine Integration
 
-This command does **not** transition `step_state.json` directly.
-
-Instead it produces planning artifacts that `/map-efficient` converts into runtime state.
-
-Subtask execution will later transition:
-```
-INITIALIZED → IN_PROGRESS → ... → SUBTASK_COMPLETE
-```
-
-Final /map-check will transition:
-```
-SUBTASK_COMPLETE (all subtasks) → WORKFLOW_COMPLETE
-```
-
----
+Planning artifacts become the inputs for `/map-efficient` state initialization. Do not edit state directly.
 
 ## Hook Enforcement
 
-workflow-gate.py is designed to prevent code edits during execution phases until required steps are complete.
-
-/map-plan should:
-- avoid editing repo code (outside `.map/`)
-- finish writing planning artifacts (spec/task_plan/blueprint) before any execution state is created
-
----
-
-## Example Usage
-
-```bash
-# User wants to add authentication to their app
-User: "Add JWT authentication with refresh tokens"
-
-# You call /map-plan (this command)
-# Result:
-# - .map/main/spec_main.md with architecture graph + decisions
-# - .map/main/task_plan_main.md with 5 subtasks + AAG contracts:
-#   ST-001: Add JWT library dependency
-#     AAG: PackageConfig -> add_dependency(pyjwt) -> import succeeds
-#   ST-002: Implement token generation service
-#     AAG: TokenService -> generate(user_id, ttl) -> returns signed JWT
-#   ST-003: Add middleware for token validation
-#     AAG: AuthMiddleware -> validate(request) -> 401|passes with user_id
-#   ST-004: Implement refresh token rotation
-#     AAG: TokenService -> refresh(old_token) -> new access+refresh pair
-#   ST-005: Add integration tests
-#     AAG: TestSuite -> test_auth_flow() -> all 12 assertions pass
-
-# After planning phase completes, user reviews and starts execution
-```
-
----
-
-## Troubleshooting
-
-**Q: Task-decomposer created too many subtasks (10+)?**
-A: Subtasks are too granular. Ask task-decomposer to group related work into larger chunks (aim for 3-7 subtasks).
-
-**Q: User changed requirements after planning?**
-A: Re-run /map-plan. It will overwrite the planning artifacts. Then re-run `/map-efficient`, which will rebuild runtime state via `resume_from_plan`.
-
----
-
-## Success Criteria
-
-This command succeeds when:
-- ✅ Deep interview completed (if scope warranted it) with spec_<branch>.md written
-- ✅ Spec acceptance criteria enumerated completely (not summarized)
-- ✅ Spec includes a `## Contradiction` section (real `<X> AND NOT <X>` tension, or explicit "No non-trivial contradiction" with justification)
-- ✅ Devil's Advocate review completed (if skip conditions not met) — including the trivial-contradiction check
-- ✅ Architecture graph written in spec_<branch>.md (for complexity >= 3)
-- ✅ Decomposition coverage check passed (Step 5.7) — no orphaned ACs, result fields, or cross-cutting concerns; both sides of the spec contradiction have at least one defender subtask
-- ✅ task_plan_<branch>.md exists with AAG contracts for every subtask AND Spec Coverage table
-- ✅ CHECKPOINT shows subtask count and IDs
-- ✅ Context distilled (plan files self-contained for fresh session)
-- ✅ You STOPPED (did not proceed to execution)
-
+Hooks may enforce read-only planning boundaries and later implementation boundaries. If a hook blocks expected planning artifact writes, report the exact command and blocker.
 
 ## Examples
 
-```
-/map-plan <typical args>
-```
+See [plan-reference.md](plan-reference.md#examples) for complete planning transcripts and generated task-plan examples.
+
+## Troubleshooting
+
+See [plan-reference.md](plan-reference.md#troubleshooting) for stale artifacts, failed blueprint validation, unsupported direct-edit off-ramp, and spec-review failures.
+
+## Success Criteria
+
+- Mode flags detected and stripped from `$ARGUMENTS` before use.
+- Workflow-fit decision recorded.
+- Already-implemented gate ran (or was explicitly skipped with a reason): whole-feature duplicates off-ramped, partial duplicates moved to spec "Out of Scope > Already Implemented". (LIGHT mode: gate explicitly skipped — noted in checkpoint.)
+- Live/runtime-state gate ran when `depends_on_runtime_state=true`: each runtime assumption was verified read-only, or recorded as an `Unverified Runtime Assumption` (Open Questions / Risks) with the exact check to run and dependent subtasks marked `provisional`.
+- Spec exists or is intentionally reused.
+- Blueprint exists and `validate_blueprint_contract` passed.
+- Human-readable task plan includes scope metadata and coverage.
+- DEEP mode: architecture review (Step 4.5) ran and any CRITICAL findings were resolved before decomposition.
+- LIGHT mode: decomposition produced 2–5 minimal subtasks.
+- The command stops with a clear execution handoff that names the active mode.

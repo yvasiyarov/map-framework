@@ -29,12 +29,12 @@ SRC_PATH = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_PATH))
 sys.path.insert(0, str(SCRIPTS_PATH))
 
-import map_orchestrator  # noqa: E402  # type: ignore[import-not-found]
-import map_step_runner  # noqa: E402  # type: ignore[import-not-found]
+import map_orchestrator  # type: ignore[import-not-found]
+import map_step_runner  # type: ignore[import-not-found]
 
 # DependencyGraph may not be importable if mapify_cli deps are missing (e.g. Python <3.11)
 try:
-    from mapify_cli.dependency_graph import DependencyGraph  # noqa: F401
+    from mapify_cli.dependency_graph import DependencyGraph
 
     del DependencyGraph
     _HAS_DEPENDENCY_GRAPH = True
@@ -76,6 +76,112 @@ def _load_fixture(name: str) -> str:
 def _load_fixture_json(name: str) -> dict:
     """Read a fixture file as JSON."""
     return json.loads(_load_fixture(name))
+
+
+def _write_valid_research(workspace: Path, subtask_id: str) -> None:
+    project_dir = workspace.parents[1]
+    source = project_dir / "src" / "service.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("def handle() -> bool:\n    return True\n", encoding="utf-8")
+    research_dir = workspace / "research"
+    research_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "confidence": 0.9,
+        "status": "OK",
+        "search_method": "glob_grep",
+        "search_stats": {
+            "files_scanned": 1,
+            "total_matches_found": 1,
+            "results_truncated": False,
+        },
+        "executive_summary": "Service entry point handles the behavior under test.",
+        "relevant_locations": [
+            {
+                "path": "src/service.py",
+                "lines": [1, 2],
+                "signature": "def handle() -> bool",
+                "relevance": "Primary implementation entry point.",
+                "relevance_score": 0.95,
+                "has_intent": False,
+            }
+        ],
+        "patterns_discovered": ["direct function dispatch"],
+    }
+    (research_dir / f"{subtask_id}__actor.md").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+class TestResearchLocalizationEvalContract:
+    """Research localization eval is part of the no-provider E2E contract."""
+
+    def test_mapify_research_eval_scores_fixture_repo(self, tmp_path: Path) -> None:
+        from typer.testing import CliRunner
+
+        from mapify_cli import app
+
+        source = tmp_path / "src" / "service.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "".join(f"line {index}\n" for index in range(1, 41)),
+            encoding="utf-8",
+        )
+        research_output = tmp_path / "research.json"
+        research_output.write_text(
+            json.dumps(
+                {
+                    "status": "OK",
+                    "confidence": 0.9,
+                    "search_stats": {
+                        "files_scanned": 1,
+                        "total_matches_found": 1,
+                        "results_truncated": False,
+                    },
+                    "relevant_locations": [
+                        {
+                            "path": "src/service.py",
+                            "lines": [20, 22],
+                            "relevance": "Primary implementation branch.",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        expected = tmp_path / "expected.json"
+        expected.write_text(
+            json.dumps(
+                {
+                    "expected_locations": [
+                        {"path": "src/service.py", "lines": [20, 22]}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(
+            app,
+            [
+                "research-eval",
+                "score",
+                str(research_output),
+                str(expected),
+                "--repo-root",
+                str(tmp_path),
+                "--fail-under-file-f1",
+                "1.0",
+                "--fail-under-line-f1",
+                "1.0",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["passed"] is True
+        assert payload["score"]["exact_match_count"] == 1
+        assert payload["score"]["file_level"]["f1"] == 1.0
+        assert payload["score"]["line_level"]["f1"] == 1.0
 
 
 # =====================================================================
@@ -458,13 +564,19 @@ class TestFullLifecycle:
         state = map_orchestrator.StepState.load(workspace / "step_state.json")
         assert state.current_subtask_id == "ST-001"
 
-        # 6. Walk subtask execution steps (RESEARCH → ACTOR → MONITOR)
+        # 6. Walk subtask execution steps (RESEARCH → ACTOR → MONITOR).
+        # validate_step("2.2") now enforces that save_research wrote a real
+        # artifact for the current subtask (MANDATORY RESEARCH); plant one
+        # per subtask so the gate accepts.
+        _write_valid_research(workspace, "ST-001")
         for step_id in ["2.2", "2.3", "2.4"]:
             step = map_orchestrator.get_next_step(branch)
             assert (
                 step["step_id"] == step_id
             ), f"Expected {step_id}, got {step['step_id']}"
-            map_orchestrator.validate_step(step_id, branch)
+            # ST-003: closing 2.4 now requires Monitor's recommendation.
+            rec = "proceed" if step_id == "2.4" else None
+            map_orchestrator.validate_step(step_id, branch, recommendation=rec)
 
         # 7. Should advance to next subtask
         step = map_orchestrator.get_next_step(branch)
@@ -472,10 +584,13 @@ class TestFullLifecycle:
         assert step["step_id"] == "2.2"
 
         # 8. Complete second subtask
+        _write_valid_research(workspace, "ST-002")
         for step_id in ["2.2", "2.3", "2.4"]:
             step = map_orchestrator.get_next_step(branch)
             assert step["step_id"] == step_id
-            map_orchestrator.validate_step(step_id, branch)
+            # ST-003: closing 2.4 now requires Monitor's recommendation.
+            rec = "proceed" if step_id == "2.4" else None
+            map_orchestrator.validate_step(step_id, branch, recommendation=rec)
 
         # 9. All done
         step = map_orchestrator.get_next_step(branch)

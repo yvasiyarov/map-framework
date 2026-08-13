@@ -7,24 +7,22 @@
 - **Bundled templates (what users get from `mapify init`):** `src/mapify_cli/templates/`
 - **Dev templates/config used in this repo:** `.claude/` (keep it in sync with `src/mapify_cli/templates/`)
 
-## Critical invariant: template synchronization
+## Critical invariant: template single-source render
 
-If you change anything under `.claude/` that is shipped to users, you MUST copy it to the matching path under `src/mapify_cli/templates/` before finishing.
+All shipped templates are generated from `src/mapify_cli/templates_src/**/*.jinja` via `make render-templates`. Never edit the generated trees directly — edit the `.jinja` source and re-render.
 
-Common synced paths:
-- `.claude/agents/` → `src/mapify_cli/templates/agents/`
-- `.claude/commands/` → `src/mapify_cli/templates/commands/` (custom-command scaffolding only; MAP `/map-*` surfaces live in skills)
-- `.claude/skills/` → `src/mapify_cli/templates/skills/`
-- `.claude/hooks/` → `src/mapify_cli/templates/hooks/`
-- `.claude/references/` → `src/mapify_cli/templates/references/`
-- `.claude/settings.json`, `.claude/workflow-rules.json` → `src/mapify_cli/templates/`
+Generated trees (do NOT edit directly):
+- `src/mapify_cli/templates/**`
+- `.claude/**`
+- `.codex/**`
+- `.agents/skills/**`
 
-Do the sync via a deterministic command (preferred):
-- `make sync-templates` (runs `scripts/sync-templates.sh`)
+To propagate any change to shipped templates:
+- `make render-templates`
 
 Verification:
-- Run `pytest tests/test_template_sync.py -v` (enforces agent template sync).
-- For other `.claude/` files, use `git diff`/`git status` to ensure the template copy was updated too.
+- Run `make check-render` (renders and asserts no diff — enforces generated trees match source).
+- Run `pytest tests/test_template_render.py -v` (byte-identity golden render tests).
 
 ## Skill catalog invariant
 
@@ -34,12 +32,13 @@ When changing shipped skills, keep `.claude/skills/skill-rules.json` and `src/ma
 - `hybrid` only when reference guidance ships hooks/scripts or artifact side effects; list `runtimeEffects`.
 
 Validation:
-- Run `pytest tests/test_skills.py tests/test_template_sync.py -v`.
+- Run `pytest tests/test_skills.py tests/test_template_render.py -v`.
 - Run `uv run mapify init <new-temp-path> --no-git --mcp none` and inspect generated `.claude/skills/skill-rules.json` for shipped metadata changes.
 
 ## How to work in this repo
 
 - Prefer deterministic tooling over “manual review”: run `make check` (or `make lint` / `make test`) after changes.
+- When changing scripts, hooks, CLIs, or generated provider surfaces, test both negative/no-op paths and positive paths with realistic inputs. A hook returning `{}` proves only the silent path; also build minimal state/artifacts that should trigger its intended output or side effect.
 - When changing user-facing behavior, also update relevant docs:
   - `README.md` (quick-start)
   - `docs/USAGE.md` (workflows and CLI usage)
@@ -66,6 +65,7 @@ Validation:
 - "Not in the CI gate" is NOT a valid reason to skip. The error is real if any tool reported it.
 - "Static-analysis noise" is NOT a category. Either the type system is correct and the code is wrong, or the annotation needs fixing — pick one and fix it.
 - Only legitimate skip: the user explicitly approves deferral in the current conversation. Document the deferral in writing.
+- **Any error encountered while operating the MAP Framework itself must be fixed immediately, in the same change.** This covers the framework's own runtime — a hook that crashes or false-positives, a `.map/scripts/` runner or gate that errors or mis-reports, a `mapify` CLI traceback, a render/validator/blueprint failure, a broken `Task`/agent dispatch. When you hit one mid-task: STOP, find the root cause, and fix it before continuing the original work. Do NOT work around it, do NOT defer it as "unrelated", do NOT note-and-move-on past a broken tool. If the fix is genuinely out of scope or risky, stop and ask the user — never silently continue past a malfunctioning framework component. (Errors raised by an external plugin/hook NOT shipped by this repo are out of scope here; say so and route them to the user.)
 
 ## Bash Command Guidelines
 

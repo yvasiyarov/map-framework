@@ -14,9 +14,7 @@ Exit codes:
 
 import json
 import os
-import re
 import sys
-from pathlib import Path
 
 # =============================================================================
 # Default constants (overridable via .map/config.yaml → safe_path_prefixes)
@@ -36,9 +34,27 @@ _DEFAULT_DANGEROUS_FILE_PATTERNS = [
     r"tokens?\.(json|ya?ml|toml|txt)$",  # token files, not any file with "token" in path
 ]
 
+_DEFAULT_DANGEROUS_FILE_MARKERS = (
+    ".env",
+    "credential",
+    "private",
+    "key",
+    ".pem",
+    "secret",
+    "id_rsa",
+    "id_ed25519",
+    "password",
+    "token",
+)
+
 # Dangerous bash command patterns
 _DEFAULT_DANGEROUS_COMMANDS = [
-    r"rm\s+-rf\s+/",  # rm -rf /
+    # Block `rm -rf /` (bare root), `rm -rf /etc`, `rm -rf /home/user`, etc.,
+    # but ALLOW deletion of subpaths UNDER a temp root (rm -rf /tmp/<dir>,
+    # /private/tmp/<dir>, /var/folders/<dir>, /var/tmp/<dir>) — legitimate
+    # scratch cleanup. The negative lookahead requires a trailing slash, so the
+    # temp root itself (`rm -rf /tmp`) stays blocked; only children are allowed.
+    r"rm\s+-rf\s+/(?!(?:tmp|private/tmp|var/folders|var/tmp)/)",  # rm -rf / (non-temp)
     r"rm\s+-rf\s+\*",  # rm -rf *
     r"rm\s+-rf\s+\.\.",  # rm -rf ..
     r"git\s+push.*--force.*main",
@@ -76,17 +92,17 @@ def _load_config_overrides() -> dict:
     Reads safe_path_prefixes from project config to allow customization.
     Falls back to defaults when config is missing or unreadable.
     """
-    project_dir = Path(os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()))
-    config_path = project_dir / ".map" / "config.yaml"
-    if not config_path.exists():
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+    config_path = os.path.join(project_dir, ".map", "config.yaml")
+    if not os.path.exists(config_path):
         return {}
     try:
         import yaml  # type: ignore[import-untyped]
 
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception:  # noqa: BLE001 -- deliberate fallback/resilience boundary, must not propagate
         return {}
 
 
@@ -114,10 +130,22 @@ def check_file_safety(path: str) -> tuple[bool, str]:
     if is_safe_path(path):
         return True, ""
 
-    # Check dangerous patterns
-    path_lower = path.lower()
+    # Check dangerous patterns against the basename only, not the full path.
+    # Matching the full path causes false positives when a directory name contains
+    # security-related words (e.g. "secrets-injector", "stackland-secrets-webhook"):
+    # a legitimate file like "values.yaml" inside such a directory would be blocked
+    # even though the file itself is not a credential file.  The patterns are designed
+    # to catch files with dangerous *names* — anchoring to the basename is correct.
+    basename_lower = os.path.basename(path).lower()
+    if DANGEROUS_FILE_PATTERNS == _DEFAULT_DANGEROUS_FILE_PATTERNS and not any(
+        marker in basename_lower for marker in _DEFAULT_DANGEROUS_FILE_MARKERS
+    ):
+        return True, ""
+
+    import re
+
     for pattern in DANGEROUS_FILE_PATTERNS:
-        if re.search(pattern, path_lower, re.IGNORECASE):
+        if re.search(pattern, basename_lower, re.IGNORECASE):
             return (
                 False,
                 f"Blocked: Access to sensitive file pattern '{pattern}' in path: {path}",
@@ -131,10 +159,70 @@ def check_command_safety(command: str) -> tuple[bool, str]:
     if not command:
         return True, ""
 
+    import re
+
     for pattern in DANGEROUS_COMMANDS:
         if re.search(pattern, command, re.IGNORECASE):
             return False, f"Blocked: Dangerous command pattern detected: {pattern}"
 
+    return True, ""
+
+
+def _autonomy_enabled() -> bool:
+    """Return True when the per-user autonomy posture is active.
+
+    Detected via the ``mapify.autonomy`` sentinel that ``mapify init --autonomy``
+    writes into the gitignored ``.claude/settings.local.json``. The sentinel lives
+    beside the permissions it governs so posture and permissions cannot drift
+    apart. Read fresh on each invocation (the hook is a short-lived subprocess).
+    """
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+    path = os.path.join(project_dir, ".claude", "settings.local.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 -- deliberate fallback/resilience boundary, must not propagate
+        return False
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("mapify"), dict)
+        and data["mapify"].get("autonomy") is True
+    )
+
+
+def check_autonomy_git_block(command: str) -> tuple[bool, str]:
+    """Hard-block ``git commit`` / ``git push`` when autonomy mode is active.
+
+    Under a broad ``Bash(*)`` allow the permission-level deny for git commit/push
+    is bypassable (``bash -c 'git commit'`` matches as ``bash``, not as
+    ``git commit``). This PreToolUse hook sees the raw command string, so a single
+    regex over the whole command catches the wrapped/chained forms too — it is the
+    only gate that survives ``bash -c``. Catches realistic (sloppy /
+    model-generated) bypasses, not a determined adversary; pair with branch
+    protection for an absolute guarantee.
+    """
+    if not command or not _autonomy_enabled():
+        return True, ""
+
+    import re
+
+    # ``git`` must start a shell token (handles ``bash -c 'git commit'``);
+    # optional git options / ``-C <path>`` may sit between git and the subcommand;
+    # the subcommand must itself be a full token (avoids matching ``committing``).
+    git_block = re.compile(
+        r"(?:^|[\s;&|`'\"()])"
+        r"git\s+"
+        r"(?:-\S+\s+|-C\s+\S+\s+|-c\s+\S+\s+)*"
+        r"(?:commit|push)"
+        r"(?:$|[\s;&|`'\"()])",
+        re.IGNORECASE,
+    )
+    if git_block.search(command):
+        return (
+            False,
+            ("Autonomy mode blocks git commit/push — run it yourself "
+            "(human owns commit/push)."),
+        )
     return True, ""
 
 
@@ -177,6 +265,9 @@ def main() -> None:
         is_safe, reason = check_command_safety(command)
         if not is_safe:
             deny(f"{reason} (tool={tool_name})")
+        is_safe, reason = check_autonomy_git_block(command)
+        if not is_safe:
+            deny(reason)
 
     print("{}")
     sys.exit(0)

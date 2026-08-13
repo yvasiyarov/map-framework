@@ -3,12 +3,39 @@
   "description": "MAP Framework project-level settings with security guardrails",
   "permissions": {
     "deny": [
-      "Write(./.env*)",
-      "Write(**/*credentials*)",
-      "Write(**/*secret*)",
-      "Edit(./.env*)",
-      "Edit(**/*credentials*)",
-      "Edit(**/*secret*)",
+      "Edit(**/.env*)",
+      "Write(**/.env*)",
+      "MultiEdit(**/.env*)",
+      "Edit(**/*credentials*.yaml)",
+      "Edit(**/*credentials*.yml)",
+      "Edit(**/*credentials*.json)",
+      "Edit(**/*credentials*.toml)",
+      "Edit(**/*credentials*.env)",
+      "Write(**/*credentials*.yaml)",
+      "Write(**/*credentials*.yml)",
+      "Write(**/*credentials*.json)",
+      "Write(**/*credentials*.toml)",
+      "Write(**/*credentials*.env)",
+      "MultiEdit(**/*credentials*.yaml)",
+      "MultiEdit(**/*credentials*.yml)",
+      "MultiEdit(**/*credentials*.json)",
+      "MultiEdit(**/*credentials*.toml)",
+      "MultiEdit(**/*credentials*.env)",
+      "Edit(**/*secret*.yaml)",
+      "Edit(**/*secret*.yml)",
+      "Edit(**/*secret*.json)",
+      "Edit(**/*secret*.toml)",
+      "Edit(**/*secret*.env)",
+      "Write(**/*secret*.yaml)",
+      "Write(**/*secret*.yml)",
+      "Write(**/*secret*.json)",
+      "Write(**/*secret*.toml)",
+      "Write(**/*secret*.env)",
+      "MultiEdit(**/*secret*.yaml)",
+      "MultiEdit(**/*secret*.yml)",
+      "MultiEdit(**/*secret*.json)",
+      "MultiEdit(**/*secret*.toml)",
+      "MultiEdit(**/*secret*.env)",
       "Bash(rm -rf)",
       "Bash(git push --force origin main)",
       "Bash(git push --force origin master)",
@@ -18,9 +45,6 @@
       "Edit(.claude/agents/*)",
       "Edit(.claude/commands/*)",
       "Edit(.claude/references/*)",
-      "Write(.claude/agents/*)",
-      "Write(.claude/commands/*)",
-      "Write(.claude/references/*)",
       "Bash(mapify *)",
       "Bash(pytest *)",
       "Bash(make lint)",
@@ -51,6 +75,41 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/post-compact-context.py",
             "timeout": 5,
             "description": "Tells Claude where to find the pre-compaction transcript and workflow state"
+          }
+        ]
+      },
+      {
+        "description": "MAP Memory Finalize - finalize prior dirty session scratches (runs before recall)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-memory-finalize.py",
+            "timeout": 60,
+            "description": "Finalize prior dirty session scratches (runs before recall)"
+          }
+        ]
+      },
+      {
+        "description": "MAP Memory Recall - inject ranked recalled session memory",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-memory-recall.py",
+            "timeout": 10,
+            "description": "Inject ranked recalled session memory"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "description": "MAP Memory Endmark - best-effort 'ended' marker",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-memory-endmark.py",
+            "timeout": 5,
+            "description": "Best-effort 'ended' marker"
           }
         ]
       }
@@ -133,7 +192,31 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "description": "MAP Token Meter - attribute sub-agent token usage to the active subtask",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-token-meter.py",
+            "timeout": 5,
+            "description": "Reads the finished sub-agent transcript and records input/output/cache tokens to .map/<branch>/token_log.jsonl + token_accounting.json"
+          }
+        ]
+      }
+    ],
     "Stop": [
+      {
+        "description": "Strip MAP-internal workflow IDs at run completion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/scrub-internal-ids.py",
+            "timeout": 120,
+            "description": "On WORKFLOW_COMPLETE, removes leaked ST-/AC-/VC-/INV-/HC- IDs from run-changed code and commits the cleanup (gated, runs once)"
+          }
+        ]
+      },
       {
         "description": "Lightweight quality gates - only critical issues",
         "hooks": [
@@ -142,6 +225,28 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/end-of-turn.sh",
             "timeout": 30,
             "description": "Auto-fixes silently, only reports secrets/syntax errors"
+          }
+        ]
+      },
+      {
+        "description": "MAP Token Meter - sweep main-session token usage at turn end",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-token-meter.py",
+            "timeout": 5,
+            "description": "Records main-session input/output/cache tokens (dedup by msg_id) into the branch token accounting artifacts"
+          }
+        ]
+      },
+      {
+        "description": "MAP Memory Capture - per-turn scratch WAL",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-memory-capture.py",
+            "timeout": 5,
+            "description": "Append one LLM-free scratch turn record"
           }
         ]
       }
@@ -166,6 +271,17 @@
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/context-meter.py",
             "timeout": 5,
             "description": "Reads transcript token usage; if compression_policy=auto/aggressive and threshold crossed, injects additionalContext suggesting /compact"
+          }
+        ]
+      },
+      {
+        "description": "MAP Memory Recall",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/map-memory-recall.py",
+            "timeout": 10,
+            "description": "Inject ranked recalled session memory"
           }
         ]
       }

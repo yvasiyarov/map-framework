@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Pytest tests for .claude/hooks/safety-guardrails.py PreToolUse hook.
 
@@ -27,6 +26,7 @@ def run_hook_file(tool_name: str, file_path: str) -> tuple[int, str, str]:
         input=json.dumps(input_data),
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -39,8 +39,42 @@ def run_hook_bash(command: str) -> tuple[int, str, str]:
         input=json.dumps(input_data),
         capture_output=True,
         text=True,
+        check=False,
     )
     return result.returncode, result.stdout, result.stderr
+
+
+def run_hook_bash_in(command: str, project_dir: Path) -> tuple[int, str, str]:
+    """Execute the hook with CLAUDE_PROJECT_DIR pointed at *project_dir*.
+
+    Used to exercise the autonomy git-block, which keys on the
+    ``mapify.autonomy`` sentinel in ``<project_dir>/.claude/settings.local.json``.
+    """
+    import os
+
+    input_data = {"tool_name": "Bash", "tool_input": {"command": command}}
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project_dir)}
+    result = subprocess.run(
+        [sys.executable, str(HOOK_PATH)],
+        input=json.dumps(input_data),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def _write_autonomy_settings(project_dir: Path, enabled: bool) -> None:
+    """Write .claude/settings.local.json with the autonomy sentinel set/cleared."""
+    settings = project_dir / ".claude" / "settings.local.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "permissions": {"allow": ["Bash(*)"], "deny": ["Bash(git commit:*)"]}
+    }
+    if enabled:
+        payload["mapify"] = {"autonomy": True}
+    settings.write_text(json.dumps(payload))
 
 
 def _parse_stdout(stdout: str) -> dict:
@@ -223,6 +257,10 @@ class TestRmRfBlocking:
         [
             "rm -rf /",
             "rm -rf /home/user",
+            "rm -rf /etc",
+            "rm -rf /var",
+            "rm -rf /tmp",  # the temp ROOT itself stays blocked (no trailing /child)
+            "rm -rf /*",
             "rm -rf *",
             "rm -rf ..",
         ],
@@ -231,6 +269,25 @@ class TestRmRfBlocking:
         exit_code, stdout, _ = run_hook_bash(command)
         assert exit_code == 0
         _assert_denied(_parse_stdout(stdout))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -rf /tmp/map-spike-abc123",
+            "rm -rf /tmp/pytest-of-user/run0",
+            "rm -rf /private/tmp/map-spike-WOi8Pq",  # macOS mktemp
+            "rm -rf /var/folders/ab/cd1234/T/scratch",  # macOS $TMPDIR
+            "rm -rf /var/tmp/build-cache",
+        ],
+    )
+    def test_rm_rf_temp_subpath_allowed(self, command):
+        """Deleting a subpath UNDER a temp root is legitimate scratch cleanup
+        and must not be blocked (regression: the bare ``rm -rf /`` pattern used
+        to flag every absolute path, including temp dirs and any command that
+        merely mentioned one)."""
+        exit_code, stdout, _ = run_hook_bash(command)
+        assert exit_code == 0
+        assert _parse_stdout(stdout) == {}
 
     def test_rm_single_file_allowed(self):
         exit_code, stdout, _ = run_hook_bash("rm file.txt")
@@ -338,6 +395,76 @@ class TestLegitimateCommands:
 
 
 # =============================================================================
+# Autonomy git-block Tests
+# =============================================================================
+
+
+class TestAutonomyGitBlock:
+    """git commit/push hard-block, gated on the mapify.autonomy sentinel."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git commit",
+            'git commit -m "wip"',
+            "git push",
+            "git push origin main",
+            "git push --force origin feature",  # not main/master, but autonomy blocks all push
+            "bash -c 'git commit'",  # wrapper bypass of permission-deny — hook catches it
+            "git status && git commit -m x",  # chained
+            "git -C /repo commit -m x",  # -C <path> before subcommand
+        ],
+    )
+    def test_git_write_blocked_when_autonomy_on(self, command, tmp_path):
+        _write_autonomy_settings(tmp_path, enabled=True)
+        exit_code, stdout, _ = run_hook_bash_in(command, tmp_path)
+        assert exit_code == 0
+        _assert_denied(_parse_stdout(stdout))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git status",
+            "git diff",
+            "git log --oneline",
+            "git add .",
+            "echo committing",  # 'commit' substring, not a git subcommand
+            "pytest -q",
+        ],
+    )
+    def test_read_only_git_allowed_when_autonomy_on(self, command, tmp_path):
+        _write_autonomy_settings(tmp_path, enabled=True)
+        exit_code, stdout, _ = run_hook_bash_in(command, tmp_path)
+        assert exit_code == 0
+        assert _parse_stdout(stdout) == {}
+
+    @pytest.mark.parametrize("command", ["git commit -m x", "git push origin main"])
+    def test_git_write_allowed_when_autonomy_off(self, command, tmp_path):
+        _write_autonomy_settings(tmp_path, enabled=False)
+        exit_code, stdout, _ = run_hook_bash_in(command, tmp_path)
+        assert exit_code == 0
+        assert _parse_stdout(stdout) == {}
+
+    def test_git_write_allowed_when_no_settings_file(self, command="git commit -m x"):
+        # No .claude/settings.local.json at all → autonomy off → not blocked.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            exit_code, stdout, _ = run_hook_bash_in(command, Path(d))
+        assert exit_code == 0
+        assert _parse_stdout(stdout) == {}
+
+    def test_force_push_still_blocked_when_autonomy_off(self, tmp_path):
+        # The baseline force-push guard is independent of autonomy mode.
+        _write_autonomy_settings(tmp_path, enabled=False)
+        exit_code, stdout, _ = run_hook_bash_in(
+            "git push --force origin main", tmp_path
+        )
+        assert exit_code == 0
+        _assert_denied(_parse_stdout(stdout))
+
+
+# =============================================================================
 # Error Handling Tests
 # =============================================================================
 
@@ -361,16 +488,76 @@ class TestErrorHandling:
             input="not valid json",
             capture_output=True,
             text=True,
+            check=False,
         )
         assert result.returncode == 0
         assert _parse_stdout(result.stdout) == {}
 
     def test_empty_input(self):
         result = subprocess.run(
-            [sys.executable, str(HOOK_PATH)], input="", capture_output=True, text=True
+            [sys.executable, str(HOOK_PATH)], input="", capture_output=True, text=True,
+            check=False,
         )
         assert result.returncode == 0
         assert _parse_stdout(result.stdout) == {}
+
+
+# =============================================================================
+# Regression Tests — Bug #321: Directory Name False Positives
+# =============================================================================
+
+
+class TestDirectoryNameFalsePositives:
+    """Regression tests for bug #321.
+
+    Files with safe names inside directories with security-related names
+    (e.g. 'secrets-injector', 'stackland-secrets-webhook') must NOT be blocked.
+    The pattern check must match against the file basename only, never the full path.
+    """
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # Directory contains 'secret' but the FILE is a plain config file.
+            "deploy/secrets-injector/values.yaml",
+            "k8s/stackland-secrets-webhook/config.json",
+            "infra/secrets-manager/deployment.yaml",
+            # Directory contains 'credential' but the file is not a credential file.
+            "apps/credential-service/main.py",
+            # Directory contains 'token' but the file is not a token store.
+            "services/token-validator/handler.go",
+            # Directory contains 'key' but the file is not a private key.
+            "apps/api-key-service/schema.sql",
+            # Directory contains 'password' but the file is documentation.
+            "docs/password-policy/README.md",
+            # Directory contains 'private' but the file is a public module.
+            "libs/private-utils/public_api.py",
+        ],
+    )
+    def test_safe_file_in_dangerous_directory_not_blocked(self, path):
+        """A file with a safe basename must not be blocked even if its parent
+        directory name matches a dangerous pattern (regression for bug #321)."""
+        exit_code, stdout, _ = run_hook_file("Read", path)
+        assert exit_code == 0
+        assert _parse_stdout(stdout) == {}, (
+            f"Path '{path}' was incorrectly blocked — basename is safe; "
+            "only the directory name contains a dangerous-looking word"
+        )
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            # The FILE itself is dangerous — must still be blocked.
+            "deploy/secrets-injector/secrets.yaml",
+            "k8s/app/.env",
+            "infra/deploy/credentials.json",
+        ],
+    )
+    def test_dangerous_file_in_any_directory_still_blocked(self, path):
+        """A file with a dangerous basename must be blocked regardless of where it lives."""
+        exit_code, stdout, _ = run_hook_file("Read", path)
+        assert exit_code == 0
+        _assert_denied(_parse_stdout(stdout))
 
 
 # =============================================================================

@@ -3,15 +3,14 @@
 import json
 import tempfile
 from pathlib import Path
-
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from mapify_cli.repo_insight import (
-    detect_language,
-    generate_suggested_checks,
-    generate_key_dirs,
-    create_repo_insight,
     compute_differential_insight,
+    create_repo_insight,
+    detect_language,
+    generate_key_dirs,
+    generate_suggested_checks,
 )
 
 
@@ -113,8 +112,8 @@ class TestGenerateSuggestedChecks:
             result = generate_suggested_checks("python", project_root)
 
             assert "make check" in result
-            assert "pytest tests/test_template_sync.py -v" in result
-            assert "make sync-templates" in result
+            assert "pytest tests/test_template_render.py -v" in result
+            assert "make render-templates" in result
 
     def test_python_filters_make_without_makefile(self):
         """Should filter out 'make' commands when Makefile doesn't exist."""
@@ -126,7 +125,7 @@ class TestGenerateSuggestedChecks:
             # Should not include make commands
             assert not any(cmd.startswith("make ") for cmd in result)
             # Should still include pytest
-            assert "pytest tests/test_template_sync.py -v" in result
+            assert "pytest tests/test_template_render.py -v" in result
 
     def test_javascript_commands(self):
         """Should return JavaScript-specific commands."""

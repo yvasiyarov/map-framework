@@ -147,8 +147,8 @@ mapify init my-project
 This will:
 
 - ✅ Create project directory
-- ✅ Install MAP agents (including Synthesizer, DebateArbiter, ResearchAgent, FinalVerifier)
-- ✅ Add 10 command files plus the skill-backed `/map-learn` slash surface
+- ✅ Install MAP agents (including Predictor, Evaluator, ResearchAgent, FinalVerifier)
+- ✅ Add skill-backed `/map-*` slash surfaces, including `/map-learn` and `/map-understand`
 - ✅ Configure essential MCP servers
 - ✅ Initialize git repository
 - ✅ Install branch-scoped `.map/<branch>/` workflow runtime used by `/map-plan` and `/map-efficient`
@@ -181,7 +181,7 @@ codex --enable codex_hooks
 
 or upgrade Codex first. Upgrading is recommended.
 
-Codex MAP skills do not start with `/`. Type `$map-plan`, `$map-fast`, or `$map-check` instead of `/map-plan`, `/map-fast`, or `/map-check`.
+Codex MAP skills do not start with `/`. Type `$map-plan`, `$map-fast`, `$map-check`, or `$map-understand` instead of `/map-plan`, `/map-fast`, `/map-check`, or `/map-understand`.
 
 ### MCP Server Configuration
 
@@ -191,11 +191,11 @@ Choose which MCP servers to enable:
 # All available MCP servers
 mapify init my-project --mcp all
 
-# Essential servers only (sequential-thinking, deepwiki)
+# Essential servers only (sequential-thinking)
 mapify init my-project --mcp essential
 
 # Specific servers
-mapify init my-project --mcp "sequential-thinking,deepwiki"
+mapify init my-project --mcp "sequential-thinking"
 
 # No MCP servers
 mapify init my-project --mcp none
@@ -243,15 +243,13 @@ If you prefer manual setup:
    ```
    your-project/
    ├── .claude/
-   │   ├── agents/                    # 11 specialized agents
+   │   ├── agents/                    # 9 specialized agents
    │   │   ├── task-decomposer.md     # Decomposes tasks into subtasks
    │   │   ├── actor.md               # Implements code
    │   │   ├── monitor.md             # Validates implementations
    │   │   ├── predictor.md           # Analyzes impact and risks
    │   │   ├── evaluator.md           # Scores solution quality
    │   │   ├── reflector.md           # Extracts lessons
-   │   │   ├── synthesizer.md         # Self-MoA: Merges variants
-   │   │   ├── debate-arbiter.md      # Opus: Cross-evaluates variants
    │   │   ├── research-agent.md      # Isolated codebase research
    │   │   ├── final-verifier.md      # Adversarial verification (Ralph Loop)
    │   │   └── documentation-reviewer.md  # Reviews technical docs
@@ -271,6 +269,7 @@ If you prefer manual setup:
    │   │   ├── map-release/SKILL.md   # Release workflow
    │   │   ├── map-resume/SKILL.md    # Resume interrupted workflows
    │   │   ├── map-learn/SKILL.md     # Persist lessons to .claude/rules/learned/
+   │   │   ├── map-understand/SKILL.md # Interactive learning/quiz mode
    │   │   └── map-state/SKILL.md     # Branch-scoped planning state skill
    │   └── mcp_config.json
    ```
@@ -320,6 +319,9 @@ After installation, you can use MAP commands in Claude Code:
 
 # Extract lessons after workflow completion
 /map-learn
+
+# Teach and quiz until a target makes sense
+/map-understand HEAD~1..HEAD
 ```
 
 ### Workflow Architecture
@@ -335,6 +337,7 @@ MAP Framework uses **slash commands** as entry points that coordinate specialize
 - **`/map-release`** - Package release workflow with validation gates
 - **`/map-resume`** - Resume incomplete MAP workflow from checkpoint
 - **`/map-learn`** - Extract lessons from completed workflows (implemented as a skill, not a command file)
+- **`/map-understand`** - Interactive understanding checklist and quiz mode (transient, no artifact writes)
 
 **Note:** Agents are invoked automatically by slash commands. Direct agent invocation is not the recommended approach—use the slash commands above for proper workflow orchestration.
 
@@ -347,12 +350,6 @@ If you selected MCP servers during installation, ensure they're configured:
 - Complex problem decomposition
 - Iterative refinement of solutions
 - Edge case discovery
-
-### Deepwiki (GitHub Intelligence)
-
-- Read documentation from any GitHub repo
-- Analyze architectural patterns
-- Learn from production implementations
 
 ## Optional: Semantic Search
 
@@ -386,15 +383,26 @@ pip install -r requirements-semantic.txt
 
 ## Updating MAP Framework
 
-To update to the latest version:
+Upgrade the `mapify` CLI itself to the latest release:
 
 ```bash
-# Reinstall mapify with latest version
-uv tool upgrade mapify-cli
+# Self-upgrade the mapify CLI (auto-detects uv tool vs pip install)
+mapify upgrade
 
-# Update agents in existing project
+# Then refresh an existing project's shipped MAP files with the new templates
 mapify init . --force
 ```
+
+`mapify upgrade` detects how the tool was installed and runs the right command
+for you. The equivalent manual commands are:
+
+```bash
+uv tool upgrade mapify-cli                    # if installed via `uv tool`
+python -m pip install --upgrade mapify-cli    # if installed via pip
+```
+
+> Running `mapify upgrade` from a source checkout / editable install disables
+> self-upgrade — update that clone with `git pull` instead.
 
 ## Troubleshooting
 

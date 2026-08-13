@@ -43,7 +43,6 @@ machine-readable blueprint for the Actor/Monitor pipeline.
 │                                                                     │
 │ 3. GATHER CONTEXT (if complexity ≥ 3)                               │
 │    └─ IF ambiguous: sequentialthinking                              │
-│    └─ IF external lib: get-library-docs                             │
 │    └─ Handle fallbacks if tools fail/return empty                   │
 │                                                                     │
 │ 4. IDENTIFY ASSUMPTIONS & OPEN QUESTIONS                            │
@@ -94,8 +93,6 @@ machine-readable blueprint for the Actor/Monitor pipeline.
 | Condition | Tool | Query Pattern |
 |-----------|------|---------------|
 | Ambiguous/complex goal | sequentialthinking | Iterative refinement of scope and dependencies |
-| External library | get-library-docs | Setup/quickstart guides for initialization order |
-| Unfamiliar domain | deepwiki | `"How does [repo] structure [feature]?"` |
 
 **Skip MCP when**: complexity_score ≤ 2, trivial change, clear internal pattern exists
 
@@ -151,6 +148,14 @@ Return **ONLY** valid JSON in this exact structure:
       "INV-1": "ST-001",
       "Cross-cutting: observability": "ST-002"
     },
+    "deferred_yagni": [
+      {
+        "id": "YG-001",
+        "title": "Speculative follow-up not required for this contract",
+        "rationale": "Not explicit, not acceptance-critical, not repo-required, and not safety-required",
+        "restore_hint": "Restore as a new ST-NNN only if the user explicitly approves it"
+      }
+    ],
     "subtasks": [
       {
         "id": "ST-001",
@@ -165,6 +170,9 @@ Return **ONLY** valid JSON in this exact structure:
         "expected_diff_size": "tiny|small|medium|large",
         "concern_type": "api|config|data|docs|infra|observability|refactor|release|runtime|security|tests|ui|mixed",
         "one_logical_step": true,
+        "requiredness": "explicit|implied_by_acceptance|repo_required|safety_required|optional|ambiguous",
+        "pruneable": false,
+        "prune_rationale": "Why this work is or is not safe to recommend for user-approved YAGNI pruning",
         "split_rationale": "Required only when expected_diff_size is large; otherwise omit",
         "concern_justification": "Required only when concern_type is mixed; otherwise omit",
         "validation_criteria": [
@@ -195,6 +203,9 @@ Return **ONLY** valid JSON in this exact structure:
         "affected_files": [
           "path/to/file1.py",
           "path/to/file2.jsx"
+        ],
+        "creates_files": [
+          "path/to/file1.py"
         ]
       }
     ]
@@ -247,6 +258,12 @@ Return **ONLY** valid JSON in this exact structure:
 **blueprint.soft_constraints**: REQUIRED array of negotiable preference objects `{id, description, source?, tradeoff_rationale?}`
   - If satisfied, include the soft constraint id in `coverage_map` and cite it in validation criteria
   - If deferred or traded off, omit it from `coverage_map` only when `tradeoff_rationale` explains the decision
+**blueprint.deferred_yagni**: REQUIRED array (use `[]` when empty) of speculative work recommended for omission
+  - This is a user-visible parking lot, not a silent delete. The orchestrator must show it during plan approval.
+  - Emit non-empty `deferred_yagni` ONLY when the prompt/context explicitly says `minimality: full`, `minimality: ultra`, or the user explicitly asks for pruning/YAGNI recommendations. Otherwise use `[]`.
+  - Never put explicit, acceptance-critical, repo-required, safety-required, correctness, security, contract, data-loss, migration, concurrency, auth, permissions, billing, storage, or public-API behavior here.
+  - If unsure, keep the work active with `requiredness: "ambiguous"` and `pruneable: false`.
+  - Each item needs `id` (`YG-NNN`), `title`, `rationale`, and `restore_hint`.
 
 **subtasks[].id**: Namespaced string ID (e.g., "ST-001", "ST-002") - prevents collision across blueprints
 **subtasks[].title**: Action-oriented, specific (e.g., "Add validateToken() to AuthService", NOT "update auth")
@@ -271,6 +288,19 @@ Return **ONLY** valid JSON in this exact structure:
   - Use "mixed" only when the concerns cannot be separated without losing user value; include `concern_justification`
 **subtasks[].one_logical_step**: REQUIRED boolean, normally `true`
   - If this would be `false`, split the subtask instead of returning it
+**subtasks[].requiredness**: REQUIRED classification for why the active subtask exists
+  - Allowed values: `explicit`, `implied_by_acceptance`, `repo_required`, `safety_required`, `optional`, `ambiguous`
+  - Do NOT use `omitted_yagni` for active subtasks; omitted work belongs in `blueprint.deferred_yagni`.
+  - `explicit`: user directly asked for it.
+  - `implied_by_acceptance`: needed to satisfy acceptance criteria or hard constraints.
+  - `repo_required`: required by repo conventions, generated-template parity, schema contract, docs/versioning, or existing architecture.
+  - `safety_required`: required for security, accessibility, data integrity, real error handling, auth, permissions, migrations, storage, concurrency, billing, or data-loss prevention.
+  - `optional`: potentially useful but not required; keep active unless pruning is explicitly enabled and approved.
+  - `ambiguous`: unclear if required; never prune ambiguous work.
+**subtasks[].pruneable**: REQUIRED boolean paired with `requiredness`
+  - `false` for `explicit`, `implied_by_acceptance`, `repo_required`, `safety_required`, and `ambiguous`.
+  - `true` only for optional work that could be moved to `deferred_yagni` after explicit user approval.
+**subtasks[].prune_rationale**: REQUIRED one-sentence reason for the `pruneable` decision
 **subtasks[].validation_criteria**: Array of **testable conditions** that prove completion
   - REQUIRED: 2-4 specific, verifiable outcomes
   - Format: Prefix each item with `VC1:`, `VC2:`, ... and include every owned coverage_map key in brackets, e.g. `VC1 [AC-1]: ...`.
@@ -321,6 +351,7 @@ Return **ONLY** valid JSON in this exact structure:
     - The repository has no automated test harness, and adding one is out-of-scope for this subtask.
     - In that case: either add a FOUNDATION subtask to introduce a minimal test harness, or document the gap explicitly in risks/assumptions.
 **subtasks[].affected_files**: Precise file paths (NOT "backend", "frontend"); use [] if paths unknown
+**subtasks[].creates_files**: OPTIONAL subset of `affected_files` that this subtask CREATES from scratch (paths not yet on disk). List each such path in BOTH `affected_files` and `creates_files`. This is the prose-free, structural signal `validate_blueprint_contract` uses to mark those paths expected-absent — do NOT rely on description wording ("creates new", "introduces") to silence the affected_files-drift warning. Omit the field (or use `[]`) when the subtask only modifies existing files.
 
 ### Integration & Runtime Bootstrapping Subtasks
 
@@ -341,7 +372,49 @@ Subtasks should be ordered by dependency:
 3. Integration/wiring subtasks after ALL feature subtasks they integrate
 4. Tests/docs can be parallel with implementation (same dependency level)
 
-**CRITICAL**: If subtask B depends on subtask A, A must appear BEFORE B in the array.
+**CRITICAL — topological invariant (framework-enforced):** If subtask B depends on subtask A, A MUST appear BEFORE B in the `subtasks[]` array. A forward dependency (B at index `i` referencing A at index `j > i`) is rejected by `validate_blueprint_contract` (`forward_dep_violations`), and `set_subtasks` will either auto-reorder the input or refuse the sequence outright when it detects a cycle.
+
+```jsonc
+// WRONG — ST-012 declared at index 11 depends on ST-027 at index 26
+"subtasks": [
+  { "id": "ST-001", "dependencies": [] },
+  // ...
+  { "id": "ST-012", "dependencies": ["ST-011", "ST-027"] },  // forward dep!
+  // ...
+  { "id": "ST-027", "dependencies": [] }
+]
+// → validate_blueprint_contract reports:
+//   "ST-012: forward dependency on 'ST-027' (declared at subtasks[26]
+//    but ST-012 is at subtasks[11]); dependencies must reference only
+//    subtasks declared earlier — reorder subtasks[] so deps come first"
+
+// CORRECT — ST-027 emitted FIRST, then ST-012 can depend on it
+"subtasks": [
+  { "id": "ST-001", "dependencies": [] },
+  { "id": "ST-027", "dependencies": [] },
+  // ...
+  { "id": "ST-012", "dependencies": ["ST-011", "ST-027"] }   // backward dep OK
+]
+```
+
+A subtask MUST NOT depend on itself. The validator also flags any
+`dependencies: ["ST-XXX"]` where `ST-XXX` is the subtask's own id.
+
+### Minimize Dependencies for Parallelism (MANDATORY)
+
+`dependencies` is a HARD serialization signal — the wave planner builds execution waves from this graph, and every false dependency you add forces work that could have run in parallel into a separate wave. The cost is real: a 15-subtask plan with linear deps becomes 15 sequential waves, 15x research-actor-monitor cycles, and 15x context budget.
+
+Add a dependency edge ONLY when:
+- B literally reads symbols/files that A creates, OR
+- B's tests rely on A's behavior, OR
+- B touches a file A creates or substantially renames.
+
+Do NOT add dependencies for:
+- "Logical ordering" (B feels like it should come after A but doesn't read A's output).
+- Same-area-of-codebase intuition (two subtasks in the auth module touching different files are independent).
+- Risk hedging ("might break if done out of order").
+
+When two subtasks touch disjoint `affected_files` and neither reads the other's symbols, leave their `dependencies` arrays independent — `split_wave_by_file_conflicts` will further refine if needed. Always populate `affected_files`; the file-conflict checker treats missing/empty `affected_files` as "conflicts with everything" and places the subtask in its own wave.
 
 ### Acceptance Criteria Section (Ralph Loop Integration)
 
@@ -552,6 +625,8 @@ When invoked with `mode: "re_decomposition"` from the orchestrator, you receive 
 ✅ Acceptance criteria are specific and measurable
 ✅ File paths are precise (not "backend" or "frontend")
 ✅ Size/concern metadata makes scope creep visible before implementation
+✅ Requiredness/pruneable classifications explain why each active subtask exists
+✅ deferred_yagni is [] unless pruning is explicitly enabled; non-empty parking lots are user-visible and restorable
 ✅ Complexity estimates are realistic (based on actual effort)
 ✅ Risks are identified (not empty)
 ✅ 5-8 subtasks (neither too granular nor too coarse)
@@ -566,6 +641,8 @@ When invoked with `mode: "re_decomposition"` from the orchestrator, you receive 
 ❌ "Tests pass" (vague acceptance criteria)
 ❌ "Code" or "backend" (vague file paths)
 ❌ Large or mixed-concern subtask with no rationale
+❌ Silent pruning of optional-looking work without deferred_yagni and user approval
+❌ Marking explicit, safety-required, repo-required, or ambiguous work as pruneable
 ❌ All subtasks marked "low" complexity (unrealistic)
 ❌ Empty risks array for complex feature
 ❌ 2 giant subtasks or 20 tiny subtasks
@@ -590,6 +667,9 @@ When invoked with `mode: "re_decomposition"` from the orchestrator, you receive 
 - [ ] AAG contracts are specific (not "does stuff" — name classes, methods, return types)
 - [ ] AAG contracts include wiring/integration when relevant (entrypoint + validator/policy checks, not leaf-only helpers)
 - [ ] All dependencies are explicit and accurate
+- [ ] Each `dependencies` edge is load-bearing (B reads A's output, A creates B's files, or A's tests pin B's behavior) — no edges added for "logical ordering" or risk hedging
+- [ ] `affected_files` populated for every subtask (empty = single-subtask wave)
+- [ ] **No circular imports between subtask modules.** If subtask A's affected_files includes `mod_x.py` that imports from `mod_y.py` (subtask B), AND B's affected_files imports from `mod_x.py`, you have a cycle. Either redesign the contract surface (lift the shared symbol to a third module owned by a foundation subtask) or document the lazy-import workaround in `split_rationale` so Actor doesn't discover it mid-implementation.
 - [ ] Subtasks ordered by dependency (foundations first)
 - [ ] 5-8 subtasks (not too granular or too coarse)
 - [ ] Titles are action-oriented (start with verb)
@@ -597,6 +677,10 @@ When invoked with `mode: "re_decomposition"` from the orchestrator, you receive 
 - [ ] Each subtask has expected_diff_size, concern_type, and one_logical_step=true
 - [ ] Large subtasks have split_rationale, or were split before returning
 - [ ] Mixed-concern subtasks have concern_justification, or were split before returning
+- [ ] Each active subtask has requiredness, pruneable, and prune_rationale
+- [ ] No explicit, acceptance-critical, repo-required, safety-required, or ambiguous subtask is pruneable
+- [ ] deferred_yagni is `[]` unless minimality full/ultra or the user explicitly requested pruning
+- [ ] Any deferred_yagni item is speculative only, user-visible, and has a restore_hint
 - [ ] coverage_map assigns every AC/invariant/cross-cutting requirement to an existing ST-NNN
 
 **Acceptance Criteria**:
@@ -610,6 +694,48 @@ When invoked with `mode: "re_decomposition"` from the orchestrator, you receive 
 - [ ] All affected_files are precise paths
 - [ ] No vague references ("backend", "frontend", "code")
 - [ ] Paths match actual project structure
+- [ ] Paths verified to exist on disk (grep/glob) OR, for files this subtask creates from scratch, listed in `creates_files` (a subset of `affected_files`) — `validate_blueprint_contract` warns "affected_files drift" when every MODIFY-target path is missing under CLAUDE_PROJECT_DIR. Use the structural `creates_files` field, not description prose, to mark new files.
+
+**Symbol Grounding (MANDATORY)**:
+- [ ] Every class / function / method name referenced in `aag_contract` or `validation_criteria` has been grep-verified against actual source code (`rg 'class FooBar'` or `rg 'def baz_method'`). Do NOT name symbols from memory or from a similar-looking project. Recurring decomposer failure mode: hallucinating `SourceCraftPublisher.publish_inline` when the real entry point is `publish_findings`, sending Actor on a wild-goose chase before the bug is caught.
+- [ ] If the subtask creates a NEW file, list it in `creates_files` (and `affected_files`). If it creates a NEW symbol inside an existing file, note it in the description ("introduces new class `X`") so reviewers don't expect to find it in the current tree.
+- [ ] When extending an existing class, name the class AND verify the file path where it currently lives — the decomposer's working assumption ("the obvious name") is wrong often enough that grep before write is cheaper than Actor rework.
+
+**Tool-Call Budget Estimate (MANDATORY)**:
+- [ ] For every planned subtask, estimate the Actor's tool-call budget:
+  approximate (file reads to understand context) + (edits across
+  `affected_files`) + (test/lint invocations). Subtasks projected to
+  exceed ~30 tool calls are HIGH RISK for Actor truncation (the
+  observed truncation floor across production runs is ~50-66 tool
+  calls — leaving a 30-call buffer for unanticipated overhead).
+- [ ] High-budget subtasks (>30 estimated tool calls) MUST EITHER:
+  (a) split into smaller subtasks each below the threshold, OR
+  (b) include `split_rationale` documenting WHY the work cannot be
+      split (e.g., a single atomic refactor whose intermediate state
+      would not compile), AND tag `expected_diff_size: large` so
+      Monitor/Evaluator know to expect a long run.
+- [ ] Cleanup-heavy subtasks (touching 20+ files for tracking
+  consistency) MUST split by concern (one subtask per concern_type:
+  type-cleanup, dead-code, naming, docs).
+- [ ] When affected_files lists 8+ paths, add `split_rationale` even
+  if expected_diff_size remains medium — high file count correlates
+  with truncation regardless of per-file delta.
+
+**Stale-Roadmap Check (MANDATORY)**:
+- [ ] For every planned subtask, run `detect_already_done` to confirm
+  the work isn't already shipped in prod / an earlier branch / a
+  recently-merged PR:
+  ```bash
+  python3 .map/scripts/map_step_runner.py detect_already_done \
+    <branch> <ST-NNN> [--since-ref HEAD~20]
+  ```
+  Returns `status="likely_done"` when every `affected_files` path
+  already has recent commits — that subtask should be dropped, marked
+  via `mark_subtask_complete --kind prior_pr`, OR re-scoped to the
+  delta that's actually still missing. Decomposer regression: planning
+  a 5-step subtask whose implementation already landed in the prior
+  iteration, leading to "subtask = 1 line + 12 tests" once Actor reads
+  the source.
 
 **Complexity Estimation** (using Unified Framework):
 - [ ] Numeric complexity_score (1-10) assigned using unified scoring framework
@@ -826,157 +952,6 @@ Omit for simple CRUD, internal helpers, obvious logic.
 For detailed examples and anti-patterns, see: `.claude/references/decomposition-examples.md`
 
 <Decomposer_Reference_Examples>
-
-## REFERENCE EXAMPLES
-
-### Example A: Simple CRUD Feature
-
-**Goal**: "Add ability to archive projects"
-
-**Why this decomposition works**: Single domain, clear boundaries, well-known pattern
-
-**Full JSON Output**:
-```json
-{
-  "schema_version": "2.0",
-  "analysis": {
-    "assumptions": ["Project model exists with standard CRUD operations"],
-    "open_questions": [],
-    "scope_vs_quality_decision": "Full feature scope implemented with non-negotiable quality standards. No scope reductions needed for this standard CRUD extension.",
-    "architecture_graph_summary": "Project -[add_field]-> archived_at; ProjectService -[calls]-> Project.update(); api/routes/projects.py -[uses]-> ProjectService; GET /projects -[filters_by]-> archived_at"
-  },
-  "blueprint": {
-    "id": "project-archive",
-    "summary": "Add soft-delete archiving to projects via archived_at timestamp field with API endpoints and filtered listings",
-    "quality_requirements": {
-      "min_security_score": 7,
-      "min_functionality_score": 7,
-      "error_handling_required": true,
-      "rationale": "Standard CRUD operations require robust error handling and data validation"
-    },
-    "subtasks": [
-      {
-        "id": "ST-001",
-        "title": "Add archived_at field to Project model",
-        "description": "Add nullable DateTime 'archived_at' to Project model in models/project.py. Generate migration. null = active, non-null = archived.",
-        "dependencies": [],
-        "risk_level": "low",
-        "risks": [],
-        "security_critical": false,
-        "complexity_score": 3,
-        "complexity_rationale": "Score 3: Base(1) + Novelty(+0) + Deps(+0) + Scope(+2) + Risk(+0) = 3",
-        "aag_contract": "ProjectModel -> add_field(archived_at: DateTime?) -> migration passes, existing queries unaffected",
-        "validation_criteria": [
-          "VC1 [AC-1]: Project model has archived_at field (nullable DateTime)",
-          "VC2 [INV-1]: Migration runs without errors on existing data",
-          "VC3 [INV-1]: SELECT count(*) FROM projects WHERE archived_at IS NOT NULL returns 0"
-        ],
-        "test_strategy": {
-          "unit": "Test field accepts timestamps, test default is null",
-          "integration": "Test migration applies cleanly",
-          "e2e": "N/A",
-          "scenario_dimensions": {
-            "happy_path": "Test archived_at stores valid timestamp",
-            "error": "Test migration rollback on failure",
-            "edge_case": "Test field with existing null values in table",
-            "security": "N/A"
-          }
-        },
-        "affected_files": [
-          "models/project.py",
-          "migrations/versions/add_archived_at_to_projects.py"
-        ]
-      },
-      {
-        "id": "ST-002",
-        "title": "Add archive_project() and unarchive_project() to ProjectService",
-        "description": "Add methods to services/project_service.py. archive_project(id) sets archived_at=now(), unarchive_project(id) sets archived_at=null.",
-        "dependencies": ["ST-001"],
-        "risk_level": "low",
-        "risks": [],
-        "security_critical": false,
-        "complexity_score": 3,
-        "complexity_rationale": "Score 3: Base(1) + Novelty(+0) + Deps(+1) + Scope(+1) + Risk(+0) = 3",
-        "aag_contract": "ProjectService -> archive_project(id) + unarchive_project(id) -> sets/clears archived_at, raises ProjectNotFoundError for invalid IDs",
-        "validation_criteria": [
-          "VC1 [AC-2]: archive_project(valid_id) sets archived_at to current UTC timestamp",
-          "VC2 [AC-2]: unarchive_project(valid_id) sets archived_at to null",
-          "VC3 [AC-2]: Both raise ProjectNotFoundError for invalid IDs"
-        ],
-        "test_strategy": {
-          "unit": "Test archive sets timestamp, test unarchive clears it, test invalid ID handling",
-          "integration": "Test database persistence",
-          "e2e": "N/A"
-        },
-        "affected_files": [
-          "services/project_service.py"
-        ]
-      },
-      {
-        "id": "ST-003",
-        "title": "Add POST /projects/{id}/archive and /unarchive endpoints",
-        "description": "Create endpoints in api/routes/projects.py. Require project owner permission. Return updated project JSON.",
-        "dependencies": ["ST-002"],
-        "risk_level": "low",
-        "risks": [],
-        "security_critical": false,
-        "complexity_score": 4,
-        "complexity_rationale": "Score 4: Base(1) + Novelty(+0) + Deps(+1) + Scope(+2) + Risk(+0) = 4",
-        "aag_contract": "ProjectRoutes -> POST /projects/{id}/archive|unarchive -> 200+JSON for owner, 403 for non-owner, 404 for invalid ID",
-        "validation_criteria": [
-          "VC1 [AC-3]: POST /projects/{id}/archive returns 200 + archived project JSON",
-          "VC2 [AC-3]: POST /projects/{id}/unarchive returns 200 + active project JSON",
-          "VC3 [SEC-1]: Non-owner receives 403 Forbidden",
-          "VC4 [AC-3]: Invalid ID returns 404 Not Found"
-        ],
-        "contracts": [
-          {"type": "postcondition", "assertion": "response.status == 200 AND project.archived_at IS SET WHEN valid_owner", "scope": "endpoint"},
-          {"type": "postcondition", "assertion": "response.status == 403 WHEN NOT project.owner_id == request.user_id", "scope": "endpoint"},
-          {"type": "postcondition", "assertion": "response.status == 404 WHEN project NOT EXISTS", "scope": "endpoint"}
-        ],
-        "implementation_hint": "Use existing @require_project_owner decorator",
-        "test_strategy": {
-          "unit": "Test request validation, test permission decorator",
-          "integration": "Test service integration, test response format",
-          "e2e": "Full flow: auth → archive → verify response → verify DB"
-        },
-        "affected_files": [
-          "api/routes/projects.py",
-          "api/schemas/project.py"
-        ]
-      },
-      {
-        "id": "ST-004",
-        "title": "Filter archived projects from GET /projects by default",
-        "description": "Modify listing in api/routes/projects.py to exclude archived_at IS NOT NULL. Add ?include_archived=true param.",
-        "dependencies": ["ST-001"],
-        "risk_level": "low",
-        "risks": [],
-        "security_critical": false,
-        "complexity_score": 3,
-        "complexity_rationale": "Score 3: Base(1) + Novelty(+0) + Deps(+1) + Scope(+1) + Risk(+0) = 3",
-        "aag_contract": "ProjectRoutes -> GET /projects(?include_archived=bool) -> excludes archived by default, includes when param=true",
-        "validation_criteria": [
-          "VC1 [AC-4]: GET /projects excludes archived projects by default",
-          "VC2 [AC-4]: GET /projects?include_archived=true returns all projects",
-          "VC3 [AC-4]: Response includes is_archived boolean field"
-        ],
-        "test_strategy": {
-          "unit": "Test filter logic, test query param parsing",
-          "integration": "Test with mix of archived/active projects",
-          "e2e": "N/A"
-        },
-        "affected_files": [
-          "api/routes/projects.py",
-          "services/project_service.py"
-        ]
-      }
-    ]
-  }
-}
-```
-
----
 
 ## Additional Examples
 

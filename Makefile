@@ -1,4 +1,4 @@
-.PHONY: help test install clean build release dev-install lint format check sync-templates test-e2e test-e2e-sdk test-integration
+.PHONY: help test install clean build release dev-install lint format check check-render render-templates test-e2e test-e2e-sdk test-integration
 
 # Default target
 help:
@@ -13,7 +13,7 @@ help:
 	@echo "  build        Build distribution packages"
 	@echo "  release      Create a new release"
 	@echo "  check        Run all checks (lint + test)"
-	@echo "  sync-templates Sync .claude/ into src/ templates"
+	@echo "  render-templates Render templates_src/*.jinja into all generated trees (dev only)"
 	@echo "  test-e2e     Run e2e artifact contract tests (no LLM, fast)"
 	@echo "  test-e2e-sdk Run e2e tests with real Claude SDK (slow, needs API key)"
 	@echo "  test-integration Run integration tests (excludes slow SDK tests)"
@@ -26,38 +26,53 @@ dev-install:
 	pip install -e ".[dev,ssl]"
 
 # Testing
+# Invoke tools via `uv run` so they always use the project venv. A bare
+# `pytest`/`ruff`/`pyright` resolves to whatever is first on PATH (e.g. a
+# global Homebrew install whose interpreter lacks truststore/hypothesis),
+# producing phantom failures that disappear under `uv run`.
 test:
-	pytest
+	uv run pytest
 
 test-cov:
-	pytest --cov=mapify_cli --cov-report=html --cov-report=term
+	uv run pytest --cov=mapify_cli --cov-report=html --cov-report=term
 
 test-watch:
-	pytest-watch
+	uv run pytest-watch
 
 # E2E / Integration testing
 test-e2e:
-	pytest tests/integration/test_e2e_artifact_contracts.py -v
+	uv run pytest tests/integration/test_e2e_artifact_contracts.py -v
 
 test-e2e-sdk:
-	pytest tests/integration/test_e2e_claude_sdk.py -v -m slow
+	uv run pytest tests/integration/test_e2e_claude_sdk.py -v -m slow
 
 test-integration:
-	pytest tests/integration/ -v -m "not slow"
+	uv run pytest tests/integration/ -v -m "not slow"
 
 # Code quality
 lint:
-	ruff check src/ tests/
-	mypy src/
+	uv run ruff check src/ tests/
+	uv run mypy src/
+	uv run pyright src/
+	uv run python3 scripts/lint-hooks.py
 
 format:
-	black src/ tests/
-	ruff check --fix src/ tests/
+	uv run black src/ tests/
+	uv run ruff check --fix src/ tests/
 
-check: lint test
+check: lint test check-render
 
-sync-templates:
-	./scripts/sync-templates.sh
+render-templates: ## Render templates_src/*.jinja into all generated trees (dev only)
+	uv run python -m mapify_cli.delivery.template_renderer claude
+	uv run python -m mapify_cli.delivery.template_renderer codex
+	@echo "✅ Templates rendered"
+
+check-render: ## Render templates_src and fail if committed generated trees are stale
+	# Non-destructive: renders into a tempdir and byte-compares against the
+	# committed trees. Never renders in place and never runs `git checkout`,
+	# so uncommitted hand-authored files (e.g. .claude/rules/learned/*-patterns.md,
+	# invariant D11) are NEVER reverted.
+	uv run python -m mapify_cli.delivery.template_renderer --check
 
 # Build and release
 clean:
@@ -67,14 +82,14 @@ clean:
 	find . -type f -name "*.pyc" -delete
 
 build: clean
-	python -m build
+	uv run python3 -m build
 
 release: build
 	@echo "Ready to upload to PyPI with: twine upload dist/*"
-	@echo "Don't forget to tag the release: git tag -a v$(shell python -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])") -m 'Release version ...'"
+	@echo "Don't forget to tag the release: git tag -a v$(shell uv run python3 -c "import tomli; print(tomli.load(open('pyproject.toml', 'rb'))['project']['version'])") -m 'Release version ...'"
 
 # Quick test of the CLI
 test-cli:
 	@echo "Testing CLI installation..."
-	python -m mapify_cli --version
-	python -m mapify_cli check
+	uv run python3 -m mapify_cli --version
+	uv run python3 -m mapify_cli check

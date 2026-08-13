@@ -30,10 +30,18 @@ jobs:
   publish:
     needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for PyPI OIDC authentication
+      contents: write  # Required for creating GitHub Release
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: "3.11"
 
     - name: Extract version from tag
       id: get_version
@@ -62,7 +70,7 @@ jobs:
         echo "✓ Version validation passed: tag and pyproject.toml both at $TAG_VERSION"
 
     - name: Download build artifacts from CI
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: dist-${{ github.run_id }}
         path: dist/
@@ -81,11 +89,36 @@ jobs:
 
     - name: Verify package quality before publishing
       run: |
-        pip install twine
-        twine check dist/*
+        python -m pip install --upgrade "packaging>=26" "twine>=6.2.0"
+        python -m twine check dist/*
         echo "✓ Package validation passed"
 
     - name: Publish to PyPI using OIDC
-      uses: pypa/gh-action-pypi-publish@v1.13.0
+      uses: pypa/gh-action-pypi-publish@v1.14.2
       with:
         skip-existing: true
+
+    - name: Extract changelog for GitHub Release
+      id: changelog
+      run: |
+        VERSION="${{ steps.get_version.outputs.VERSION }}"
+        # NB: a two-address awk range (/start/,/end/) collapses to a single line
+        # here — the "## [X.Y.Z]" heading matches both patterns at once. Use an
+        # explicit flag; 'next' keeps the heading itself out of the range.
+        EXCERPT=$(awk -v ver="$VERSION" 'index($0, "## [" ver "]") == 1 {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md)
+        if [ -z "$EXCERPT" ]; then
+          echo "::warning::No changelog excerpt found for version ${VERSION}"
+          EXCERPT="See CHANGELOG.md for details."
+        fi
+        echo "$EXCERPT" > /tmp/changelog_excerpt.md
+        echo "excerpt_file=/tmp/changelog_excerpt.md" >> $GITHUB_OUTPUT
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: MAP Framework ${{ github.ref_name }}
+        body_path: ${{ steps.changelog.outputs.excerpt_file }}
+        draft: false
+        prerelease: false
+        fail_on_unmatched_files: false
