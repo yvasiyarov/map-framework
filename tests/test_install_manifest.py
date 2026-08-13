@@ -887,3 +887,54 @@ class TestVC17BackwardCompat:
         assert m_read is not None
         config_keys = [e.key_path for e in m_read.config_entries]
         assert len(config_keys) == len(set(config_keys)), "no duplicate config entries"
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware manifests: legacy compatibility and dual-provider auditing
+# ---------------------------------------------------------------------------
+
+
+def test_old_single_provider_manifest_populates_providers(tmp_path: Path) -> None:
+    raw = {
+        "mapify_version": VERSION,
+        "provider": "claude",
+        "installed_at": _TIMESTAMP,
+        "entries": [],
+    }
+    path = tmp_path / ".map" / MANIFEST_FILENAME
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = read_manifest(tmp_path)
+
+    assert loaded is not None
+    assert loaded.provider == "claude"
+    assert loaded.providers == ["claude"]
+
+
+def test_dual_provider_manifest_contains_union_without_duplicate_shared_files(
+    tmp_path: Path,
+) -> None:
+    _setup_claude_install(tmp_path)
+    _setup_codex_install(tmp_path)
+
+    manifest = build_manifest(tmp_path, ["claude", "codex"], VERSION)
+
+    assert manifest.providers == ["claude", "codex"]
+    destinations = [entry.dest for entry in manifest.entries]
+    assert len(destinations) == len(set(destinations))
+    assert any(dest.startswith(".claude/") for dest in destinations)
+    assert any(
+        dest.startswith((".codex/", ".agents/"))
+        for dest in destinations
+    )
+
+
+def test_check_installed_scans_both_provider_roots(tmp_path: Path) -> None:
+    _setup_claude_install(tmp_path)
+    _setup_codex_install(tmp_path)
+    write_manifest(tmp_path, build_manifest(tmp_path, ["claude", "codex"], VERSION))
+    extra = tmp_path / ".agents" / "skills" / "map-extra" / "SKILL.md"
+    _write_managed_file(extra, "# Extra\n", fenced=True)
+
+    assert ".agents/skills/map-extra/SKILL.md" in check_installed(tmp_path).orphaned

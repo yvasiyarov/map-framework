@@ -21,6 +21,7 @@ Security invariants:
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,15 @@ from mapify_cli.delivery.managed_file_copier import compute_hash, extract_metada
 # ---------------------------------------------------------------------------
 
 MANIFEST_FILENAME = "mapify.lock.json"
+
+_PROVIDER_ORDER = ("claude", "codex")
+
+
+def normalize_providers(provider: str | Sequence[str]) -> list[str]:
+    """Return known providers in their canonical order without duplicates."""
+    raw = [provider] if isinstance(provider, str) else list(provider)
+    requested = set(raw)
+    return [name for name in _PROVIDER_ORDER if name in requested]
 
 # Relative paths (from project root) that are machine-local and should
 # NOT appear in the committed manifest.
@@ -134,6 +144,7 @@ class InstallManifest:
     installed_at: str       # manifest write timestamp
     entries: list[ManifestEntry] = field(default_factory=list)
     config_entries: list[ConfigEntry] = field(default_factory=list)
+    providers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -474,7 +485,7 @@ def reconcile_config(project_path: Path) -> ReconcileResult:
 
 def build_manifest(
     project_path: Path,
-    provider: str,
+    provider: str | Sequence[str],
     version: str,
 ) -> InstallManifest:
     """Build an InstallManifest by scanning the installed provider surfaces.
@@ -483,32 +494,33 @@ def build_manifest(
     collects all files that carry MAP-MANAGED metadata. Local-only files and
     symlinks are excluded from the committed manifest.
     """
-    entries: list[ManifestEntry] = []
+    providers = normalize_providers(provider)
+    entries_by_dest: dict[str, ManifestEntry] = {}
 
-    if provider == "claude":
-        for rel_dir in _CLAUDE_SCAN_ROOTS:
-            entries.extend(_scan_dir(project_path, rel_dir))
-        for rel_file in _CLAUDE_SINGLE_FILES:
-            entry = _scan_file(project_path, rel_file)
-            if entry is not None:
-                entries.append(entry)
-    elif provider == "codex":
-        for rel_dir in _CODEX_SCAN_ROOTS:
-            entries.extend(_scan_dir(project_path, rel_dir))
-        for rel_file in _CODEX_SINGLE_FILES:
-            entry = _scan_file(project_path, rel_file)
-            if entry is not None:
-                entries.append(entry)
-    # Unknown provider: no entries (still writes an empty manifest)
+    for selected_provider in providers:
+        if selected_provider == "claude":
+            scan_roots = _CLAUDE_SCAN_ROOTS
+            single_files = _CLAUDE_SINGLE_FILES
+        else:
+            scan_roots = _CODEX_SCAN_ROOTS
+            single_files = _CODEX_SINGLE_FILES
+
+        for rel_dir in scan_roots:
+            for scanned_entry in _scan_dir(project_path, rel_dir):
+                entries_by_dest.setdefault(scanned_entry.dest, scanned_entry)
+        for rel_file in single_files:
+            single_entry = _scan_file(project_path, rel_file)
+            if single_entry is not None:
+                entries_by_dest.setdefault(single_entry.dest, single_entry)
 
     # Stable sort: alphabetical by dest path
-    entries.sort(key=lambda e: e.dest)
+    entries = sorted(entries_by_dest.values(), key=lambda e: e.dest)
 
     timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Config-entry ownership (only for providers that do config merges)
     config_entries: list[ConfigEntry] = []
-    if provider == "claude":
+    if "claude" in providers:
         config_entries.extend(_scan_mcp_config_entries(project_path, version, timestamp))
         ce = _scan_statusline_config_entry(project_path, version, timestamp)
         if ce is not None:
@@ -518,10 +530,11 @@ def build_manifest(
 
     return InstallManifest(
         mapify_version=version,
-        provider=provider,
+        provider="+".join(providers),
         installed_at=timestamp,
         entries=entries,
         config_entries=config_entries,
+        providers=providers,
     )
 
 
@@ -559,12 +572,20 @@ def read_manifest(project_path: Path) -> InstallManifest | None:
         entries = [ManifestEntry(**e) for e in raw_entries if isinstance(e, dict)]
         raw_config = data.get("config_entries", [])
         config_entries = [ConfigEntry(**e) for e in raw_config if isinstance(e, dict)]
+        legacy_provider = data.get("provider", "")
+        raw_providers = data.get("providers")
+        providers = (
+            normalize_providers(raw_providers)
+            if isinstance(raw_providers, list) and all(isinstance(name, str) for name in raw_providers)
+            else normalize_providers(legacy_provider.split("+"))
+        )
         return InstallManifest(
             mapify_version=data.get("mapify_version", ""),
-            provider=data.get("provider", ""),
+            provider=legacy_provider,
             installed_at=data.get("installed_at", ""),
             entries=entries,
             config_entries=config_entries,
+            providers=providers,
         )
     except (TypeError, KeyError):
         return None
@@ -630,15 +651,16 @@ def check_installed(project_path: Path) -> CheckResult:
             result.ok.append(entry.dest)
 
     # Orphan detection: scan directories for MAP-managed files not in manifest
-    provider = manifest.provider
     scan_roots: list[str] = []
     single_files: list[str] = []
-    if provider == "claude":
-        scan_roots = _CLAUDE_SCAN_ROOTS
-        single_files = _CLAUDE_SINGLE_FILES
-    elif provider == "codex":
-        scan_roots = _CODEX_SCAN_ROOTS
-        single_files = _CODEX_SINGLE_FILES
+    providers = manifest.providers or normalize_providers(manifest.provider.split("+"))
+    for provider in providers:
+        if provider == "claude":
+            scan_roots.extend(_CLAUDE_SCAN_ROOTS)
+            single_files.extend(_CLAUDE_SINGLE_FILES)
+        elif provider == "codex":
+            scan_roots.extend(_CODEX_SCAN_ROOTS)
+            single_files.extend(_CODEX_SINGLE_FILES)
 
     on_disk_managed: set[str] = set()
     for rel_dir in scan_roots:
