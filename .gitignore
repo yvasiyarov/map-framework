@@ -90,6 +90,9 @@ docs/superpowers/*
 !docs/superpowers/specs/
 docs/superpowers/specs/*
 !docs/superpowers/specs/2026-08-13-automatic-framework-updates-design.md
+!docs/superpowers/plans/
+docs/superpowers/plans/*
+!docs/superpowers/plans/2026-08-13-automatic-framework-updates.md
 
 # Hypothesis test cache
 .hypothesis/
