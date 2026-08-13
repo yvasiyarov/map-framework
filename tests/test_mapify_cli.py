@@ -34,6 +34,7 @@ from mapify_cli import (
     write_project_mcp_json,
 )
 from mapify_cli.delivery import create_map_tools
+from mapify_cli.install_manifest import read_manifest
 
 runner = CliRunner()
 
@@ -111,7 +112,10 @@ class TestTemplates:
         """Test error when templates not found anywhere."""
         del mock_files  # side_effect fires on call; mock object itself not needed
         # Mock Path methods to simulate templates not existing
-        with mock.patch("pathlib.Path.exists", return_value=False), pytest.raises(RuntimeError, match="Templates directory not found"):
+        with (
+            mock.patch("pathlib.Path.exists", return_value=False),
+            pytest.raises(RuntimeError, match="Templates directory not found"),
+        ):
             get_templates_dir()
 
 
@@ -471,14 +475,14 @@ class TestInitCommand:
 
         assert "mcp_servers" in mcp_config, "mcp_config missing 'mcp_servers' key"
         for server in expected_servers:
-            assert (
-                server in mcp_config["mcp_servers"]
-            ), f"MCP server '{server}' not found in config"
+            assert server in mcp_config["mcp_servers"], (
+                f"MCP server '{server}' not found in config"
+            )
 
         # Verify exactly the expected default set (no extras)
-        assert sorted(mcp_config["mcp_servers"]) == sorted(
-            expected_servers
-        ), f"Expected default MCP servers {expected_servers}, found {mcp_config['mcp_servers']}"
+        assert sorted(mcp_config["mcp_servers"]) == sorted(expected_servers), (
+            f"Expected default MCP servers {expected_servers}, found {mcp_config['mcp_servers']}"
+        )
 
     def test_init_force_no_prompts(self, tmp_path):
         """Test that init --force completes without interactive confirmation prompts.
@@ -526,9 +530,9 @@ class TestInitCommand:
         # This confirms --force actually re-initialized the files
         assert actor_file.exists()
         restored_content = actor_file.read_text()
-        assert (
-            restored_content != "# Modified by user"
-        ), "--force did not restore template files"
+        assert restored_content != "# Modified by user", (
+            "--force did not restore template files"
+        )
         # Should contain some template markers (not exact match due to potential updates)
         assert len(restored_content) > 100, "Restored actor.md seems too short"
 
@@ -537,7 +541,9 @@ class TestInitCommand:
         os.chdir(tmp_path)
 
         # First init with --sofa
-        result1 = runner.invoke(app, ["init", ".", "--no-git", "--mcp", "none", "--sofa"])
+        result1 = runner.invoke(
+            app, ["init", ".", "--no-git", "--mcp", "none", "--sofa"]
+        )
         assert result1.exit_code == 0, f"init --sofa failed: {result1.stdout}"
 
         config_file = tmp_path / ".map" / "config.yaml"
@@ -564,7 +570,9 @@ class TestInitCommand:
         """VC1 [AC-1]: mapify init --sofa writes sofa.enabled: true to .map/config.yaml."""
         os.chdir(tmp_path)
 
-        result = runner.invoke(app, ["init", ".", "--no-git", "--mcp", "none", "--sofa"])
+        result = runner.invoke(
+            app, ["init", ".", "--no-git", "--mcp", "none", "--sofa"]
+        )
         assert result.exit_code == 0, f"init --sofa failed: {result.stdout}"
 
         config_file = tmp_path / ".map" / "config.yaml"
@@ -581,6 +589,383 @@ class TestInitCommand:
         config_file = tmp_path / ".map" / "config.yaml"
         assert config_file.exists()
         assert "sofa.enabled: true" not in config_file.read_text()
+
+
+class TestRefreshExistingInit:
+    """Hidden fresh-process refresh mode preserves project-owned choices."""
+
+    @pytest.fixture(autouse=True)
+    def _avoid_global_settings_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(mapify_cli, "configure_global_permissions", mock.Mock())
+
+    def test_refresh_existing_preserves_claude_mcp_selection_and_writes_dual_manifest(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+
+        first = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                "claude",
+            ],
+        )
+        second = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--provider", "codex"],
+        )
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert first.exit_code == 0, first.stdout
+        assert second.exit_code == 0, second.stdout
+        assert refresh.exit_code == 0, refresh.stdout
+        assert not (tmp_path / ".mcp.json").exists()
+        manifest = read_manifest(tmp_path)
+        assert manifest is not None
+        assert manifest.providers == ["claude", "codex"]
+
+    def test_refresh_existing_is_hidden_from_init_help(self) -> None:
+        result = runner.invoke(app, ["init", "--help"])
+
+        assert result.exit_code == 0
+        assert "--refresh-existing" not in result.stdout
+
+    def test_refresh_existing_rejects_uninitialized_project(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "initialized MAP project" in result.stdout
+        assert not (tmp_path / ".claude").exists()
+
+    def test_refresh_existing_does_not_create_uninitialized_named_project(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        target = tmp_path / "not-initialized"
+
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                target.name,
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert not target.exists()
+
+    def test_refresh_existing_requires_config_and_complete_provider_layout(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        (tmp_path / ".map").mkdir()
+        (tmp_path / ".map" / "config.yaml").write_text("", encoding="utf-8")
+        (tmp_path / ".claude").mkdir()
+
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert not (tmp_path / ".claude" / "skills").exists()
+
+    def test_refresh_existing_does_not_claim_user_modified_mcp_server(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        (tmp_path / ".map").mkdir()
+        (tmp_path / ".map" / "config.yaml").write_text(
+            "updates.auto: true\n", encoding="utf-8"
+        )
+        (tmp_path / ".claude" / "skills").mkdir(parents=True)
+        custom_server = {"command": "custom-sequential-thinking"}
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"sequential-thinking": custom_server}}),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert result.exit_code == 0, result.stdout
+        assert not (tmp_path / ".claude" / "mcp_config.json").exists()
+        mcp_data = json.loads((tmp_path / ".mcp.json").read_text())
+        assert mcp_data["mcpServers"]["sequential-thinking"] == custom_server
+        manifest = read_manifest(tmp_path)
+        assert manifest is not None
+        assert not any(
+            entry.key_path == "mcpServers.sequential-thinking"
+            for entry in manifest.config_entries
+        )
+
+    def test_refresh_existing_preserves_project_choices(self, tmp_path: Path) -> None:
+        from mapify_cli.config.project_config import load_map_config
+
+        os.chdir(tmp_path)
+        with mock.patch("mapify_cli.configure_global_permissions"):
+            first = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--mcp",
+                    "none",
+                    "--compression",
+                    "aggressive",
+                    "--compression-threshold",
+                    "250000",
+                    "--sofa",
+                    "--agent-memory",
+                    "local",
+                    "--no-auto-update",
+                    "--autonomy",
+                ],
+            )
+            refresh = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--provider",
+                    "claude",
+                    "--refresh-existing",
+                ],
+            )
+
+        assert first.exit_code == 0, first.stdout
+        assert refresh.exit_code == 0, refresh.stdout
+        config = load_map_config(tmp_path)
+        assert config.compression_policy == "aggressive"
+        assert config.compression_threshold_tokens == 250_000
+        assert config.sofa_enabled is True
+        assert config.claude_agents_persistent_memory == "local"
+        assert config.updates_auto is False
+        reflector = (tmp_path / ".claude" / "agents" / "reflector.md").read_text()
+        assert "memory: user_local" in reflector
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.local.json").read_text()
+        )
+        assert settings["mapify"]["autonomy"] is True
+
+    def test_refresh_existing_skips_global_permissions(self, tmp_path: Path) -> None:
+        os.chdir(tmp_path)
+        with mock.patch("mapify_cli.configure_global_permissions") as configure:
+            first = runner.invoke(
+                app,
+                ["init", ".", "--force", "--no-git", "--mcp", "none"],
+            )
+            assert first.exit_code == 0, first.stdout
+            configure.assert_called_once_with()
+            configure.reset_mock()
+
+            refresh = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--provider",
+                    "claude",
+                    "--refresh-existing",
+                ],
+            )
+
+        assert refresh.exit_code == 0, refresh.stdout
+        configure.assert_not_called()
+
+    def test_refresh_existing_configuration_failure_is_fatal_but_normal_init_warns(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+
+        with mock.patch(
+            "mapify_cli.config.project_config.write_default_config",
+            side_effect=OSError("config is read-only"),
+        ):
+            refresh = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--provider",
+                    "claude",
+                    "--refresh-existing",
+                ],
+            )
+            normal = runner.invoke(
+                app,
+                ["init", ".", "--force", "--no-git", "--mcp", "none"],
+            )
+
+        assert refresh.exit_code == 1
+        assert "config is read-only" in refresh.stdout
+        assert normal.exit_code == 0, normal.stdout
+
+    def test_refresh_existing_malformed_project_config_is_fatal_and_non_mutating(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        malformed = "claude_agents.persistent_memory: [\n"
+        config_path = tmp_path / ".map" / "config.yaml"
+        config_path.write_text(malformed, encoding="utf-8")
+        reflector_path = tmp_path / ".claude" / "agents" / "reflector.md"
+        reflector_path.write_text("user sentinel\n", encoding="utf-8")
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing project configuration" in refresh.stdout
+        assert config_path.read_text(encoding="utf-8") == malformed
+        assert reflector_path.read_text(encoding="utf-8") == "user sentinel\n"
+
+    def test_refresh_existing_malformed_mcp_config_is_fatal_and_non_mutating(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        malformed = '{"mcpServers": {'
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(malformed, encoding="utf-8")
+        reflector_path = tmp_path / ".claude" / "agents" / "reflector.md"
+        reflector_path.write_text("user sentinel\n", encoding="utf-8")
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing Claude MCP configuration" in refresh.stdout
+        assert mcp_path.read_text(encoding="utf-8") == malformed
+        assert list(tmp_path.glob(".mcp.backup.*.json")) == []
+        assert reflector_path.read_text(encoding="utf-8") == "user sentinel\n"
+
+    def test_refresh_existing_manifest_failure_is_fatal_but_normal_init_warns(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+
+        with mock.patch(
+            "mapify_cli.install_manifest.write_manifest",
+            side_effect=OSError("manifest is read-only"),
+        ):
+            refresh = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--provider",
+                    "claude",
+                    "--refresh-existing",
+                ],
+            )
+            normal = runner.invoke(
+                app,
+                ["init", ".", "--force", "--no-git", "--mcp", "none"],
+            )
+
+        assert refresh.exit_code == 1
+        assert "manifest is read-only" in refresh.stdout
+        assert normal.exit_code == 0, normal.stdout
 
 
 class TestSofaGitignoreMerge:
@@ -691,9 +1076,7 @@ class TestAutonomyPosture:
     """Tests for the opt-in --autonomy posture in settings.local.json."""
 
     def _read_local(self, tmp_path):
-        return json.loads(
-            (tmp_path / ".claude" / "settings.local.json").read_text()
-        )
+        return json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
 
     def test_autonomy_true_writes_broad_allow_deny_and_sentinel(self, tmp_path):
         from mapify_cli.config.settings import create_or_merge_project_settings_local
@@ -766,14 +1149,13 @@ class TestAutonomyPosture:
         )
 
         assert result.exit_code == 0, f"init --autonomy failed: {result.stdout}"
-        data = json.loads(
-            (tmp_path / ".claude" / "settings.local.json").read_text()
-        )
+        data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
         assert data["mapify"]["autonomy"] is True
         assert "Bash(*)" in data["permissions"]["allow"]
-        assert ".claude/settings.local.json" in (
-            tmp_path / ".gitignore"
-        ).read_text().splitlines()
+        assert (
+            ".claude/settings.local.json"
+            in (tmp_path / ".gitignore").read_text().splitlines()
+        )
 
 
 class TestConfigureGlobalPermissions:
@@ -817,9 +1199,7 @@ class TestConfigureGlobalPermissions:
         settings_path = self._global_settings_path(tmp_path, monkeypatch)
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings_path.write_text(
-            json.dumps(
-                {"permissions": {"allow": ["Glob(**)", "Glob(**)"], "deny": []}}
-            )
+            json.dumps({"permissions": {"allow": ["Glob(**)", "Glob(**)"], "deny": []}})
         )
 
         configure_global_permissions()
@@ -844,9 +1224,7 @@ class TestConfigureGlobalPermissions:
         result = runner.invoke(app, ["init", ".", "--no-git", "--mcp", "none"])
 
         assert result.exit_code == 0, f"init failed: {result.stdout}"
-        data = json.loads(
-            (tmp_path / ".claude" / "settings.local.json").read_text()
-        )
+        data = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
         assert "mapify" not in data
         assert "Bash(*)" not in data["permissions"]["allow"]
 
@@ -1172,9 +1550,9 @@ class TestAgentCreation:
                 name in agent_file
                 for name in ["task-decomposer", "actor", "monitor", "predictor"]
             ):
-                assert (
-                    "mcp" in content.lower() or "tool" in content.lower()
-                ), f"Agent {agent_file} missing MCP integration section"
+                assert "mcp" in content.lower() or "tool" in content.lower(), (
+                    f"Agent {agent_file} missing MCP integration section"
+                )
 
 
 class TestCommandCreation:
@@ -1195,9 +1573,7 @@ class TestCommandCreation:
         commands_dir = tmp_path / ".claude" / "commands"
         assert commands_dir.exists()
         # After skills migration, commands/ has only README.md (no map-*.md)
-        command_files = [
-            p for p in commands_dir.glob("*.md") if p.name != "README.md"
-        ]
+        command_files = [p for p in commands_dir.glob("*.md") if p.name != "README.md"]
         assert len(command_files) == 0
 
 
@@ -1424,7 +1800,9 @@ class TestMcpJsonConfig:
         config = json.loads(mcp_file.read_text())
 
         assert "sequential-thinking" in config["mcpServers"]
-        assert "deepwiki" not in config["mcpServers"]  # removed → filtered like any unknown
+        assert (
+            "deepwiki" not in config["mcpServers"]
+        )  # removed → filtered like any unknown
         assert "unknown-server" not in config["mcpServers"]
 
     def test_init_creates_mcp_json(self, tmp_path):
@@ -1435,9 +1813,9 @@ class TestMcpJsonConfig:
 
         # Allow exit code 0 or initialization messages
         mcp_file = tmp_path / ".mcp.json"
-        assert (
-            mcp_file.exists()
-        ), f"Expected .mcp.json to be created. Output: {result.output}"
+        assert mcp_file.exists(), (
+            f"Expected .mcp.json to be created. Output: {result.output}"
+        )
 
         config = json.loads(mcp_file.read_text())
         assert "mcpServers" in config
@@ -1612,9 +1990,9 @@ class TestCodexProvider:
         result = local_runner.invoke(
             app, ["init", ".", "--provider", "codex", "--no-git", "--force"]
         )
-        assert (
-            result.exit_code == 0
-        ), f"init --provider codex failed (exit {result.exit_code}):\n{result.output}"
+        assert result.exit_code == 0, (
+            f"init --provider codex failed (exit {result.exit_code}):\n{result.output}"
+        )
         return tmp_path
 
     # ------------------------------------------------------------------ #
@@ -1634,13 +2012,13 @@ class TestCodexProvider:
         """AC-2: SKILL.md must start with '---' and contain name/description fields."""
         skill_file = codex_project / ".agents" / "skills" / "map-plan" / "SKILL.md"
         content = skill_file.read_text(encoding="utf-8")
-        assert content.startswith(
-            "---"
-        ), "SKILL.md must start with YAML frontmatter '---'"
+        assert content.startswith("---"), (
+            "SKILL.md must start with YAML frontmatter '---'"
+        )
         assert "name:" in content, "SKILL.md frontmatter must contain 'name:'"
-        assert (
-            "description:" in content
-        ), "SKILL.md frontmatter must contain 'description:'"
+        assert "description:" in content, (
+            "SKILL.md frontmatter must contain 'description:'"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-3: SKILL.md contains no Claude-specific tool references          #
@@ -1661,9 +2039,9 @@ class TestCodexProvider:
             "Grep(",
         ]
         for pattern in forbidden_patterns:
-            assert (
-                pattern not in content
-            ), f"SKILL.md must not contain Claude tool reference '{pattern}'"
+            assert pattern not in content, (
+                f"SKILL.md must not contain Claude tool reference '{pattern}'"
+            )
 
     # ------------------------------------------------------------------ #
     # AC-4: AGENTS.md exists at project root                              #
@@ -1679,10 +2057,12 @@ class TestCodexProvider:
         # Either a real file with content or a symlink to CLAUDE.md
         assert agents_md.is_symlink() or len(content) > 0, "AGENTS.md must be non-empty"
         if not agents_md.is_symlink():
-            assert "$map-plan" in content, "Codex AGENTS.md must document skill invocation with $"
-            assert (
-                "$map-efficient" in content
-            ), "Codex AGENTS.md must document the execution skill"
+            assert "$map-plan" in content, (
+                "Codex AGENTS.md must document skill invocation with $"
+            )
+            assert "$map-efficient" in content, (
+                "Codex AGENTS.md must document the execution skill"
+            )
             assert "codex_hooks" not in content, (
                 "Codex AGENTS.md must not document deprecated codex_hooks"
             )
@@ -1703,12 +2083,12 @@ class TestCodexProvider:
             "Codex config must not use deprecated codex_hooks feature alias"
         )
         toml_files = list((codex_dir / "agents").glob("*.toml"))
-        assert (
-            len(toml_files) > 0
-        ), ".codex/agents/ must contain at least one *.toml file"
-        assert (
-            codex_dir / "hooks" / "workflow-gate.py"
-        ).exists(), ".codex/hooks/workflow-gate.py must exist"
+        assert len(toml_files) > 0, (
+            ".codex/agents/ must contain at least one *.toml file"
+        )
+        assert (codex_dir / "hooks" / "workflow-gate.py").exists(), (
+            ".codex/hooks/workflow-gate.py must exist"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-6: .map/scripts/ installed (or skipped if already present)       #
@@ -1719,9 +2099,9 @@ class TestCodexProvider:
         map_scripts = codex_project / ".map" / "scripts"
         templates_scripts = get_templates_dir() / "map" / "scripts"
         if templates_scripts.exists() and any(templates_scripts.iterdir()):
-            assert (
-                map_scripts.exists()
-            ), ".map/scripts/ must exist when template provides scripts"
+            assert map_scripts.exists(), (
+                ".map/scripts/ must exist when template provides scripts"
+            )
 
         # Verify skip-if-exists: pre-existing custom scripts survive codex init
         project2 = tmp_path / "skip_test"
@@ -1737,9 +2117,9 @@ class TestCodexProvider:
             app, ["init", ".", "--provider", "codex", "--no-git", "--force"]
         )
         assert result.exit_code == 0, f"init failed: {result.output}"
-        assert (
-            custom_script.exists()
-        ), ".map/scripts/custom.py must survive codex init (skip-if-exists)"
+        assert custom_script.exists(), (
+            ".map/scripts/custom.py must survive codex init (skip-if-exists)"
+        )
         assert custom_script.read_text() == "# user custom script\n"
 
     # ------------------------------------------------------------------ #
@@ -1754,12 +2134,12 @@ class TestCodexProvider:
             app, ["init", ".", "--no-git", "--mcp", "none", "--force"]
         )
         assert result.exit_code == 0, f"Default init failed:\n{result.output}"
-        assert (
-            tmp_path / ".claude"
-        ).exists(), ".claude/ must exist for default provider"
-        assert not (
-            tmp_path / ".codex"
-        ).exists(), ".codex/ must NOT be created by the default claude provider"
+        assert (tmp_path / ".claude").exists(), (
+            ".claude/ must exist for default provider"
+        )
+        assert not (tmp_path / ".codex").exists(), (
+            ".codex/ must NOT be created by the default claude provider"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-8: Template sync enforced (reference to ST-008 coverage)         #
@@ -1772,14 +2152,14 @@ class TestCodexProvider:
         This test is a quick smoke check that the directory exists and is non-empty.
         """
         codex_templates = get_templates_dir() / "codex"
-        assert (
-            codex_templates.exists()
-        ), "templates/codex/ must exist (render enforced by test_template_render.py)"
+        assert codex_templates.exists(), (
+            "templates/codex/ must exist (render enforced by test_template_render.py)"
+        )
         all_files = list(codex_templates.rglob("*"))
         template_files = [f for f in all_files if f.is_file()]
-        assert (
-            len(template_files) > 0
-        ), "templates/codex/ must contain at least one file"
+        assert len(template_files) > 0, (
+            "templates/codex/ must contain at least one file"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-9: SKILL.md has all 9 step section headers                       #
@@ -1827,10 +2207,9 @@ class TestCodexProvider:
                     if pattern in content:
                         rel = file_path.relative_to(codex_project)
                         violations.append(f"{rel}: contains '{pattern}'")
-        assert (
-            not violations
-        ), "Claude-specific tool references found in Codex provider files:\n" + "\n".join(
-            violations
+        assert not violations, (
+            "Claude-specific tool references found in Codex provider files:\n"
+            + "\n".join(violations)
         )
 
     # ------------------------------------------------------------------ #
@@ -1840,18 +2219,18 @@ class TestCodexProvider:
     def test_ac11_stub_skills_exist(self, codex_project):
         """AC-11: Codex skills must exist under the official .agents/skills root."""
         skills_dir = codex_project / ".agents" / "skills"
-        assert (
-            skills_dir / "map-fast" / "SKILL.md"
-        ).exists(), ".agents/skills/map-fast/SKILL.md must exist"
-        assert (
-            skills_dir / "map-check" / "SKILL.md"
-        ).exists(), ".agents/skills/map-check/SKILL.md must exist"
-        assert (
-            skills_dir / "map-efficient" / "SKILL.md"
-        ).exists(), ".agents/skills/map-efficient/SKILL.md must exist"
-        assert (
-            skills_dir / "map-efficient" / "efficient-reference.md"
-        ).exists(), ".agents/skills/map-efficient/efficient-reference.md must exist"
+        assert (skills_dir / "map-fast" / "SKILL.md").exists(), (
+            ".agents/skills/map-fast/SKILL.md must exist"
+        )
+        assert (skills_dir / "map-check" / "SKILL.md").exists(), (
+            ".agents/skills/map-check/SKILL.md must exist"
+        )
+        assert (skills_dir / "map-efficient" / "SKILL.md").exists(), (
+            ".agents/skills/map-efficient/SKILL.md must exist"
+        )
+        assert (skills_dir / "map-efficient" / "efficient-reference.md").exists(), (
+            ".agents/skills/map-efficient/efficient-reference.md must exist"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-9 (map-review port spec): Codex map-review skill + refs exist    #
@@ -1894,15 +2273,15 @@ class TestCodexProvider:
             / "map-review"
         )
         for filename in ("SKILL.md", "review-reference.md", "adversarial-reference.md"):
-            assert (
-                templates_dir / filename
-            ).exists(), f"templates/codex/skills/map-review/{filename} must exist"
+            assert (templates_dir / filename).exists(), (
+                f"templates/codex/skills/map-review/{filename} must exist"
+            )
 
         agents_skills_dir = codex_project / ".agents" / "skills" / "map-review"
         for filename in ("SKILL.md", "review-reference.md", "adversarial-reference.md"):
-            assert (
-                agents_skills_dir / filename
-            ).exists(), f".agents/skills/map-review/{filename} must exist"
+            assert (agents_skills_dir / filename).exists(), (
+                f".agents/skills/map-review/{filename} must exist"
+            )
 
     # ------------------------------------------------------------------ #
     # AC-12: hooks.json and workflow-gate.py both created                 #
@@ -1915,9 +2294,9 @@ class TestCodexProvider:
         codex_dir = codex_project / ".codex"
         hooks_json_path = codex_dir / "hooks.json"
         assert hooks_json_path.exists(), ".codex/hooks.json must exist"
-        assert (
-            codex_dir / "hooks" / "workflow-gate.py"
-        ).exists(), ".codex/hooks/workflow-gate.py must exist"
+        assert (codex_dir / "hooks" / "workflow-gate.py").exists(), (
+            ".codex/hooks/workflow-gate.py must exist"
+        )
 
         # Verify hook command uses quoted git-root-resolved path
         hooks_data = _json.loads(hooks_json_path.read_text())
@@ -1925,13 +2304,13 @@ class TestCodexProvider:
             ".codex/hooks.json must not include MAP-only top-level metadata"
         )
         command = hooks_data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        assert (
-            "$(git rev-parse --show-toplevel)" in command
-        ), "Hook command must use $(git rev-parse --show-toplevel) for path resolution"
+        assert "$(git rev-parse --show-toplevel)" in command, (
+            "Hook command must use $(git rev-parse --show-toplevel) for path resolution"
+        )
         # Path must be quoted to handle spaces in directory names
-        assert (
-            '"$(git rev-parse --show-toplevel)' in command
-        ), "Hook command path must be quoted for spaces in paths"
+        assert '"$(git rev-parse --show-toplevel)' in command, (
+            "Hook command path must be quoted for spaces in paths"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-13: CodexProvider is a subclass of BaseProvider                  #
@@ -1942,9 +2321,9 @@ class TestCodexProvider:
         from mapify_cli.delivery.providers import BaseProvider, CodexProvider
 
         provider = CodexProvider()
-        assert isinstance(
-            provider, BaseProvider
-        ), "CodexProvider must inherit from BaseProvider"
+        assert isinstance(provider, BaseProvider), (
+            "CodexProvider must inherit from BaseProvider"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-14: --provider codex does NOT create .claude/                    #
@@ -1952,9 +2331,9 @@ class TestCodexProvider:
 
     def test_ac14_codex_init_no_claude_dir(self, codex_project):
         """AC-14: init --provider codex must not create the .claude/ directory."""
-        assert not (
-            codex_project / ".claude"
-        ).exists(), ".claude/ must NOT be created when using --provider codex"
+        assert not (codex_project / ".claude").exists(), (
+            ".claude/ must NOT be created when using --provider codex"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-15: SKILL.md includes spawn_agent with monitor in SPEC_REVIEW    #
@@ -1966,9 +2345,9 @@ class TestCodexProvider:
         content = skill_file.read_text(encoding="utf-8")
         # The SPEC_REVIEW step uses spawn_agent with agent_type="monitor"
         assert "spawn_agent(" in content, "SKILL.md must contain spawn_agent("
-        assert (
-            'agent_type="monitor"' in content
-        ), 'SKILL.md must contain agent_type="monitor" for SPEC_REVIEW step'
+        assert 'agent_type="monitor"' in content, (
+            'SKILL.md must contain agent_type="monitor" for SPEC_REVIEW step'
+        )
 
     # ------------------------------------------------------------------ #
     # AC-16: --provider foo exits 1 with helpful message                  #
@@ -1981,12 +2360,12 @@ class TestCodexProvider:
         result = local_runner.invoke(
             app, ["init", ".", "--provider", "foo", "--no-git", "--force"]
         )
-        assert (
-            result.exit_code == 1
-        ), f"Expected exit code 1 for invalid provider, got {result.exit_code}"
-        assert (
-            "Valid providers" in result.output
-        ), "Error message must mention 'Valid providers'"
+        assert result.exit_code == 1, (
+            f"Expected exit code 1 for invalid provider, got {result.exit_code}"
+        )
+        assert "Valid providers" in result.output, (
+            "Error message must mention 'Valid providers'"
+        )
         assert "claude" in result.output, "Valid providers list must include 'claude'"
         assert "codex" in result.output, "Valid providers list must include 'codex'"
 
@@ -2002,12 +2381,12 @@ class TestCodexProvider:
         for toml_file in toml_files:
             content = toml_file.read_text(encoding="utf-8")
             assert "name" in content, f"{toml_file.name} must contain 'name' field"
-            assert (
-                "description" in content
-            ), f"{toml_file.name} must contain 'description' field"
-            assert (
-                "developer_instructions" in content
-            ), f"{toml_file.name} must contain 'developer_instructions' field"
+            assert "description" in content, (
+                f"{toml_file.name} must contain 'description' field"
+            )
+            assert "developer_instructions" in content, (
+                f"{toml_file.name} must contain 'developer_instructions' field"
+            )
 
     # ------------------------------------------------------------------ #
     # AC-18: hooks.json matcher value is "Bash"                           #
@@ -2018,13 +2397,13 @@ class TestCodexProvider:
         hooks_json_path = codex_project / ".codex" / "hooks.json"
         hooks_data = json.loads(hooks_json_path.read_text(encoding="utf-8"))
         pre_tool_use = hooks_data.get("hooks", {}).get("PreToolUse", [])
-        assert (
-            len(pre_tool_use) > 0
-        ), "hooks.json must define at least one PreToolUse entry"
+        assert len(pre_tool_use) > 0, (
+            "hooks.json must define at least one PreToolUse entry"
+        )
         matchers = [entry.get("matcher") for entry in pre_tool_use]
-        assert (
-            "Bash" in matchers
-        ), f"hooks.json PreToolUse must have a 'Bash' matcher, got: {matchers}"
+        assert "Bash" in matchers, (
+            f"hooks.json PreToolUse must have a 'Bash' matcher, got: {matchers}"
+        )
 
     def test_ac18b_hooks_json_merges_existing_project_hooks(self, tmp_path):
         """AC-18b: Codex init preserves project hooks and removes legacy MAP metadata."""
@@ -2109,7 +2488,9 @@ class TestCodexProvider:
         assert "echo existing bash" in commands
         assert "python3 old/.codex/hooks/workflow-gate.py" not in commands
         workflow_gate_commands = [
-            command for command in commands if ".codex/hooks/workflow-gate.py" in command
+            command
+            for command in commands
+            if ".codex/hooks/workflow-gate.py" in command
         ]
         assert len(workflow_gate_commands) == 1
         assert any(
@@ -2153,17 +2534,17 @@ class TestCodexProvider:
             codex_dir / "config.toml",
         ]
         for path in expected_paths:
-            assert (
-                path.exists()
-            ), f"Expected discovery path does not exist: {path.relative_to(codex_project)}"
+            assert path.exists(), (
+                f"Expected discovery path does not exist: {path.relative_to(codex_project)}"
+            )
         # Agents directory must have TOML files for agent discovery
         toml_count = len(list((codex_dir / "agents").glob("*.toml")))
-        assert (
-            toml_count >= 1
-        ), f".codex/agents/ must have at least 1 *.toml for agent discovery, found {toml_count}"
-        assert not (
-            codex_dir / "skills"
-        ).exists(), "Codex skills must be installed under .agents/skills, not .codex/skills"
+        assert toml_count >= 1, (
+            f".codex/agents/ must have at least 1 *.toml for agent discovery, found {toml_count}"
+        )
+        assert not (codex_dir / "skills").exists(), (
+            "Codex skills must be installed under .agents/skills, not .codex/skills"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-20: workflow-gate.py blocks file-modifying commands in RESEARCH  #
@@ -2181,9 +2562,9 @@ class TestCodexProvider:
         gate_ns: dict = {}
         exec(compile(gate_source, str(gate_script), "exec"), gate_ns)  # noqa: S102
         editing_phases = gate_ns["EDITING_PHASES"]
-        assert (
-            "RESEARCH" not in editing_phases
-        ), "RESEARCH must NOT be in EDITING_PHASES"
+        assert "RESEARCH" not in editing_phases, (
+            "RESEARCH must NOT be in EDITING_PHASES"
+        )
         assert "ACTOR" in editing_phases, "ACTOR must be in EDITING_PHASES"
 
         # Simulate gate invocation: Edit tool during RESEARCH phase → should block.
@@ -2207,14 +2588,14 @@ class TestCodexProvider:
             cwd=str(codex_project),
             check=False,
         )
-        assert (
-            proc.returncode == 0
-        ), f"workflow-gate.py must exit 0 always, got {proc.returncode}"
+        assert proc.returncode == 0, (
+            f"workflow-gate.py must exit 0 always, got {proc.returncode}"
+        )
         gate_output = _json.loads(proc.stdout.strip())
         hook_output = gate_output.get("hookSpecificOutput", {})
-        assert (
-            hook_output.get("permissionDecision") == "deny"
-        ), f"Expected 'deny' for Edit in RESEARCH phase, got: {gate_output}"
+        assert hook_output.get("permissionDecision") == "deny", (
+            f"Expected 'deny' for Edit in RESEARCH phase, got: {gate_output}"
+        )
 
     # ------------------------------------------------------------------ #
     # AC-21: upgrade on codex project must not create .claude/             #
@@ -2232,15 +2613,13 @@ class TestCodexProvider:
         os.chdir(codex_project)
         result = local_runner.invoke(app, ["upgrade"])
         assert result.exit_code == 0, f"upgrade failed: {result.output}"
-        assert not (
-            codex_project / ".claude"
-        ).exists(), ".claude/ must NOT be created by upgrade on a codex project"
+        assert not (codex_project / ".claude").exists(), (
+            ".claude/ must NOT be created by upgrade on a codex project"
+        )
 
     def test_ac22_map_efficient_state_machine_markers(self, codex_project):
         """AC-22: $map-efficient documents the required state-machine commands."""
-        skill_file = (
-            codex_project / ".agents" / "skills" / "map-efficient" / "SKILL.md"
-        )
+        skill_file = codex_project / ".agents" / "skills" / "map-efficient" / "SKILL.md"
         content = skill_file.read_text(encoding="utf-8")
         for marker in [
             "resume_from_plan",
@@ -2253,9 +2632,9 @@ class TestCodexProvider:
 
         mutation_index = content.index("## Mutation Boundary Constraints")
         implement_index = content.index("Implement exactly")
-        assert (
-            mutation_index < implement_index
-        ), "Mutation boundary constraints must appear before implementation directives"
+        assert mutation_index < implement_index, (
+            "Mutation boundary constraints must appear before implementation directives"
+        )
 
 
 class TestDetectProviderEdgeCases:
@@ -2307,12 +2686,12 @@ class TestDoctorCodexProject:
         assert result.exit_code == 0
         # Run doctor
         result = local_runner.invoke(app, ["doctor"])
-        assert (
-            ".claude/agents" not in result.output
-        ), "doctor must not report .claude/agents as missing for codex project"
-        assert (
-            ".claude/commands" not in result.output
-        ), "doctor must not report .claude/commands as missing for codex project"
+        assert ".claude/agents" not in result.output, (
+            "doctor must not report .claude/agents as missing for codex project"
+        )
+        assert ".claude/commands" not in result.output, (
+            "doctor must not report .claude/commands as missing for codex project"
+        )
         assert "all core paths present" in result.output or "codex" in result.output
 
 
@@ -2336,9 +2715,9 @@ class TestClaudeProviderInstall:
             "rules",
             "statusline",
         }
-        assert (
-            set(counts.keys()) == expected_keys
-        ), f"ClaudeProvider.install() must return all category keys, got: {set(counts.keys())}"
+        assert set(counts.keys()) == expected_keys, (
+            f"ClaudeProvider.install() must return all category keys, got: {set(counts.keys())}"
+        )
         # Each category must have created at least one file
         for key, value in counts.items():
             assert value >= 0, f"counts['{key}'] must be non-negative"
@@ -2353,6 +2732,6 @@ class TestClaudeProviderInstall:
         provider.install(tmp_path, mcp_servers=[])
         assert (tmp_path / ".claude" / "agents").exists()
         assert (tmp_path / ".claude" / "commands").exists()
-        assert not (
-            tmp_path / ".codex"
-        ).exists(), "ClaudeProvider must not create .codex/"
+        assert not (tmp_path / ".codex").exists(), (
+            "ClaudeProvider must not create .codex/"
+        )
