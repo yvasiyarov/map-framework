@@ -85,6 +85,11 @@ docs/map-demo-real-case-plan.md
 uv.lock
 docs/research/
 docs/superpowers/
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/specs/
+docs/superpowers/specs/*
+!docs/superpowers/specs/2026-08-13-automatic-framework-updates-design.md
 
 # Hypothesis test cache
 .hypothesis/
