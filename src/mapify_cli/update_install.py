@@ -6,16 +6,23 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
 from pathlib import Path
 
+from mapify_cli.update_state import (
+    MAP_UPDATE_PARENT_LEASE_ENV,
+    current_project_update_lease,
+)
 from mapify_cli.update_versions import StableVersion
 
 COMMAND_TIMEOUT_SECONDS = 300.0
 MAX_ERROR_OUTPUT_CHARS = 4_096
 
-CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
+CommandRunner = Callable[
+    [list[str], Path, float, Mapping[str, str]],
+    subprocess.CompletedProcess[str],
+]
 
 
 class InstallKind(StrEnum):
@@ -46,7 +53,10 @@ class ProjectRefreshError(RuntimeError):
 
 
 def run_command(
-    command: list[str], cwd: Path, timeout: float
+    command: list[str],
+    cwd: Path,
+    timeout: float,
+    env: Mapping[str, str],
 ) -> subprocess.CompletedProcess[str]:
     """Run one bounded command while capturing text output for diagnostics."""
     return subprocess.run(
@@ -56,7 +66,16 @@ def run_command(
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
+
+
+def _child_environment(parent_lease: str | None = None) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop(MAP_UPDATE_PARENT_LEASE_ENV, None)
+    if parent_lease is not None:
+        environment[MAP_UPDATE_PARENT_LEASE_ENV] = parent_lease
+    return environment
 
 
 def detect_install_kind(module_file: str | Path) -> InstallKind:
@@ -128,7 +147,13 @@ def install_exact_version(
         )
 
     try:
-        result = runner(command, project_path, COMMAND_TIMEOUT_SECONDS)
+        # Intent: A forged ambient refresh lease must never reach a package manager.
+        result = runner(
+            command,
+            project_path,
+            COMMAND_TIMEOUT_SECONDS,
+            _child_environment(),
+        )
     except subprocess.TimeoutExpired as exc:
         raise PackageUpdateError(
             f"Exact mapify-cli {version} installation timed out after "
@@ -191,6 +216,10 @@ def refresh_installed_providers(
         except ProjectRefreshError as exc:
             raise ProjectRefreshError(str(exc), pending_providers=pending) from exc
     refreshed: list[str] = []
+    parent_lease = current_project_update_lease(project_path)
+    child_environment = _child_environment(
+        parent_lease.token if parent_lease is not None else None
+    )
 
     for index, provider in enumerate(pending):
         command = [
@@ -205,7 +234,12 @@ def refresh_installed_providers(
         ]
         remaining = pending[index:]
         try:
-            result = runner(command, project_path, COMMAND_TIMEOUT_SECONDS)
+            result = runner(
+                command,
+                project_path,
+                COMMAND_TIMEOUT_SECONDS,
+                child_environment,
+            )
         except subprocess.TimeoutExpired as exc:
             raise ProjectRefreshError(
                 f"Refreshing the {provider} provider timed out after "

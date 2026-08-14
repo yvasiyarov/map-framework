@@ -68,7 +68,7 @@ The remainder of this file contains the deeper implementation dive (workflow-spe
 - `src/mapify_cli/memory/`: cross-session scratch capture, digest schema, finalize, and recall helpers used by generated hooks and `/map-memory-now`
 - `src/mapify_cli/skills_eval/`: skill trigger eval runner, assertions, aggregation, Claude dispatcher, description optimizer, patcher, proposer, schema, and HTML viewer
 - `src/mapify_cli/update_versions.py`: strict stable-version parsing, non-yanked PyPI target selection, and bounded official GitHub release highlights
-- `src/mapify_cli/update_state.py`: atomic project-local update state, rolling 24-hour due checks, and the non-blocking project update lock
+- `src/mapify_cli/update_state.py`: atomic project-local update state, rolling 24-hour due checks, updater/provider lock ordering, and direct-child refresh leases
 - `src/mapify_cli/update_install.py`: install-kind classification, exact-version package commands, installed-provider detection, and fresh-process provider refresh
 - `src/mapify_cli/auto_update.py`: central automatic/manual policy orchestrator and typed result model consumed by provider skills
 - `src/mapify_cli/templates/`: Shipped provider templates, hooks, agents, references, rule files, Codex config, and shared `.map/scripts/` payloads used by `mapify init`
@@ -87,6 +87,7 @@ The remainder of this file contains the deeper implementation dive (workflow-spe
 - `.map/mapify.lock.json`: Install manifest/lock — aggregate audit of all MAP-managed files, written by `mapify init` and read by `mapify check-installed`
 - `.map/update-state.json`: gitignored automatic-update attempt/install/pending-refresh state, written atomically
 - `.map/update.lock`: gitignored project-local updater mutex; lock contention is a silent automatic skip and an explicit manual error
+- `.map/provider-refresh.lock`: gitignored provider-mutation barrier; it prevents a replacement updater from racing an orphaned refresh child
 - `.map/<branch>/approval_holds.json` and `.map/<branch>/approval_hold_<id>.md`: Durable human-gate artifacts for pending/decided approval holds
 - `.map/wayfind/<slug>/`: **Repo-level** (not branch-scoped) decision maps for `/map-wayfind`. Holds the canonical `state.json`, regenerated `map.md` and `tickets/*.md` views (DO-NOT-EDIT banner), author-written `resolutions/*.md` (+ `*.human.md` verbatim human answers), and the final `handoff.md`/`handoff.json`. Maps outlive branches and are committed by default.
 
@@ -126,28 +127,65 @@ enter package arguments.
 
 `auto_update.py` composes the three lower-level modules. `update_versions.py`
 selects non-yanked strict stable releases and fetches bounded official highlights;
-`update_state.py` atomically maintains `.map/update-state.json` and serializes work
-with `.map/update.lock`; `update_install.py` updates an exact version through `uv
-tool` or the current interpreter's pip and never mutates source/editable installs.
-The state timestamp records an automatic attempt, not only success. If package
-installation succeeds but refresh does not, `pending_refresh` and the remaining
-providers allow a later invocation to retry local refresh without another version
-query.
+`update_state.py` atomically maintains `.map/update-state.json`, serializes package
+policy with `.map/update.lock`, and serializes provider mutation with
+`.map/provider-refresh.lock`; `update_install.py` updates an exact version through
+`uv tool` or the current interpreter's pip and never mutates source/editable
+installs. The state timestamp records an automatic attempt, not only success.
+
+Update-state schema v2 is a three-phase write-ahead state machine:
+
+| Phase | Install target | Refresh flag | Provider set | Meaning |
+|---|---|---|---|---|
+| Idle | absent | false | empty | No recovery work is authorized. |
+| Install intent | exact stable version | false | non-empty | Persisted before the package manager starts; the install outcome may be ambiguous. |
+| Refresh pending | absent | true | non-empty | The target package is known to be running and these providers still need refresh. |
+
+A fresh process whose running version exactly matches an install intent promotes
+it to refresh-pending before the throttle or any network access. A mismatch never
+treats the persisted target as install authority: automatic mode retains a recent
+intent until the throttle expires, while manual mode (or a due automatic check)
+re-enters freshly fetched version and major-consent policy. Exact legacy v1 state
+is migrated in memory; its historical provider-less pending-refresh form is
+normalized by detecting and persisting the provider set before a child is started.
+All new writes obey the strict v2 phase invariants.
 
 After installation, refresh deliberately crosses a process boundary so it imports
-the newly installed package rather than the old in-memory module. Installed
-providers are detected in canonical Claude-then-Codex order, then each receives:
+the newly installed package rather than the old in-memory module. The updater
+retains `update.lock` and delegates a cryptorandom, project-bound lease only to the
+direct `mapify init` child through `MAP_UPDATE_PARENT_LEASE`. The raw lease appears
+only in that child's environment: it is removed before init runs, is never placed
+in argv or passed to a package manager, and is never written to disk. The lock
+record contains only its SHA-256 digest, the updater PID, and the resolved project.
+A child may borrow the parent's lock authority only while contention proves the
+parent still owns the lock and the digest, direct parent PID, project, provider,
+running version, and pending phase all match.
+
+Lock order is always `update.lock` then `provider-refresh.lock`. A delegated child
+does not recursively acquire `update.lock`; it acquires the provider barrier for
+the whole filesystem mutation. A standalone recovery acquires both locks in order.
+Before reading state or querying versions, a new updater acquires `update.lock`
+and probes the provider barrier without waiting. This prevents concurrent package
+or provider mutation if a refresh child outlives a failed parent. Automatic mode
+silently skips contention; manual mode reports it clearly without network or state
+mutation.
+
+Installed providers are detected in canonical Claude-then-Codex order, then each
+receives:
 
 ```text
 mapify init . --force --no-git --provider <provider> --refresh-existing
 ```
 
 The hidden init mode preserves configuration, MCP selections, user-managed
-regions, and `updates.auto`, and it never initializes Git. Each refresh rebuilds
-the aggregate `.map/mapify.lock.json`; when both providers coexist, the final
-manifest audits both catalogs with `providers: ["claude", "codex"]` and
-deduplicates shared `.map/scripts` entries. Legacy single-provider manifests
-remain readable through the retained compatibility field.
+regions, and `updates.auto`, and it never initializes Git. The update service
+reports refresh completion explicitly only after every provider succeeds; the
+hidden adapter uses that signal rather than inferring success from a manifest that
+may have been replaced during a partial refresh. Each refresh rebuilds the
+aggregate `.map/mapify.lock.json`; when both providers coexist, the final manifest
+audits both catalogs with `providers: ["claude", "codex"]` and deduplicates shared
+`.map/scripts` entries. Legacy single-provider manifests remain readable through
+the retained compatibility field.
 
 ## Source of Truth
 
@@ -160,7 +198,7 @@ remain readable through the retained compatibility field.
 - **Host-path and lock contract**: `src/mapify_cli/_locking.py` owns the `flock_with_state` implementation; `src/mapify_cli/templates/references/host-paths.md` is the shipped user-facing reference for `MAP_*`, `~/.map/`, and lock state-marker semantics.
 - **Spec citation gate**: `.map/scripts/validate_spec_citations.py` and its template twin validate `file:line` references before `/map-plan` decomposes work.
 - **Install manifest**: `.map/mapify.lock.json` is the aggregate audit lock written by `mapify init` via `src/mapify_cli/install_manifest.py`; `mapify check-installed` reads its canonical provider collection and managed-file union to detect missing/drifted/orphaned files. Security invariants: no absolute paths, no secrets, machine-local `settings.local.json` excluded from the committed manifest.
-- **Automatic update state**: `.map/update-state.json` and `.map/update.lock` are gitignored local runtime files owned by `src/mapify_cli/update_state.py`; neither is the install manifest.
+- **Automatic update state**: `.map/update-state.json`, `.map/update.lock`, and `.map/provider-refresh.lock` are gitignored local runtime files owned by `src/mapify_cli/update_state.py`; none is the install manifest. `MAP_UPDATE_PARENT_LEASE` is an ephemeral direct-child credential, not persisted configuration.
 - **Approval holds and completion state**: `src/mapify_cli/templates/map/scripts/map_step_runner.py` owns approval-hold JSON/report artifacts, while `src/mapify_cli/templates/map/scripts/map_orchestrator.py` owns completed-state archive and branch-reuse cleanup.
 - **Governance regression evidence**: `tests/test_governance_attack_fixtures.py` is the deny/allow fixture suite for governance surfaces such as workflow state, mutation boundaries, false-progress gates, wave lifecycle, safety guardrails, workflow-gate, and run-health schema.
 - **Documentation**: `README.md`, `docs/USAGE.md`, `docs/INSTALL.md`, and this document define expected behavior and invariants.

@@ -259,22 +259,63 @@ invariant.
 ## State and concurrency
 
 Project-local update state is stored at the gitignored
-`.map/update-state.json`; the corresponding lock is `.map/update.lock`. The state
-includes:
+`.map/update-state.json`. Schema v2 includes:
 
 - schema version;
 - last automatic attempt time in UTC;
 - version observed during that attempt;
 - last successfully installed version;
+- the exact pending-install target, when package mutation has started but its
+  result is not yet proven;
 - pending-refresh status; and
 - providers still requiring refresh, when applicable.
 
 The state contains no credentials, absolute paths, release bodies, or environment
-details. Writes are atomic.
+details. Writes are atomic and must represent exactly one of these phases:
 
-A project-local file lock serializes updater execution. In automatic mode, lock
-contention is a silent skip. In manual mode, lock contention is reported clearly.
-The lock and state paths are added to the shipped gitignore surface.
+| Phase | `pending_install_version` | `pending_refresh` | `pending_providers` |
+|---|---|---|---|
+| Idle | `null` | `false` | empty |
+| Install intent | exact stable target | `false` | non-empty |
+| Refresh pending | `null` | `true` | non-empty |
+
+The service writes install intent before invoking a package manager. If that call
+raises, exits unsuccessfully, or the process dies, the intent remains deliberately
+ambiguous. Only a fresh process running the exact target version may promote it
+locally to refresh-pending before throttle and network checks. A version mismatch
+never makes the saved target install authority: a recent automatic check keeps the
+intent and skips, while manual mode or a due automatic check clears that authority
+and re-enters freshly fetched patch/minor and major-consent policy. Once package
+success is reported, the service promotes to refresh-pending before starting any
+provider child. A failed promotion leaves install intent rather than claiming that
+refresh is authorized.
+
+Strict, exact-shape schema-v1 payloads migrate to v2. The one historical v1
+pending-refresh form that omitted providers is accepted only as a transitional
+read: the service discovers and persists the canonical provider set before it can
+launch a refresh child. Every v2 write enforces the phase table above.
+
+Two project-local locks protect the transition:
+
+- `.map/update.lock` serializes policy, package mutation, and standalone recovery.
+- `.map/provider-refresh.lock` serializes the complete provider filesystem
+  mutation and remains effective if the updater parent dies before its child.
+
+Lock order is always update then provider-refresh. A new updater acquires the
+update lock and probes the provider barrier before reading update state, querying
+the network, or running a package manager. Contention is a silent automatic skip
+and a clear manual error with no state or network side effects.
+
+The updater delegates lock authority to a provider-refresh child with a
+cryptorandom `MAP_UPDATE_PARENT_LEASE` environment value. The raw value is never
+stored, printed, passed in argv, or exposed to a package manager; only its SHA-256
+digest, owner PID, and resolved project identity are written to the locked file.
+The child immediately removes the variable from its environment. Borrowing is
+valid only while the update lock is actively contended and the digest, direct
+parent PID, exact project, requested provider, running package version, and
+pending state all agree. A borrowed child owns only the provider barrier, avoiding
+recursive update-lock acquisition. A standalone `--refresh-existing` recovery
+owns both locks in global order.
 
 ## Error semantics
 
@@ -286,9 +327,12 @@ invoked MAP skill.
 
 Manual mode converts the same failures into a non-success result with an actionable
 message. It does not claim an update succeeded unless both the package installation
-and every required provider refresh succeeded. If the package changed but refresh
-did not, the message identifies the partial state and the exact `mapify init`
-recovery action.
+and every required provider refresh succeeded. An install-intent error says the
+package outcome is uncertain and directs the user to start a fresh invocation so
+the running version can be reconciled safely. A refresh-pending error identifies
+the remaining providers and exact `mapify init` recovery actions. The internal
+adapter relies on an explicit full-refresh-complete signal; it never infers success
+from a manifest that a partially completed refresh may already have replaced.
 
 State corruption is handled as an automatic cache miss and replaced atomically;
 manual mode may additionally report that invalid local state was repaired.

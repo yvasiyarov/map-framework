@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import errno
+import hashlib
+import hmac
 import importlib
 import json
 import os
+import re
+import secrets
 import stat
 import tempfile
 import time
@@ -20,9 +25,29 @@ else:
     import fcntl
 
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 STATE_RELATIVE_PATH = Path(".map/update-state.json")
+MAP_UPDATE_PARENT_LEASE_ENV = "MAP_UPDATE_PARENT_LEASE"
 UPDATE_INTERVAL = timedelta(hours=24)
+_STABLE_VERSION_RE = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+)
+_PROVIDERS = frozenset({"claude", "codex"})
+_V1_KEYS = frozenset(
+    {
+        "schema_version",
+        "last_attempt_at",
+        "last_observed_version",
+        "last_installed_version",
+        "pending_refresh",
+        "pending_providers",
+    }
+)
+_V2_KEYS = _V1_KEYS | {"pending_install_version"}
+_LEASE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+_LOCK_RECORD_KEYS = frozenset(
+    {"schema_version", "lease_digest", "owner_pid", "project"}
+)
 
 
 class UpdateLockBusy(RuntimeError):
@@ -33,12 +58,31 @@ class UpdateLockSecurityError(RuntimeError):
     """Raised when the project lock path cannot be opened safely."""
 
 
+class UpdateLeaseRejected(RuntimeError):
+    """Raised when a provider child cannot prove direct updater authority."""
+
+
+@dataclass(frozen=True)
+class ProjectUpdateLease:
+    """In-memory authority delegated only to direct provider-refresh children."""
+
+    token: str
+    owner_pid: int
+    project: Path
+
+
+_CURRENT_UPDATE_LEASE: contextvars.ContextVar[ProjectUpdateLease | None] = (
+    contextvars.ContextVar("map_current_update_lease", default=None)
+)
+
+
 @dataclass(frozen=True)
 class UpdateState:
     schema_version: int = STATE_SCHEMA_VERSION
     last_attempt_at: str | None = None
     last_observed_version: str | None = None
     last_installed_version: str | None = None
+    pending_install_version: str | None = None
     pending_refresh: bool = False
     pending_providers: tuple[str, ...] = ()
 
@@ -46,20 +90,11 @@ class UpdateState:
 def _state_from_payload(payload: Any) -> UpdateState | None:
     if not isinstance(payload, dict):
         return None
-
-    allowed_keys = {
-        "schema_version",
-        "last_attempt_at",
-        "last_observed_version",
-        "last_installed_version",
-        "pending_refresh",
-        "pending_providers",
-    }
-    if set(payload) != allowed_keys:
-        return None
     if type(payload.get("schema_version")) is not int:
         return None
-    if payload["schema_version"] != STATE_SCHEMA_VERSION:
+    schema_version = payload["schema_version"]
+    expected_keys = _V1_KEYS if schema_version == 1 else _V2_KEYS
+    if schema_version not in {1, STATE_SCHEMA_VERSION} or set(payload) != expected_keys:
         return None
 
     for field_name in (
@@ -80,15 +115,66 @@ def _state_from_payload(payload: Any) -> UpdateState | None:
         isinstance(provider, str) for provider in pending_providers
     ):
         return None
+    pending_install_version = (
+        None if schema_version == 1 else payload.get("pending_install_version")
+    )
+    if pending_install_version is not None and not isinstance(
+        pending_install_version, str
+    ):
+        return None
 
-    return UpdateState(
-        schema_version=payload["schema_version"],
+    state = UpdateState(
+        schema_version=STATE_SCHEMA_VERSION,
         last_attempt_at=payload.get("last_attempt_at"),
         last_observed_version=payload.get("last_observed_version"),
         last_installed_version=payload.get("last_installed_version"),
+        pending_install_version=pending_install_version,
         pending_refresh=pending_refresh,
         pending_providers=tuple(pending_providers),
     )
+    if _valid_state(state):
+        return state
+    if (
+        schema_version == 1
+        and state.pending_refresh
+        and state.last_installed_version is not None
+        and not state.pending_providers
+    ):
+        # Intent: v1 allowed provider-less refresh recovery. Keep it only as an
+        # in-memory migration phase so the updater can discover and persist v2
+        # provider authority before launching a child; v2 writes stay strict.
+        return state
+    return None
+
+
+def _stable_version_or_none(value: str | None) -> bool:
+    return value is None or _STABLE_VERSION_RE.fullmatch(value) is not None
+
+
+def _valid_state(state: UpdateState) -> bool:
+    if state.schema_version != STATE_SCHEMA_VERSION:
+        return False
+    if not all(
+        _stable_version_or_none(value)
+        for value in (
+            state.last_observed_version,
+            state.last_installed_version,
+            state.pending_install_version,
+        )
+    ):
+        return False
+    providers = state.pending_providers
+    if any(provider not in _PROVIDERS for provider in providers) or len(
+        set(providers)
+    ) != len(providers):
+        return False
+
+    has_install_intent = state.pending_install_version is not None
+    if has_install_intent:
+        return not state.pending_refresh and bool(providers)
+    if state.pending_refresh:
+        return state.last_installed_version is not None and bool(providers)
+    return not providers
 
 
 def read_update_state(project_path: Path) -> UpdateState:
@@ -101,6 +187,8 @@ def read_update_state(project_path: Path) -> UpdateState:
 
 
 def write_update_state(project_path: Path, state: UpdateState) -> None:
+    if not _valid_state(state):
+        raise ValueError("invalid MAP update state")
     state_path = project_path / STATE_RELATIVE_PATH
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
@@ -117,6 +205,7 @@ def write_update_state(project_path: Path, state: UpdateState) -> None:
                     "last_attempt_at": state.last_attempt_at,
                     "last_observed_version": state.last_observed_version,
                     "last_installed_version": state.last_installed_version,
+                    "pending_install_version": state.pending_install_version,
                     "pending_refresh": state.pending_refresh,
                     "pending_providers": list(state.pending_providers),
                 },
@@ -226,25 +315,20 @@ else:
             return
 
 
-@contextlib.contextmanager
-def project_update_lock(
-    project_path: Path,
-    *,
-    timeout_s: float,
-) -> Generator[None, None, None]:
-    lock_path = project_path / ".map" / "update.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+def _open_lock_file(lock_path: Path, *, create: bool) -> int:
+    if create:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow == 0 and lock_path.is_symlink():
         raise UpdateLockSecurityError(str(lock_path))
+    flags = os.O_RDWR | (os.O_CREAT if create else 0) | nofollow
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | nofollow, 0o600)
+        fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
             raise UpdateLockSecurityError(str(lock_path)) from exc
         raise
 
-    acquired = False
     try:
         if nofollow == 0:
             # Intent: Match path and descriptor identities to detect path swaps.
@@ -257,21 +341,257 @@ def project_update_lock(
                 raise UpdateLockSecurityError(str(lock_path))
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
-        deadline = time.monotonic() + timeout_s
-        while True:
-            try:
-                _try_lock(fd)
-                acquired = True
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise UpdateLockBusy(str(lock_path)) from exc
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+def _acquire_fd(fd: int, lock_path: Path, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            _try_lock(fd)
+            return
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline:
+                raise UpdateLockBusy(str(lock_path)) from exc
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _write_fd(fd: int, data: bytes) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("failed to write MAP update lock record")
+        remaining = remaining[written:]
+    os.fsync(fd)
+
+
+def _write_lock_record(fd: int, lease: ProjectUpdateLease) -> None:
+    payload = {
+        "schema_version": 1,
+        "lease_digest": hashlib.sha256(lease.token.encode()).hexdigest(),
+        "owner_pid": lease.owner_pid,
+        "project": str(lease.project),
+    }
+    _write_fd(fd, (json.dumps(payload, sort_keys=True) + "\n").encode())
+
+
+def _read_lock_record(fd: int) -> dict[str, Any] | None:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 2_049)
+        if len(raw) > 2_048:
+            return None
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != _LOCK_RECORD_KEYS:
+        return None
+    if payload.get("schema_version") != 1:
+        return None
+    if not isinstance(payload.get("lease_digest"), str):
+        return None
+    if type(payload.get("owner_pid")) is not int or payload["owner_pid"] <= 0:
+        return None
+    if not isinstance(payload.get("project"), str):
+        return None
+    return payload
+
+
+def current_project_update_lease(project_path: Path) -> ProjectUpdateLease | None:
+    """Return this context's lease only for its exact resolved project."""
+    lease = _CURRENT_UPDATE_LEASE.get()
+    if lease is None or lease.project != project_path.resolve():
+        return None
+    return lease
+
+
+def _state_authorizes_provider_child(
+    state: UpdateState,
+    provider: str,
+    running_version: str,
+) -> bool:
+    if provider not in state.pending_providers:
+        return False
+    if state.pending_install_version is not None:
+        return (
+            not state.pending_refresh
+            and state.pending_install_version == running_version
+        )
+    return state.pending_refresh and state.last_installed_version == running_version
+
+
+def validate_parent_update_lease(
+    project_path: Path,
+    provider: str,
+    running_version: str,
+    raw_lease: str | None,
+) -> bool:
+    """Validate a direct updater parent's active, project-bound refresh lease."""
+    if raw_lease is None or _LEASE_TOKEN_RE.fullmatch(raw_lease) is None:
+        return False
+    project = project_path.resolve()
+    if not _state_authorizes_provider_child(
+        read_update_state(project), provider, running_version
+    ):
+        return False
+
+    lock_path = project / ".map" / "update.lock"
+    try:
+        fd = _open_lock_file(lock_path, create=False)
+    except (OSError, UpdateLockSecurityError):
+        return False
+    try:
+        try:
+            _try_lock(fd)
+        except BlockingIOError:
+            record = _read_lock_record(fd)
+        else:
+            # Intent: A persisted digest without active lock contention is stale.
+            _unlock(fd)
+            return False
+    finally:
+        os.close(fd)
+
+    if record is None:
+        return False
+    expected_digest = hashlib.sha256(raw_lease.encode()).hexdigest()
+    return (
+        hmac.compare_digest(record["lease_digest"], expected_digest)
+        and record["owner_pid"] == os.getppid()
+        and record["project"] == str(project)
+    )
+
+
+@contextlib.contextmanager
+def provider_refresh_lock(
+    project_path: Path,
+    *,
+    timeout_s: float,
+) -> Generator[None, None, None]:
+    """Serialize provider mutation independently from an updater parent lifetime."""
+    lock_path = project_path.resolve() / ".map" / "provider-refresh.lock"
+    fd = _open_lock_file(lock_path, create=True)
+    acquired = False
+    try:
+        _acquire_fd(fd, lock_path, timeout_s)
+        acquired = True
         yield
     finally:
         try:
             if acquired:
+                _unlock(fd)
+        finally:
+            os.close(fd)
+
+
+def _promote_matching_install_intent(
+    project_path: Path,
+    state: UpdateState,
+    running_version: str,
+) -> UpdateState:
+    if state.pending_install_version != running_version:
+        return state
+    promoted = replace(
+        state,
+        last_installed_version=running_version,
+        pending_install_version=None,
+        pending_refresh=True,
+    )
+    write_update_state(project_path, promoted)
+    return promoted
+
+
+def _validate_refresh_phase_for_running_version(
+    state: UpdateState,
+    running_version: str,
+) -> None:
+    if state.pending_install_version is not None and (
+        state.pending_install_version != running_version
+    ):
+        raise UpdateLeaseRejected(
+            "pending MAP installation does not match the running mapify version"
+        )
+    if state.pending_refresh and state.last_installed_version != running_version:
+        raise UpdateLeaseRejected(
+            "pending MAP refresh does not match the running mapify version"
+        )
+
+
+@contextlib.contextmanager
+def provider_refresh_session(
+    project_path: Path,
+    *,
+    provider: str,
+    running_version: str,
+    raw_parent_lease: str | None,
+    timeout_s: float,
+) -> Generator[None, None, None]:
+    """Serialize one complete ``init --refresh-existing`` mutation."""
+    project = project_path.resolve()
+    if raw_parent_lease is not None:
+        if not validate_parent_update_lease(
+            project,
+            provider,
+            running_version,
+            raw_parent_lease,
+        ):
+            raise UpdateLeaseRejected("invalid parent update lease")
+        # Intent: The parent retains update.lock; the child owns only the orphan
+        # barrier, avoiding a recursive acquisition deadlock.
+        with provider_refresh_lock(project, timeout_s=timeout_s):
+            state = read_update_state(project)
+            if not _state_authorizes_provider_child(state, provider, running_version):
+                raise UpdateLeaseRejected("invalid parent update lease state")
+            _promote_matching_install_intent(project, state, running_version)
+            yield
+        return
+
+    # Intent: Standalone recovery always follows update -> provider-refresh order.
+    with (
+        project_update_lock(project, timeout_s=timeout_s),
+        provider_refresh_lock(project, timeout_s=timeout_s),
+    ):
+        state = read_update_state(project)
+        _validate_refresh_phase_for_running_version(state, running_version)
+        _promote_matching_install_intent(project, state, running_version)
+        yield
+
+
+@contextlib.contextmanager
+def project_update_lock(
+    project_path: Path,
+    *,
+    timeout_s: float,
+) -> Generator[ProjectUpdateLease, None, None]:
+    project = project_path.resolve()
+    lock_path = project / ".map" / "update.lock"
+    fd = _open_lock_file(lock_path, create=True)
+    acquired = False
+    context_token: contextvars.Token[ProjectUpdateLease | None] | None = None
+    try:
+        _acquire_fd(fd, lock_path, timeout_s)
+        acquired = True
+        lease = ProjectUpdateLease(
+            token=secrets.token_urlsafe(32),
+            owner_pid=os.getpid(),
+            project=project,
+        )
+        _write_lock_record(fd, lease)
+        context_token = _CURRENT_UPDATE_LEASE.set(lease)
+        yield lease
+    finally:
+        try:
+            if context_token is not None:
+                _CURRENT_UPDATE_LEASE.reset(context_token)
+            if acquired:
+                with contextlib.suppress(OSError):
+                    _write_fd(fd, b"")
                 _unlock(fd)
         finally:
             os.close(fd)

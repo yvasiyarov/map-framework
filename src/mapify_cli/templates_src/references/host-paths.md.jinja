@@ -10,13 +10,14 @@
 
 ## (b) Reserved Variables
 
-These three variables are reserved by the MAP orchestration layer. Do not repurpose or shadow them.
+These four variables are reserved by MAP runtime layers. Do not repurpose or shadow them.
 
 | Variable | Semantics |
 |---|---|
 | `MAP_INVOKED_BY` | Identity of the invoking agent or surface (e.g., `map-efficient`, `map-task`). |
 | `MAP_BRANCH` | Git branch name of the active MAP session; used to scope `.map/<branch>/` state. |
 | `MAP_SUBTASK_ID` | ID of the currently executing subtask (e.g., `ST-002`); set by the orchestrator. |
+| `MAP_UPDATE_PARENT_LEASE` | Ephemeral updater-to-provider-child credential. It is not user configuration; see §Update Refresh Lease below. |
 
 ## (c) Registry of Existing MAP_* Variables
 
@@ -36,12 +37,31 @@ These three variables are reserved by the MAP orchestration layer. Do not repurp
 
 MAP uses two root directories:
 
-- **`.map/<branch>/`** — per-branch workflow state (subtask plans, step state, findings). Lives inside the project repo, committed or gitignored per project convention.
+- **`.map/`** — project-local MAP state. `.map/<branch>/` holds per-branch workflow artifacts. The automatic updater owns the gitignored `.map/update-state.json`, `.map/update.lock`, and `.map/provider-refresh.lock` files.
 - **`~/.map/`** — host-scoped shared state. Two subdirectories matter:
   - `~/.map/locks/` — advisory lock files acquired by the orchestrator to prevent concurrent MAP sessions on the same branch.
   - `~/.map/hooks/` — host-level hook scripts invoked by the MAP hook harness before/after workflow phases.
 
 These are the only two MAP roots. No other directories are created by the MAP runtime.
+
+### Update Refresh Lease
+
+`MAP_UPDATE_PARENT_LEASE` is a cryptorandom, single-process handoff from an updater
+that holds `.map/update.lock` to its direct `mapify init --refresh-existing` child.
+It is an ephemeral credential, not a configurable runtime option:
+
+- the updater passes it only in that provider child's environment;
+- the child removes it before init executes any command or extension;
+- it is never placed in command arguments or inherited by a package manager;
+- the raw value is never persisted—the lock record stores only its SHA-256 digest,
+  the parent PID, and resolved project identity; and
+- it cannot be reused without active update-lock contention plus matching direct
+  parent PID, project, provider, running version, and pending update phase.
+
+Provider mutation is separately serialized by `.map/provider-refresh.lock` so a
+child that outlives its updater parent cannot race a replacement update. The global
+order is `.map/update.lock` then `.map/provider-refresh.lock`; a validated borrowed
+child already covered by its parent's update lock acquires only the provider lock.
 
 ## (f) State Markers (Closed Enum)
 

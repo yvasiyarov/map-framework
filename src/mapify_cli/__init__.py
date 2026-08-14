@@ -26,6 +26,8 @@ Or install globally:
 __version__ = "3.25.0"
 
 import contextlib
+import functools
+import inspect
 import io
 import json
 import os
@@ -969,9 +971,7 @@ def _apply_verified_auto_update_override(
     try:
         loaded = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise RuntimeError(
-            f"could not reload persisted project config: {exc}"
-        ) from exc
+        raise RuntimeError(f"could not reload persisted project config: {exc}") from exc
     if (
         persisted_values != [expected]
         or not isinstance(loaded, Mapping)
@@ -1001,7 +1001,63 @@ def _start_init_workflow_logger(
     )
 
 
+def _serialized_refresh_existing(command: Any) -> Any:
+    """Wrap hidden provider refreshes in their complete lock/lease session."""
+    signature = inspect.signature(command)
+
+    @functools.wraps(command)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from mapify_cli.update_state import (
+            MAP_UPDATE_PARENT_LEASE_ENV,
+            UpdateLeaseRejected,
+            UpdateLockBusy,
+            UpdateLockSecurityError,
+            provider_refresh_session,
+        )
+
+        # Intent: Remove delegated authority before init can launch any command or
+        # extension; only this wrapper retains the in-memory copy for validation.
+        raw_parent_lease = os.environ.pop(MAP_UPDATE_PARENT_LEASE_ENV, None)
+        bound = signature.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        if not bound.arguments.get("refresh_existing", False):
+            return command(*args, **kwargs)
+        if bound.arguments.get("project_name") != "." or bound.arguments.get(
+            "provider"
+        ) not in {"claude", "codex"}:
+            return command(*args, **kwargs)
+
+        project_path = Path.cwd().resolve()
+        try:
+            with provider_refresh_session(
+                project_path,
+                provider=str(bound.arguments["provider"]),
+                running_version=__version__,
+                raw_parent_lease=raw_parent_lease,
+                timeout_s=0.0,
+            ):
+                return command(*args, **kwargs)
+        except UpdateLockBusy as exc:
+            console.print(
+                "[red]Error:[/red] Another MAP update or provider refresh is "
+                "already running for this project; retry when it finishes."
+            )
+            raise typer.Exit(1) from exc
+        except UpdateLeaseRejected as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+        except UpdateLockSecurityError as exc:
+            console.print(
+                "[red]Error:[/red] An unsafe MAP update lock path was rejected: "
+                f"{exc}. Replace the symlink and retry."
+            )
+            raise typer.Exit(1) from exc
+
+    return wrapped
+
+
 @app.command()
+@_serialized_refresh_existing
 def init(
     project_name: str | None = typer.Argument(
         None, help="Name for your new project directory (use '.' for current directory)"
@@ -1363,7 +1419,15 @@ def init(
                     config_path, compression, compression_threshold
                 )
             if auto_update is not None:
-                _apply_verified_auto_update_override(config_path, auto_update)
+                try:
+                    _apply_verified_auto_update_override(config_path, auto_update)
+                except Exception as _auto_update_exc:
+                    tracker.error("map-config", f"skipped: {_auto_update_exc}")
+                    console.print(
+                        "[red]Error:[/red] Failed to persist requested "
+                        f"automatic-update setting: {_auto_update_exc}"
+                    )
+                    raise typer.Exit(1) from _auto_update_exc
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1372,6 +1436,8 @@ def init(
             if effective_agent_memory != "off":
                 apply_agent_memory_overrides(config_path, effective_agent_memory)
             tracker.complete("map-config", str(config_path.relative_to(project_path)))
+        except typer.Exit:
+            raise
         except Exception as e:
             # Normal init remains resilient; updater refresh makes this boundary
             # fatal below so it cannot report a partially configured success.
@@ -1379,12 +1445,6 @@ def init(
             if refresh_existing:
                 console.print(
                     f"[red]Error:[/red] Failed to refresh project configuration: {e}"
-                )
-                raise typer.Exit(1) from e
-            if auto_update is not None:
-                console.print(
-                    "[red]Error:[/red] Failed to persist requested "
-                    f"automatic-update setting: {e}"
                 )
                 raise typer.Exit(1) from e
     else:
@@ -1433,7 +1493,15 @@ def init(
                     config_path, compression, compression_threshold
                 )
             if auto_update is not None:
-                _apply_verified_auto_update_override(config_path, auto_update)
+                try:
+                    _apply_verified_auto_update_override(config_path, auto_update)
+                except Exception as _auto_update_exc:
+                    tracker.error("map-config", f"skipped: {_auto_update_exc}")
+                    console.print(
+                        "[red]Error:[/red] Failed to persist requested "
+                        f"automatic-update setting: {_auto_update_exc}"
+                    )
+                    raise typer.Exit(1) from _auto_update_exc
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1450,6 +1518,8 @@ def init(
                 if effective_agent_memory == "local":
                     merge_agent_memory_gitignore(project_path)
             tracker.complete("map-config", str(config_path.relative_to(project_path)))
+        except typer.Exit:
+            raise
         except Exception as e:
             # Normal init remains resilient; updater refresh makes this boundary
             # fatal below so it cannot report a partially configured success.
@@ -1457,12 +1527,6 @@ def init(
             if refresh_existing:
                 console.print(
                     f"[red]Error:[/red] Failed to refresh project configuration: {e}"
-                )
-                raise typer.Exit(1) from e
-            if auto_update is not None:
-                console.print(
-                    "[red]Error:[/red] Failed to persist requested "
-                    f"automatic-update setting: {e}"
                 )
                 raise typer.Exit(1) from e
 
@@ -2115,16 +2179,7 @@ def internal_update(
             )
             is_error = result.status is UpdateStatus.ERROR
             if automatic and is_error:
-                from mapify_cli.update_install import installed_providers
-
-                expected_providers = installed_providers(resolved_project)
-                completed_refresh = (
-                    result.installed_version is not None
-                    and result.reload_current_skill is True
-                    and bool(expected_providers)
-                    and tuple(result.refreshed_providers) == expected_providers
-                )
-                if not completed_refresh:
+                if not result.refresh_complete:
                     return
                 payload = result.to_dict()
                 payload["status"] = UpdateStatus.UPDATED.value

@@ -6,10 +6,12 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
+import mapify_cli.update_state as update_state_module
 from mapify_cli.update_install import (
     InstallKind,
     PackageUpdateError,
@@ -22,6 +24,7 @@ from mapify_cli.update_install import (
     resolve_mapify_executable,
     run_command,
 )
+from mapify_cli.update_state import project_update_lock
 from mapify_cli.update_versions import StableVersion
 
 
@@ -104,8 +107,9 @@ def test_install_exact_command_uses_project_and_300_second_timeout(
     calls: list[tuple[list[str], Path, float]] = []
 
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
+        assert "MAP_UPDATE_PARENT_LEASE" not in env
         calls.append((command, cwd, timeout))
         return subprocess.CompletedProcess(command, 0, "installed", "")
 
@@ -138,9 +142,9 @@ def test_install_exact_command_failure_has_bounded_actionable_stderr(
     stderr = "installer failed: " + ("x" * 10_000) + "END-OF-STDERR"
 
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
-        del cwd, timeout
+        del cwd, timeout, env
         return subprocess.CompletedProcess(command, 23, "", stderr)
 
     with pytest.raises(PackageUpdateError) as exc_info:
@@ -169,9 +173,9 @@ def test_source_install_exact_command_explains_manual_update(tmp_path: Path) -> 
 
 def test_install_exact_command_timeout_is_actionable(tmp_path: Path) -> None:
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
-        del cwd
+        del cwd, env
         raise subprocess.TimeoutExpired(command, timeout, stderr="network stalled")
 
     with pytest.raises(PackageUpdateError, match="timed out after 300 seconds"):
@@ -187,9 +191,9 @@ def test_install_exact_command_missing_runner_executable_is_actionable(
     tmp_path: Path,
 ) -> None:
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
-        del command, cwd, timeout
+        del command, cwd, timeout, env
         raise FileNotFoundError("python vanished")
 
     with pytest.raises(PackageUpdateError, match="could not be started") as exc_info:
@@ -218,7 +222,7 @@ def test_run_command_captures_text_without_raising(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    result = run_command(["tool", "arg"], tmp_path, 300.0)
+    result = run_command(["tool", "arg"], tmp_path, 300.0, env={"SAFE": "1"})
 
     assert result.returncode == 7
     assert observed == {
@@ -228,7 +232,75 @@ def test_run_command_captures_text_without_raising(
         "check": False,
         "capture_output": True,
         "text": True,
+        "env": {"SAFE": "1"},
     }
+
+
+def test_package_install_strips_parent_lease_from_child_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_name = getattr(
+        update_state_module,
+        "MAP_UPDATE_PARENT_LEASE_ENV",
+        "MAP_UPDATE_PARENT_LEASE",
+    )
+    monkeypatch.setenv(env_name, "ambient-forged-value")
+    observed: dict[str, str] = {}
+
+    def runner(
+        command: list[str],
+        cwd: Path,
+        timeout: float,
+        env: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
+        observed.update(env)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    install_exact_version(
+        tmp_path,
+        StableVersion(3, 26, 0),
+        module_file="/venv/lib/python3.11/site-packages/mapify_cli/__init__.py",
+        runner=runner,
+    )
+
+    assert env_name not in observed
+
+
+def test_refresh_passes_active_parent_lease_only_in_provider_child_environment(
+    tmp_path: Path,
+) -> None:
+    env_name = getattr(
+        update_state_module,
+        "MAP_UPDATE_PARENT_LEASE_ENV",
+        "MAP_UPDATE_PARENT_LEASE",
+    )
+    calls: list[tuple[list[str], Mapping[str, str]]] = []
+
+    def runner(
+        command: list[str],
+        cwd: Path,
+        timeout: float,
+        env: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
+        calls.append((command, env))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with project_update_lock(tmp_path, timeout_s=0.0) as lease:
+        refreshed = refresh_installed_providers(
+            tmp_path,
+            ("claude", "codex"),
+            mapify_executable="/bin/mapify",
+            runner=runner,
+        )
+
+    assert refreshed == ("claude", "codex")
+    assert len(calls) == 2
+    for command, env in calls:
+        assert lease.token not in command
+        assert env[env_name] == lease.token
 
 
 def test_dual_provider_detection_is_deterministic(tmp_path: Path) -> None:
@@ -256,8 +328,9 @@ def test_refresh_runs_fresh_mapify_init_for_both_providers(tmp_path: Path) -> No
     calls: list[tuple[list[str], Path, float]] = []
 
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
+        assert "MAP_UPDATE_PARENT_LEASE" not in env
         calls.append((command, cwd, timeout))
         return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -307,9 +380,9 @@ def test_refresh_failure_reports_completed_and_pending_providers(
     stderr = "refresh failed: " + ("x" * 10_000) + "END-OF-STDERR"
 
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
-        del cwd, timeout
+        del cwd, timeout, env
         if command[command.index("--provider") + 1] == "claude":
             return subprocess.CompletedProcess(command, 0, "", "")
         return subprocess.CompletedProcess(command, 19, "", stderr)
@@ -334,9 +407,9 @@ def test_refresh_failure_reports_completed_and_pending_providers(
 
 def test_refresh_timeout_preserves_full_pending_state(tmp_path: Path) -> None:
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
-        del cwd
+        del cwd, env
         raise subprocess.TimeoutExpired(command, timeout, stderr="too slow")
 
     with pytest.raises(ProjectRefreshError) as exc_info:
@@ -357,9 +430,9 @@ def test_refresh_missing_executable_preserves_full_pending_state(
     tmp_path: Path,
 ) -> None:
     def runner(
-        command: list[str], cwd: Path, timeout: float
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
     ) -> subprocess.CompletedProcess[str]:
-        del command, cwd, timeout
+        del command, cwd, timeout, env
         raise FileNotFoundError("mapify vanished")
 
     with pytest.raises(ProjectRefreshError) as exc_info:

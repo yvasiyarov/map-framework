@@ -25,6 +25,7 @@ from mapify_cli.update_state import (
     UpdateState,
     automatic_check_due,
     project_update_lock,
+    provider_refresh_lock,
     read_update_state,
     write_update_state,
 )
@@ -37,6 +38,7 @@ from mapify_cli.update_versions import (
 )
 
 LOCK_TIMEOUT_SECONDS = 0.0
+REFRESH_BARRIER_TIMEOUT_SECONDS = 0.0
 
 
 class UpdateMode(StrEnum):
@@ -67,6 +69,7 @@ class UpdateResult:
     message: str | None = None
     refreshed_providers: tuple[str, ...] = ()
     reload_current_skill: bool = False
+    refresh_complete: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable JSON-facing representation of this result."""
@@ -100,6 +103,7 @@ class _UpdateProgress:
     refreshed_providers: tuple[str, ...] = ()
     reload_current_skill: bool = False
     recovered_refresh: bool = False
+    refresh_complete: bool = False
 
 
 def _error(current_version: str, message: str) -> UpdateResult:
@@ -118,6 +122,7 @@ def _error_with_progress(
         message=message,
         refreshed_providers=progress.refreshed_providers,
         reload_current_skill=progress.reload_current_skill,
+        refresh_complete=progress.refresh_complete,
     )
 
 
@@ -174,15 +179,27 @@ def _install_and_refresh(
             "Codex provider before updating mapify-cli."
         )
 
-    install_exact_version(project_path, target)
-    progress.installed_version = str(target)
-    progress.state = replace(
+    # Intent: Persist package-mutation authority before an installer can change
+    # the environment; a failed installer remains deliberately ambiguous.
+    install_intent = replace(
         progress.state,
-        last_installed_version=str(target),
-        pending_refresh=True,
+        pending_install_version=str(target),
+        pending_refresh=False,
         pending_providers=providers,
     )
-    write_update_state(project_path, progress.state)
+    write_update_state(project_path, install_intent)
+    progress.state = install_intent
+
+    install_exact_version(project_path, target)
+    progress.installed_version = str(target)
+    refresh_pending = replace(
+        progress.state,
+        last_installed_version=str(target),
+        pending_install_version=None,
+        pending_refresh=True,
+    )
+    write_update_state(project_path, refresh_pending)
+    progress.state = refresh_pending
     try:
         refreshed = refresh_installed_providers(project_path, providers)
     except ProjectRefreshError as exc:
@@ -203,8 +220,10 @@ def _install_and_refresh(
         refreshed,
     )
     progress.reload_current_skill = True
+    progress.refresh_complete = True
     progress.state = replace(
         progress.state,
+        pending_install_version=None,
         pending_refresh=False,
         pending_providers=(),
     )
@@ -227,6 +246,12 @@ def _actionable_error_message(
     if mode is not UpdateMode.MANUAL:
         return message
 
+    if state.pending_install_version is not None:
+        return (
+            f"{message}. The package installation outcome is uncertain and the "
+            "project was not refreshed. Start a fresh MAP invocation and run "
+            "map-upgrade again so the installed version can be reconciled safely."
+        )
     if state.pending_refresh and state.pending_providers:
         commands = _pending_recovery_commands(state.pending_providers)
         return (
@@ -264,6 +289,7 @@ def _operational_error(
         message=_actionable_error_message(exc, mode, message_state),
         refreshed_providers=progress.refreshed_providers,
         reload_current_skill=progress.reload_current_skill,
+        refresh_complete=progress.refresh_complete,
     )
 
 
@@ -274,6 +300,7 @@ def _metadata_unavailable_result(
     installed_version: str | None,
     refreshed_providers: tuple[str, ...],
     reload_current_skill: bool,
+    refresh_complete: bool,
 ) -> UpdateResult:
     if mode is UpdateMode.AUTOMATIC:
         status = (
@@ -287,6 +314,7 @@ def _metadata_unavailable_result(
             installed_version=installed_version,
             refreshed_providers=refreshed_providers,
             reload_current_skill=reload_current_skill,
+            refresh_complete=refresh_complete,
         )
     return UpdateResult(
         UpdateStatus.ERROR,
@@ -298,6 +326,7 @@ def _metadata_unavailable_result(
         ),
         refreshed_providers=refreshed_providers,
         reload_current_skill=reload_current_skill,
+        refresh_complete=refresh_complete,
     )
 
 
@@ -317,11 +346,55 @@ def _check_locked(
 
     progress = _UpdateProgress(read_update_state(project_path))
     try:
+        if progress.state.pending_install_version is not None:
+            pending_target = progress.state.pending_install_version
+            if pending_target == str(current):
+                # Intent: A fresh target-version process is proof that the prior
+                # package mutation landed; promote locally before any throttle or I/O.
+                promoted = replace(
+                    progress.state,
+                    last_installed_version=pending_target,
+                    pending_install_version=None,
+                    pending_refresh=True,
+                )
+                write_update_state(project_path, promoted)
+                progress.state = promoted
+                progress.installed_version = pending_target
+            else:
+                if mode is UpdateMode.AUTOMATIC and not automatic_check_due(
+                    progress.state,
+                    effective_now,
+                ):
+                    return UpdateResult(UpdateStatus.SKIPPED, current_version)
+                # Intent: Persisted intent is evidence, never install authority.
+                # A mismatch re-enters freshly fetched policy (and major consent).
+                cleared = replace(
+                    progress.state,
+                    pending_install_version=None,
+                    pending_providers=(),
+                )
+                write_update_state(project_path, cleared)
+                progress.state = cleared
+
         if progress.state.pending_refresh:
             progress.installed_version = progress.state.last_installed_version
             providers = progress.state.pending_providers or installed_providers(
                 project_path
             )
+            if not providers:
+                raise RuntimeError(
+                    "No installed MAP provider surface was found for the pending "
+                    "project refresh."
+                )
+            if not progress.state.pending_providers:
+                # Intent: Normalize the sole provider-less v1 recovery shape into
+                # strict v2 authority before a leased child can be launched.
+                canonical = replace(
+                    progress.state,
+                    pending_providers=providers,
+                )
+                write_update_state(project_path, canonical)
+                progress.state = canonical
             try:
                 refreshed = refresh_installed_providers(project_path, providers)
             except ProjectRefreshError as exc:
@@ -342,8 +415,10 @@ def _check_locked(
                 refreshed,
             )
             progress.reload_current_skill = True
+            progress.refresh_complete = True
             progress.state = replace(
                 progress.state,
+                pending_install_version=None,
                 pending_refresh=False,
                 pending_providers=(),
             )
@@ -355,6 +430,7 @@ def _check_locked(
                     installed_version=progress.installed_version,
                     refreshed_providers=progress.refreshed_providers,
                     reload_current_skill=True,
+                    refresh_complete=True,
                 )
             progress.recovered_refresh = True
 
@@ -413,6 +489,7 @@ def _check_locked(
                         installed_version=progress.installed_version,
                         refreshed_providers=progress.refreshed_providers,
                         reload_current_skill=progress.reload_current_skill,
+                        refresh_complete=progress.refresh_complete,
                     )
                 _install_and_refresh(project_path, progress, approved)
                 return UpdateResult(
@@ -421,6 +498,7 @@ def _check_locked(
                     installed_version=str(approved),
                     refreshed_providers=progress.refreshed_providers,
                     reload_current_skill=True,
+                    refresh_complete=progress.refresh_complete,
                 )
 
             if targets.same_major is not None:
@@ -442,6 +520,7 @@ def _check_locked(
                             installed_version=progress.installed_version,
                             refreshed_providers=progress.refreshed_providers,
                             reload_current_skill=True,
+                            refresh_complete=progress.refresh_complete,
                         )
                     raise
                 if highlights is None:
@@ -451,6 +530,7 @@ def _check_locked(
                         installed_version=progress.installed_version,
                         refreshed_providers=progress.refreshed_providers,
                         reload_current_skill=progress.reload_current_skill,
+                        refresh_complete=progress.refresh_complete,
                     )
                 return UpdateResult(
                     UpdateStatus.MAJOR_AVAILABLE,
@@ -459,6 +539,7 @@ def _check_locked(
                     major=highlights,
                     refreshed_providers=progress.refreshed_providers,
                     reload_current_skill=progress.reload_current_skill,
+                    refresh_complete=progress.refresh_complete,
                 )
 
         if progress.installed_version is not None or progress.recovered_refresh:
@@ -468,6 +549,7 @@ def _check_locked(
                 installed_version=progress.installed_version,
                 refreshed_providers=progress.refreshed_providers,
                 reload_current_skill=progress.reload_current_skill,
+                refresh_complete=progress.refresh_complete,
             )
         return UpdateResult(UpdateStatus.CURRENT, current_version)
     except Exception as exc:  # noqa: BLE001 - preserve partial update progress
@@ -516,6 +598,13 @@ def check_and_update(
 
         try:
             with project_update_lock(project_path, timeout_s=LOCK_TIMEOUT_SECONDS):
+                # Intent: Wait for an orphaned provider child from a dead updater
+                # before reading state or starting another package mutation.
+                with provider_refresh_lock(
+                    project_path,
+                    timeout_s=REFRESH_BARRIER_TIMEOUT_SECONDS,
+                ):
+                    pass
                 completed_result = _check_locked(
                     project_path,
                     current_version,
@@ -543,7 +632,9 @@ def check_and_update(
                 completed_result.installed_version
                 if completed_result is not None
                 and completed_result.installed_version is not None
-                else state.last_installed_version if state.pending_refresh else None
+                else state.last_installed_version
+                if state.pending_refresh
+                else None
             ),
             message=_actionable_error_message(exc, mode, state),
             refreshed_providers=(
@@ -553,6 +644,11 @@ def check_and_update(
             ),
             reload_current_skill=(
                 completed_result.reload_current_skill
+                if completed_result is not None
+                else False
+            ),
+            refresh_complete=(
+                completed_result.refresh_complete
                 if completed_result is not None
                 else False
             ),

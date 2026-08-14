@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
+import re
 import stat
 import subprocess
 import sys
@@ -15,6 +17,7 @@ import pytest
 
 import mapify_cli.update_state as update_state_module
 from mapify_cli.update_state import (
+    STATE_SCHEMA_VERSION,
     UpdateLockBusy,
     UpdateLockSecurityError,
     UpdateState,
@@ -42,7 +45,6 @@ def test_state_round_trip_is_project_local(tmp_path: Path) -> None:
     state = UpdateState(
         last_attempt_at="2026-08-13T11:00:00Z",
         last_installed_version="3.25.1",
-        pending_providers=("codex",),
     )
 
     write_update_state(tmp_path, state)
@@ -56,7 +58,12 @@ def test_state_write_replaces_the_previous_document(tmp_path: Path) -> None:
 
     write_update_state(
         tmp_path,
-        UpdateState(last_observed_version="3.26.0", pending_refresh=True),
+        UpdateState(
+            last_observed_version="3.26.0",
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
     )
 
     payload = json.loads(
@@ -64,12 +71,139 @@ def test_state_write_replaces_the_previous_document(tmp_path: Path) -> None:
     )
     assert payload == {
         "last_attempt_at": None,
-        "last_installed_version": None,
+        "last_installed_version": "3.26.0",
         "last_observed_version": "3.26.0",
-        "pending_providers": [],
+        "pending_install_version": None,
+        "pending_providers": ["claude"],
         "pending_refresh": True,
-        "schema_version": 1,
+        "schema_version": 2,
     }
+
+
+def test_schema_v1_idle_state_migrates_strictly_to_v2(tmp_path: Path) -> None:
+    state_path = tmp_path / ".map" / "update-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_attempt_at": "2026-08-13T11:00:00Z",
+                "last_observed_version": "3.26.0",
+                "last_installed_version": "3.25.1",
+                "pending_refresh": False,
+                "pending_providers": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert read_update_state(tmp_path) == UpdateState(
+        schema_version=2,
+        last_attempt_at="2026-08-13T11:00:00Z",
+        last_observed_version="3.26.0",
+        last_installed_version="3.25.1",
+        pending_install_version=None,
+        pending_refresh=False,
+        pending_providers=(),
+    )
+    assert STATE_SCHEMA_VERSION == 2
+
+
+def test_schema_v1_refresh_state_migrates_strictly_to_v2(tmp_path: Path) -> None:
+    state_path = tmp_path / ".map" / "update-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_attempt_at": None,
+                "last_observed_version": "3.26.0",
+                "last_installed_version": "3.26.0",
+                "pending_refresh": True,
+                "pending_providers": ["claude", "codex"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert read_update_state(tmp_path) == UpdateState(
+        schema_version=2,
+        last_observed_version="3.26.0",
+        last_installed_version="3.26.0",
+        pending_refresh=True,
+        pending_providers=("claude", "codex"),
+    )
+
+
+def test_schema_v1_refresh_without_providers_remains_transitional_for_discovery(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / ".map" / "update-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "last_attempt_at": "2026-08-13T11:00:00Z",
+                "last_observed_version": "3.26.0",
+                "last_installed_version": "3.26.0",
+                "pending_refresh": True,
+                "pending_providers": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert read_update_state(tmp_path) == UpdateState(
+        schema_version=2,
+        last_attempt_at="2026-08-13T11:00:00Z",
+        last_observed_version="3.26.0",
+        last_installed_version="3.26.0",
+        pending_refresh=True,
+        pending_providers=(),
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        UpdateState(
+            pending_install_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+        UpdateState(pending_install_version="3.26.0"),
+        UpdateState(pending_providers=("claude",)),
+        UpdateState(
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+        ),
+        UpdateState(
+            pending_install_version="3.26.0rc1",
+            pending_providers=("claude",),
+        ),
+        UpdateState(
+            pending_install_version="3.26.0",
+            pending_providers=("unknown",),
+        ),
+        UpdateState(
+            pending_install_version="3.26.0",
+            pending_providers=("claude", "claude"),
+        ),
+    ],
+)
+def test_write_rejects_invalid_or_mixed_update_phases(
+    tmp_path: Path,
+    state: UpdateState,
+) -> None:
+    with pytest.raises(ValueError, match="invalid MAP update state"):
+        write_update_state(tmp_path, state)
+
+    assert not (tmp_path / ".map" / "update-state.json").exists()
 
 
 def test_failed_state_replace_preserves_old_state_and_removes_tempfile(
@@ -164,7 +298,21 @@ def test_pending_refresh_state_requires_flag_version_and_provider_membership(
         ),
     )
     for state in invalid_states:
-        write_update_state(tmp_path, state)
+        state_path = tmp_path / ".map" / "update-state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": state.schema_version,
+                    "last_attempt_at": state.last_attempt_at,
+                    "last_observed_version": state.last_observed_version,
+                    "last_installed_version": state.last_installed_version,
+                    "pending_install_version": state.pending_install_version,
+                    "pending_refresh": state.pending_refresh,
+                    "pending_providers": list(state.pending_providers),
+                }
+            ),
+            encoding="utf-8",
+        )
         assert pending_refresh_state(tmp_path, "claude") is None
 
 
@@ -252,6 +400,199 @@ def test_lock_file_persists_with_owner_only_permissions(tmp_path: Path) -> None:
     assert lock_path.is_file()
     if os.name != "nt":
         assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+
+def test_project_lock_yields_random_lease_without_persisting_raw_secret(
+    tmp_path: Path,
+) -> None:
+    with project_update_lock(tmp_path, timeout_s=0.0) as first:
+        assert re.fullmatch(r"[A-Za-z0-9_-]{43}", first.token)
+        assert first.owner_pid == os.getpid()
+        record_text = (tmp_path / ".map" / "update.lock").read_text(encoding="utf-8")
+        record = json.loads(record_text)
+        assert first.token not in record_text
+        assert record == {
+            "lease_digest": hashlib.sha256(first.token.encode()).hexdigest(),
+            "owner_pid": os.getpid(),
+            "project": str(tmp_path.resolve()),
+            "schema_version": 1,
+        }
+
+    with project_update_lock(tmp_path, timeout_s=0.0) as second:
+        assert second.token != first.token
+
+
+def test_parent_lease_requires_active_lock_exact_parent_project_and_refresh_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = getattr(update_state_module, "validate_parent_update_lease", None)
+    assert callable(validate), "provider children need a validated lease boundary"
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+    )
+
+    with project_update_lock(tmp_path, timeout_s=0.0) as lease:
+        monkeypatch.setattr(update_state_module.os, "getppid", lambda: lease.owner_pid)
+        assert validate(tmp_path, "claude", "3.26.0", lease.token) is True
+        assert validate(tmp_path, "claude", "3.26.0", None) is False
+        assert validate(tmp_path, "claude", "3.26.0", "x" * 43) is False
+        assert validate(tmp_path, "codex", "3.26.0", lease.token) is False
+        assert validate(tmp_path, "claude", "3.25.0", lease.token) is False
+        assert validate(tmp_path / "other", "claude", "3.26.0", lease.token) is False
+        monkeypatch.setattr(
+            update_state_module.os, "getppid", lambda: lease.owner_pid + 1
+        )
+        assert validate(tmp_path, "claude", "3.26.0", lease.token) is False
+
+    monkeypatch.setattr(update_state_module.os, "getppid", lambda: lease.owner_pid)
+    assert validate(tmp_path, "claude", "3.26.0", lease.token) is False
+
+
+def test_parent_lease_accepts_only_matching_install_intent_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validate = getattr(update_state_module, "validate_parent_update_lease", None)
+    assert callable(validate)
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            pending_install_version="3.26.0",
+            pending_providers=("claude",),
+        ),
+    )
+
+    with project_update_lock(tmp_path, timeout_s=0.0) as lease:
+        monkeypatch.setattr(update_state_module.os, "getppid", lambda: lease.owner_pid)
+        assert validate(tmp_path, "claude", "3.26.0", lease.token) is True
+        assert validate(tmp_path, "claude", "3.25.0", lease.token) is False
+
+
+def test_provider_refresh_lock_is_an_independent_orphan_barrier(
+    tmp_path: Path,
+) -> None:
+    refresh_lock = getattr(update_state_module, "provider_refresh_lock", None)
+    assert callable(refresh_lock), "orphan refreshes need their own barrier lock"
+
+    with (
+        refresh_lock(tmp_path, timeout_s=0.0),
+        pytest.raises(UpdateLockBusy),
+        refresh_lock(tmp_path, timeout_s=0.0),
+    ):
+        raise AssertionError("a second provider refresh must not overlap")
+
+    with (
+        project_update_lock(tmp_path, timeout_s=0.0),
+        refresh_lock(tmp_path, timeout_s=0.0),
+    ):
+        assert (tmp_path / ".map" / "provider-refresh.lock").is_file()
+
+
+def test_standalone_provider_refresh_session_owns_locks_in_global_order(
+    tmp_path: Path,
+) -> None:
+    session = getattr(update_state_module, "provider_refresh_session", None)
+    assert callable(session), "refresh-existing needs a serialized session boundary"
+
+    with session(
+        tmp_path,
+        provider="claude",
+        running_version="3.26.0",
+        raw_parent_lease=None,
+        timeout_s=0.0,
+    ):
+        with (
+            pytest.raises(UpdateLockBusy),
+            project_update_lock(tmp_path, timeout_s=0.0),
+        ):
+            raise AssertionError("standalone refresh must own update.lock")
+        with (
+            pytest.raises(UpdateLockBusy),
+            update_state_module.provider_refresh_lock(tmp_path, timeout_s=0.0),
+        ):
+            raise AssertionError("standalone refresh must own provider-refresh.lock")
+
+
+def test_borrowed_provider_refresh_session_promotes_matching_intent_without_deadlock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = getattr(update_state_module, "provider_refresh_session", None)
+    assert callable(session)
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            pending_install_version="3.26.0",
+            pending_providers=("claude", "codex"),
+        ),
+    )
+
+    with project_update_lock(tmp_path, timeout_s=0.0) as lease:
+        monkeypatch.setattr(update_state_module.os, "getppid", lambda: lease.owner_pid)
+        with session(
+            tmp_path,
+            provider="claude",
+            running_version="3.26.0",
+            raw_parent_lease=lease.token,
+            timeout_s=0.0,
+        ):
+            state = read_update_state(tmp_path)
+            assert state.pending_install_version is None
+            assert state.last_installed_version == "3.26.0"
+            assert state.pending_refresh is True
+            assert state.pending_providers == ("claude", "codex")
+
+
+@pytest.mark.parametrize("raw_lease", [None, "x" * 43])
+def test_parent_refresh_session_rejects_missing_or_forged_lease_under_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_lease: str | None,
+) -> None:
+    session = getattr(update_state_module, "provider_refresh_session", None)
+    rejection = getattr(update_state_module, "UpdateLeaseRejected", RuntimeError)
+    assert callable(session)
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+    )
+
+    with project_update_lock(tmp_path, timeout_s=0.0) as lease:
+        monkeypatch.setattr(update_state_module.os, "getppid", lambda: lease.owner_pid)
+        if raw_lease is None:
+            with (
+                pytest.raises(UpdateLockBusy),
+                session(
+                    tmp_path,
+                    provider="claude",
+                    running_version="3.26.0",
+                    raw_parent_lease=None,
+                    timeout_s=0.0,
+                ),
+            ):
+                raise AssertionError("missing lease must not borrow")
+        else:
+            with (
+                pytest.raises(rejection, match="invalid parent update lease"),
+                session(
+                    tmp_path,
+                    provider="claude",
+                    running_version="3.26.0",
+                    raw_parent_lease=raw_lease,
+                    timeout_s=0.0,
+                ),
+            ):
+                raise AssertionError("forged lease must not borrow")
 
 
 def _readline_with_timeout(stream: IO[Any], timeout_s: float) -> str:

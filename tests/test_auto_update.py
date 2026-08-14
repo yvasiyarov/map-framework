@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from mapify_cli.update_state import (
     UpdateLockBusy,
     UpdateLockSecurityError,
     UpdateState,
+    provider_refresh_lock,
     read_update_state,
     write_update_state,
 )
@@ -163,26 +165,34 @@ def test_pending_refresh_retries_before_throttle_and_requests_reload(
     fetch.assert_not_called()
 
 
-def test_pending_refresh_without_saved_providers_redetects_them(
+def test_legacy_pending_refresh_discovers_and_persists_providers_before_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    write_update_state(
-        tmp_path,
-        UpdateState(
-            last_installed_version="3.26.0",
-            pending_refresh=True,
-        ),
+    state_path = tmp_path / ".map" / "update-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        """{"schema_version":1,"last_attempt_at":null,"last_observed_version":null,"last_installed_version":"3.26.0","pending_refresh":true,"pending_providers":[]}\n""",
+        encoding="utf-8",
     )
-    providers = Mock(return_value=("claude",))
-    refresh = Mock(return_value=("claude",))
-    monkeypatch.setattr(auto_update, "installed_providers", providers)
+    monkeypatch.setattr(auto_update, "installed_providers", lambda project: ("claude",))
+
+    def refresh(project: Path, providers: tuple[str, ...]) -> tuple[str, ...]:
+        assert providers == ("claude",)
+        canonical = read_update_state(project)
+        assert canonical.pending_refresh is True
+        assert canonical.pending_providers == ("claude",)
+        return providers
+
+    fetch = Mock(side_effect=AssertionError("recovery must precede network"))
     monkeypatch.setattr(auto_update, "refresh_installed_providers", refresh)
+    monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
 
     result = check_and_update(tmp_path, "3.26.0", UpdateMode.AUTOMATIC, now=NOW)
 
     assert result.status is UpdateStatus.UPDATED
-    providers.assert_called_once_with(tmp_path)
-    refresh.assert_called_once_with(tmp_path, ("claude",))
+    assert result.refreshed_providers == ("claude",)
+    assert read_update_state(tmp_path).pending_refresh is False
+    fetch.assert_not_called()
 
 
 def test_manual_bypasses_disabled_config_and_throttle_without_changing_timestamp(
@@ -251,6 +261,36 @@ def test_lock_contention_skips_automatic_and_errors_manual(
     assert automatic.status is UpdateStatus.SKIPPED
     assert manual.status is UpdateStatus.ERROR
     assert manual.message is not None and "already running" in manual.message
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [
+        (UpdateMode.AUTOMATIC, UpdateStatus.SKIPPED),
+        (UpdateMode.MANUAL, UpdateStatus.ERROR),
+    ],
+)
+@pytest.mark.timeout(1)
+def test_provider_refresh_barrier_contention_is_failfast_before_state_or_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: UpdateMode,
+    expected_status: UpdateStatus,
+) -> None:
+    fetch = Mock(side_effect=AssertionError("busy barrier must precede network"))
+    monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
+
+    with provider_refresh_lock(tmp_path, timeout_s=0.0):
+        started = time.monotonic()
+        result = check_and_update(tmp_path, "3.25.0", mode, now=NOW)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert result.status is expected_status
+    if mode is UpdateMode.MANUAL:
+        assert result.message is not None and "already running" in result.message
+    assert not (tmp_path / ".map" / "update-state.json").exists()
+    fetch.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", [UpdateMode.AUTOMATIC, UpdateMode.MANUAL])
@@ -400,6 +440,7 @@ def test_same_major_without_higher_major_returns_updated(
     assert result.installed_version == "3.25.1"
     assert result.refreshed_providers == ("claude",)
     assert result.reload_current_skill is True
+    assert result.refresh_complete is True
 
 
 def test_major_is_offered_but_never_installed_without_approval(
@@ -769,7 +810,7 @@ def test_failed_manual_fetch_does_not_change_automatic_attempt_timestamp(
     assert read_update_state(tmp_path).last_attempt_at == previous_attempt
 
 
-def test_package_install_failure_preserves_observed_target_without_pending_refresh(
+def test_package_install_failure_preserves_ambiguous_install_intent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -797,7 +838,10 @@ def test_package_install_failure_preserves_observed_target_without_pending_refre
     state = read_update_state(tmp_path)
     assert state.last_observed_version == "3.26.0"
     assert state.last_installed_version is None
+    assert state.pending_install_version == "3.26.0"
     assert state.pending_refresh is False
+    assert state.pending_providers == ("claude",)
+    assert result.message is not None and "outcome is uncertain" in result.message
 
 
 def test_package_success_is_persisted_as_pending_before_refresh_starts(
@@ -813,11 +857,17 @@ def test_package_success_is_persisted_as_pending_before_refresh_starts(
         "installed_providers",
         lambda project: ("claude", "codex"),
     )
-    monkeypatch.setattr(
-        auto_update,
-        "install_exact_version",
-        lambda project, version: None,
-    )
+
+    def install(project: Path, version: StableVersion) -> None:
+        assert version == StableVersion(3, 26, 0)
+        assert read_update_state(project) == UpdateState(
+            last_attempt_at="2026-08-13T12:00:00Z",
+            last_observed_version="3.26.0",
+            pending_install_version="3.26.0",
+            pending_providers=("claude", "codex"),
+        )
+
+    monkeypatch.setattr(auto_update, "install_exact_version", install)
 
     def refresh(project: Path, providers: tuple[str, ...]) -> tuple[str, ...]:
         assert providers == ("claude", "codex")
@@ -837,7 +887,35 @@ def test_package_success_is_persisted_as_pending_before_refresh_starts(
     assert result.status is UpdateStatus.UPDATED
 
 
-def test_pending_state_write_failure_retains_exact_manual_recovery(
+def test_install_intent_write_failure_never_calls_package_installer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write = auto_update.write_update_state
+    installer = Mock(side_effect=AssertionError("installer must wait for intent"))
+
+    def fail_intent_write(project: Path, state: UpdateState) -> None:
+        if state.pending_install_version is not None:
+            raise OSError("intent disk full")
+        real_write(project, state)
+
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_version_targets",
+        lambda current, client: VersionTargets(StableVersion(3, 26, 0), None),
+    )
+    monkeypatch.setattr(auto_update, "installed_providers", lambda project: ("codex",))
+    monkeypatch.setattr(auto_update, "install_exact_version", installer)
+    monkeypatch.setattr(auto_update, "write_update_state", fail_intent_write)
+
+    result = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL, now=NOW)
+
+    assert result.status is UpdateStatus.ERROR
+    assert result.installed_version is None
+    assert result.message is not None and "intent disk full" in result.message
+    installer.assert_not_called()
+
+
+def test_promotion_write_failure_retains_intent_for_fresh_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_write = auto_update.write_update_state
@@ -871,16 +949,165 @@ def test_pending_state_write_failure_retains_exact_manual_recovery(
 
     result = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL, now=NOW)
 
-    assert write_calls == 2
+    assert write_calls == 3
     assert result.status is UpdateStatus.ERROR
     assert result.installed_version == "3.26.0"
     assert result.reload_current_skill is False
     assert result.message is not None
-    assert (
-        "mapify init . --force --no-git --provider codex --refresh-existing"
-        in result.message
-    )
+    assert "run map-upgrade again" in result.message
+    persisted = read_update_state(tmp_path)
+    assert persisted.pending_install_version == "3.26.0"
+    assert persisted.pending_refresh is False
+    assert persisted.pending_providers == ("codex",)
     refresh.assert_not_called()
+
+
+def test_matching_install_intent_promotes_and_refreshes_before_throttle_or_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            last_attempt_at="2026-08-13T11:00:00Z",
+            last_observed_version="3.26.0",
+            pending_install_version="3.26.0",
+            pending_providers=("codex",),
+        ),
+    )
+    fetch = Mock(side_effect=AssertionError("local recovery precedes network"))
+
+    def refresh(project: Path, providers: tuple[str, ...]) -> tuple[str, ...]:
+        assert providers == ("codex",)
+        state = read_update_state(project)
+        assert state.pending_install_version is None
+        assert state.last_installed_version == "3.26.0"
+        assert state.pending_refresh is True
+        return providers
+
+    monkeypatch.setattr(auto_update, "refresh_installed_providers", refresh)
+    monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
+
+    result = check_and_update(tmp_path, "3.26.0", UpdateMode.AUTOMATIC, now=NOW)
+
+    assert result.status is UpdateStatus.UPDATED
+    assert result.installed_version == "3.26.0"
+    assert result.refreshed_providers == ("codex",)
+    assert result.reload_current_skill is True
+    final = read_update_state(tmp_path)
+    assert final.pending_install_version is None
+    assert final.pending_refresh is False
+    assert final.pending_providers == ()
+    fetch.assert_not_called()
+
+
+def test_second_fresh_invocation_recovers_after_promotion_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_write = auto_update.write_update_state
+    fail_promotion = True
+    installs: list[str] = []
+
+    def write_with_one_crash(project: Path, state: UpdateState) -> None:
+        nonlocal fail_promotion
+        if fail_promotion and state.pending_refresh:
+            fail_promotion = False
+            raise OSError("simulated crash before promotion")
+        real_write(project, state)
+
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_version_targets",
+        lambda current, client: VersionTargets(StableVersion(3, 26, 0), None),
+    )
+    monkeypatch.setattr(auto_update, "installed_providers", lambda project: ("claude",))
+    monkeypatch.setattr(
+        auto_update,
+        "install_exact_version",
+        lambda project, version: installs.append(str(version)),
+    )
+    monkeypatch.setattr(auto_update, "write_update_state", write_with_one_crash)
+    monkeypatch.setattr(
+        auto_update,
+        "refresh_installed_providers",
+        lambda project, providers: tuple(providers),
+    )
+
+    first = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL, now=NOW)
+    assert first.status is UpdateStatus.ERROR
+    assert read_update_state(tmp_path).pending_install_version == "3.26.0"
+
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_version_targets",
+        Mock(side_effect=AssertionError("fresh recovery must not fetch")),
+    )
+    second = check_and_update(tmp_path, "3.26.0", UpdateMode.AUTOMATIC, now=NOW)
+
+    assert installs == ["3.26.0"]
+    assert second.status is UpdateStatus.UPDATED
+    assert second.refresh_complete is True
+    assert read_update_state(tmp_path).pending_refresh is False
+
+
+def test_mismatched_install_intent_respects_automatic_throttle_without_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = UpdateState(
+        last_attempt_at="2026-08-13T11:00:00Z",
+        pending_install_version="4.0.0",
+        pending_providers=("claude",),
+    )
+    write_update_state(tmp_path, original)
+    fetch = Mock(side_effect=AssertionError("throttle must precede network"))
+    install = Mock(side_effect=AssertionError("state target must never install"))
+    monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
+    monkeypatch.setattr(auto_update, "install_exact_version", install)
+
+    result = check_and_update(tmp_path, "3.25.0", UpdateMode.AUTOMATIC, now=NOW)
+
+    assert result.status is UpdateStatus.SKIPPED
+    assert read_update_state(tmp_path) == original
+    fetch.assert_not_called()
+    install.assert_not_called()
+
+
+def test_mismatched_major_intent_requires_fresh_policy_and_consent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            pending_install_version="4.0.0",
+            pending_providers=("claude",),
+        ),
+    )
+    target = StableVersion(4, 0, 0)
+    install = Mock(side_effect=AssertionError("persisted major is not consent"))
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_version_targets",
+        lambda current, client: VersionTargets(None, target),
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_release_highlights",
+        lambda version, client: ReleaseHighlights(
+            version,
+            "MAP 4",
+            "New planning engine",
+            "https://example.test/v4",
+        ),
+    )
+    monkeypatch.setattr(auto_update, "install_exact_version", install)
+
+    result = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL, now=NOW)
+
+    assert result.status is UpdateStatus.MAJOR_AVAILABLE
+    assert result.major is not None and result.major.version == target
+    state = read_update_state(tmp_path)
+    assert state.pending_install_version is None
+    assert state.pending_providers == ()
+    install.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", [UpdateMode.AUTOMATIC, UpdateMode.MANUAL])
@@ -924,6 +1151,7 @@ def test_package_success_refresh_failure_sets_exact_pending_state_and_result(
     assert result.installed_version == "3.26.0"
     assert result.refreshed_providers == ("claude",)
     assert result.reload_current_skill is True
+    assert result.refresh_complete is False
     state = read_update_state(tmp_path)
     assert state.last_installed_version == "3.26.0"
     assert state.pending_refresh is True
@@ -1267,6 +1495,7 @@ def test_lock_cleanup_failure_preserves_completed_update_progress(
     assert result.installed_version == "3.26.0"
     assert result.refreshed_providers == ("claude",)
     assert result.reload_current_skill is True
+    assert result.refresh_complete is True
     assert result.message is not None and "lock cleanup failed" in result.message
     if mode is UpdateMode.MANUAL:
         assert "Retry the manual update" in result.message
@@ -1360,6 +1589,7 @@ def test_automatic_late_highlight_failure_returns_message_free_updated_progress(
         installed_version="3.26.0",
         refreshed_providers=("claude", "codex"),
         reload_current_skill=True,
+        refresh_complete=True,
     )
     assert read_update_state(tmp_path).pending_refresh is False
 
