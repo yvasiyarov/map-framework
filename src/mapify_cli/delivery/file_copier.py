@@ -43,7 +43,9 @@ _IGNORED_TEMPLATE_SUFFIXES = {".pyc", ".pyo"}
 # not just documented. (A bare ``assert`` would be stripped under ``python -O``,
 # silently turning the guarantee into a no-op, so we raise explicitly.)
 # requires-skills is warn-only (not a skip), handled separately.
-_BLOCKING_REQUIRES_KEYS = {k for k in SKILL_REQUIREMENTS_KEYS if k != "requires-skills"}
+_BLOCKING_REQUIRES_KEYS = {
+    k for k in SKILL_REQUIREMENTS_KEYS if k != "requires-skills"
+}
 
 
 def _check_requires_cmd(name: str) -> bool:
@@ -95,9 +97,7 @@ if _BLOCKING_REQUIRES_KEYS != set(_REQUIRES_CHECKER):
     )
 
 
-def _skill_missing_dependency(
-    requires_block: dict[str, list[str]],
-) -> tuple[str, str] | None:
+def _skill_missing_dependency(requires_block: dict[str, list[str]]) -> tuple[str, str] | None:
     """Return (kind, name) of the first missing blocking dependency, or None.
 
     Checks requires-cmd, requires-pip, requires-env in that order (dict
@@ -312,9 +312,7 @@ def create_command_files(
     return 0
 
 
-def _load_template_skill_catalog(
-    skills_template_dir: Path,
-) -> dict[str, dict[str, object]]:
+def _load_template_skill_catalog(skills_template_dir: Path) -> dict[str, dict[str, object]]:
     """Parse the template skill-rules.json and return the skills dict.
 
     Returns an empty dict on any error (missing file, invalid JSON) so the
@@ -376,9 +374,7 @@ def create_skill_files(project_path: Path) -> int:
             requires_block = _extract_requires_block(skill_name, entry)
 
             # Emit WARNING for requires-skills (read-only; never a skip).
-            req_skills = (
-                entry.get("requires-skills") if isinstance(entry, dict) else None
-            )
+            req_skills = entry.get("requires-skills") if isinstance(entry, dict) else None
             if isinstance(req_skills, list) and req_skills:
                 _warn_requires_skills(skill_name, req_skills)
 
@@ -413,10 +409,7 @@ def _install_managed_tree(src_dir: Path, dest_dir: Path, version: str) -> None:
     for src in sorted(src_dir.rglob("*")):
         if not src.is_file():
             continue
-        if (
-            src.name in _IGNORED_TEMPLATE_NAMES
-            or src.suffix in _IGNORED_TEMPLATE_SUFFIXES
-        ):
+        if src.name in _IGNORED_TEMPLATE_NAMES or src.suffix in _IGNORED_TEMPLATE_SUFFIXES:
             continue
         rel = src.relative_to(src_dir)
         _install_managed_file(src, dest_dir / rel, version)
@@ -434,10 +427,7 @@ def _copy_map_path(src: Path, dest: Path, version: str) -> int:
         for child in sorted(src.rglob("*")):
             if not child.is_file():
                 continue
-            if (
-                child.name in _IGNORED_TEMPLATE_NAMES
-                or child.suffix in _IGNORED_TEMPLATE_SUFFIXES
-            ):
+            if child.name in _IGNORED_TEMPLATE_NAMES or child.suffix in _IGNORED_TEMPLATE_SUFFIXES:
                 continue
             rel = child.relative_to(src)
             count += _install_map_file(child, dest / rel, version)
@@ -956,8 +946,12 @@ def ensure_map_statusline(
     settings["statusLine"] = {"type": "command", "command": command}
 
     claude_dir.mkdir(parents=True, exist_ok=True)
-    local_settings.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    return StatuslineResult(wired=True, reason="wired", settings_path=local_settings)
+    local_settings.write_text(
+        json.dumps(settings, indent=2) + "\n", encoding="utf-8"
+    )
+    return StatuslineResult(
+        wired=True, reason="wired", settings_path=local_settings
+    )
 
 
 def create_rules_dir(
