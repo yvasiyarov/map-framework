@@ -21,6 +21,8 @@ Security invariants:
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -549,7 +551,21 @@ def write_manifest(project_path: Path, manifest: InstallManifest) -> Path:
     map_dir.mkdir(parents=True, exist_ok=True)
     dest = map_dir / MANIFEST_FILENAME
     data = asdict(manifest)
-    dest.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    fd, temp_name = tempfile.mkstemp(
+        dir=map_dir,
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            temp_file.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, dest)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
     return dest
 
 

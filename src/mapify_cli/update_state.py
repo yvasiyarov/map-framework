@@ -9,7 +9,7 @@ import stat
 import tempfile
 import time
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -130,6 +130,49 @@ def write_update_state(project_path: Path, state: UpdateState) -> None:
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
+
+
+def pending_refresh_state(
+    project_path: Path,
+    provider: str,
+) -> UpdateState | None:
+    """Return state only when it authorizes recovery for ``provider``."""
+    state = read_update_state(project_path)
+    if (
+        state.pending_refresh
+        and bool(state.last_installed_version)
+        and provider in state.pending_providers
+    ):
+        return state
+    return None
+
+
+def complete_pending_provider_refresh(
+    project_path: Path,
+    provider: str,
+) -> UpdateState:
+    """Atomically remove one successfully refreshed provider from pending state.
+
+    This transition deliberately does not acquire the project update lock: updater
+    child processes run while their parent owns that lock.
+    """
+    state = pending_refresh_state(project_path, provider)
+    if state is None:
+        raise RuntimeError(
+            f"Pending MAP refresh state no longer includes provider '{provider}'."
+        )
+    remaining = tuple(
+        pending_provider
+        for pending_provider in state.pending_providers
+        if pending_provider != provider
+    )
+    completed = replace(
+        state,
+        pending_refresh=bool(remaining),
+        pending_providers=remaining,
+    )
+    write_update_state(project_path, completed)
+    return completed
 
 
 def automatic_check_due(state: UpdateState, now: datetime) -> bool:

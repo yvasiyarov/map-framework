@@ -1320,6 +1320,50 @@ def test_failure_after_same_major_refresh_preserves_all_completed_progress(
     )
 
 
+def test_automatic_late_highlight_failure_returns_message_free_updated_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_version_targets",
+        lambda current, client: VersionTargets(
+            StableVersion(3, 26, 0),
+            StableVersion(4, 0, 0),
+        ),
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "installed_providers",
+        lambda project: ("claude", "codex"),
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "install_exact_version",
+        lambda project, version: None,
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "refresh_installed_providers",
+        lambda project, providers: ("claude", "codex"),
+    )
+    monkeypatch.setattr(
+        auto_update,
+        "fetch_release_highlights",
+        Mock(side_effect=httpx.TimeoutException("GitHub offline")),
+    )
+
+    result = check_and_update(tmp_path, "3.25.0", UpdateMode.AUTOMATIC, now=NOW)
+
+    assert result == UpdateResult(
+        UpdateStatus.UPDATED,
+        "3.25.0",
+        installed_version="3.26.0",
+        refreshed_providers=("claude", "codex"),
+        reload_current_skill=True,
+    )
+    assert read_update_state(tmp_path).pending_refresh is False
+
+
 def test_approved_major_refresh_failure_uses_the_same_durable_recovery_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

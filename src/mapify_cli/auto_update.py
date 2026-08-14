@@ -427,7 +427,23 @@ def _check_locked(
                 _install_and_refresh(project_path, progress, targets.same_major)
 
             if targets.next_major is not None:
-                highlights = fetch_release_highlights(targets.next_major, client)
+                try:
+                    highlights = fetch_release_highlights(targets.next_major, client)
+                except Exception:
+                    if (
+                        mode is UpdateMode.AUTOMATIC
+                        and progress.installed_version is not None
+                        and progress.reload_current_skill
+                        and not progress.state.pending_refresh
+                    ):
+                        return UpdateResult(
+                            UpdateStatus.UPDATED,
+                            current_version,
+                            installed_version=progress.installed_version,
+                            refreshed_providers=progress.refreshed_providers,
+                            reload_current_skill=True,
+                        )
+                    raise
                 if highlights is None:
                     return _metadata_unavailable_result(
                         mode,

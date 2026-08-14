@@ -23,9 +23,12 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -308,6 +311,78 @@ class TestVC3Idempotency:
         # actor.md was removed, so manifest2 shouldn't contain it
         dests2 = {e.dest for e in manifest2.entries}
         assert ".claude/agents/actor.md" not in dests2
+
+
+def test_write_manifest_fsyncs_a_same_directory_tempfile_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = InstallManifest(
+        mapify_version=VERSION,
+        provider="claude",
+        installed_at="2026-08-13T00:00:00Z",
+        providers=["claude"],
+    )
+    events: list[tuple[str, Path | None, Path | None]] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def recording_fsync(fd: int) -> None:
+        events.append(("fsync", None, None))
+        real_fsync(fd)
+
+    def recording_replace(source: str | Path, destination: str | Path) -> None:
+        events.append(("replace", Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(os, "replace", recording_replace)
+
+    manifest_path = write_manifest(tmp_path, manifest)
+
+    assert [event[0] for event in events] == ["fsync", "replace"]
+    _, temp_path, replacement_path = events[1]
+    assert temp_path is not None
+    assert replacement_path == manifest_path
+    assert temp_path.parent == manifest_path.parent
+    assert temp_path != manifest_path
+    assert not temp_path.exists()
+    assert read_manifest(tmp_path) == manifest
+
+
+def test_write_manifest_replace_failure_preserves_old_file_and_cleans_tempfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = InstallManifest(
+        mapify_version="3.25.0",
+        provider="claude",
+        installed_at="2026-08-13T00:00:00Z",
+        providers=["claude"],
+    )
+    replacement = InstallManifest(
+        mapify_version="3.26.0",
+        provider="claude",
+        installed_at="2026-08-14T00:00:00Z",
+        providers=["claude"],
+    )
+    manifest_path = write_manifest(tmp_path, original)
+    original_bytes = manifest_path.read_bytes()
+    replace_error = OSError("replace failed")
+
+    def fail_replace(source: str | Path, destination: str | Path) -> None:
+        del source, destination
+        raise replace_error
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError) as caught:
+        write_manifest(tmp_path, replacement)
+
+    assert caught.value is replace_error
+    assert manifest_path.read_bytes() == original_bytes
+    assert read_manifest(tmp_path) == original
+    assert list(manifest_path.parent.glob(f".{manifest_path.name}.*.tmp")) == []
 
 
 # ---------------------------------------------------------------------------

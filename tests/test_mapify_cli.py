@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -33,10 +34,26 @@ from mapify_cli import (
     read_project_mcp_json,
     write_project_mcp_json,
 )
-from mapify_cli.auto_update import UpdateMode, UpdateResult, UpdateStatus
+from mapify_cli.auto_update import (
+    UpdateMode,
+    UpdateResult,
+    UpdateStatus,
+    check_and_update,
+)
 from mapify_cli.delivery import create_map_tools
 from mapify_cli.install_manifest import read_manifest
-from mapify_cli.update_versions import ReleaseHighlights, StableVersion
+from mapify_cli.update_install import InstallKind, ProjectRefreshError
+from mapify_cli.update_state import (
+    UpdateState,
+    project_update_lock,
+    read_update_state,
+    write_update_state,
+)
+from mapify_cli.update_versions import (
+    ReleaseHighlights,
+    StableVersion,
+    VersionTargets,
+)
 
 runner = CliRunner()
 
@@ -1137,6 +1154,281 @@ class TestRefreshExistingInit:
         assert "existing install manifest" in refresh.stdout
         assert _snapshot_tree(tmp_path) == before
 
+    @pytest.mark.parametrize(
+        "manifest_content",
+        [
+            "{malformed",
+            "[]\n",
+            json.dumps(
+                {
+                    "mapify_version": "3.25.0",
+                    "provider": "claude",
+                    "installed_at": "2026-08-13T00:00:00Z",
+                    "entries": {},
+                }
+            ),
+        ],
+        ids=["malformed", "non-object", "schema-invalid"],
+    )
+    def test_pending_refresh_invalid_manifest_is_regenerated_under_parent_lock(
+        self,
+        tmp_path: Path,
+        manifest_content: str,
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        config_path = tmp_path / ".map" / "config.yaml"
+        config_before = config_path.read_bytes()
+        catalog_before = {
+            path.name
+            for path in (tmp_path / ".claude" / "skills").iterdir()
+            if path.is_dir()
+        }
+        manifest_path = tmp_path / ".map" / "mapify.lock.json"
+        manifest_path.write_text(manifest_content, encoding="utf-8")
+        write_update_state(
+            tmp_path,
+            UpdateState(
+                last_installed_version=mapify_cli.__version__,
+                pending_refresh=True,
+                pending_providers=("claude",),
+            ),
+        )
+
+        with project_update_lock(tmp_path, timeout_s=0.0):
+            refresh = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--provider",
+                    "claude",
+                    "--refresh-existing",
+                ],
+            )
+
+        assert refresh.exit_code == 0, refresh.stdout
+        assert config_path.read_bytes() == config_before
+        assert {
+            path.name
+            for path in (tmp_path / ".claude" / "skills").iterdir()
+            if path.is_dir()
+        } == catalog_before
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert isinstance(raw_manifest, dict)
+        manifest = read_manifest(tmp_path)
+        assert manifest is not None
+        assert manifest.providers == ["claude"]
+        state = read_update_state(tmp_path)
+        assert state.last_installed_version == mapify_cli.__version__
+        assert state.pending_refresh is False
+        assert state.pending_providers == ()
+        assert list(manifest_path.parent.glob(f".{manifest_path.name}.*.tmp")) == []
+
+    def test_pending_refresh_does_not_bypass_unreadable_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        manifest_path = tmp_path / ".map" / "mapify.lock.json"
+        manifest_before = manifest_path.read_bytes()
+        pending_state = UpdateState(
+            last_installed_version=mapify_cli.__version__,
+            pending_refresh=True,
+            pending_providers=("claude",),
+        )
+        write_update_state(tmp_path, pending_state)
+        original_read_text = Path.read_text
+
+        def deny_manifest_read(path: Path, *args: object, **kwargs: object) -> str:
+            if path == manifest_path:
+                raise PermissionError("manifest unreadable")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", deny_manifest_read)
+
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert refresh.exit_code == 1
+        assert "existing install manifest" in refresh.stdout
+        assert manifest_path.read_bytes() == manifest_before
+        assert read_update_state(tmp_path) == pending_state
+
+    def test_pending_dual_provider_refresh_narrows_then_clears_state(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        claude = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                "claude",
+            ],
+        )
+        codex = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--provider", "codex"],
+        )
+        assert claude.exit_code == 0, claude.stdout
+        assert codex.exit_code == 0, codex.stdout
+        config_path = tmp_path / ".map" / "config.yaml"
+        config_before = config_path.read_bytes()
+        claude_catalog = {
+            path.name
+            for path in (tmp_path / ".claude" / "skills").iterdir()
+            if path.is_dir()
+        }
+        codex_catalog = {
+            path.name
+            for path in (tmp_path / ".agents" / "skills").iterdir()
+            if path.is_dir()
+        }
+        manifest_path = tmp_path / ".map" / "mapify.lock.json"
+        manifest_path.write_text("{malformed", encoding="utf-8")
+        write_update_state(
+            tmp_path,
+            UpdateState(
+                last_installed_version=mapify_cli.__version__,
+                pending_refresh=True,
+                pending_providers=("claude", "codex"),
+            ),
+        )
+
+        first_refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert first_refresh.exit_code == 0, first_refresh.stdout
+        first_state = read_update_state(tmp_path)
+        assert first_state.pending_refresh is True
+        assert first_state.pending_providers == ("codex",)
+        first_manifest = read_manifest(tmp_path)
+        assert first_manifest is not None
+        assert first_manifest.providers == ["claude", "codex"]
+
+        second_refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "codex",
+                "--refresh-existing",
+            ],
+        )
+
+        assert second_refresh.exit_code == 0, second_refresh.stdout
+        completed_state = read_update_state(tmp_path)
+        assert completed_state.pending_refresh is False
+        assert completed_state.pending_providers == ()
+        assert config_path.read_bytes() == config_before
+        assert {
+            path.name
+            for path in (tmp_path / ".claude" / "skills").iterdir()
+            if path.is_dir()
+        } == claude_catalog
+        assert {
+            path.name
+            for path in (tmp_path / ".agents" / "skills").iterdir()
+            if path.is_dir()
+        } == codex_catalog
+        completed_manifest = read_manifest(tmp_path)
+        assert completed_manifest is not None
+        assert completed_manifest.providers == ["claude", "codex"]
+
+    def test_manual_recovery_action_rebuilds_corrupt_manifest_and_is_terminal(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        first = runner.invoke(
+            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+        )
+        assert first.exit_code == 0, first.stdout
+        manifest_path = tmp_path / ".map" / "mapify.lock.json"
+        manifest_path.write_text("{malformed", encoding="utf-8")
+        write_update_state(
+            tmp_path,
+            UpdateState(
+                last_installed_version=mapify_cli.__version__,
+                pending_refresh=True,
+                pending_providers=("claude",),
+            ),
+        )
+        refresh_error = ProjectRefreshError(
+            "refresh failed",
+            pending_providers=("claude",),
+        )
+        with (
+            mock.patch(
+                "mapify_cli.auto_update.detect_install_kind",
+                return_value=InstallKind.PIP,
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.refresh_installed_providers",
+                side_effect=refresh_error,
+            ),
+        ):
+            update_result = check_and_update(
+                tmp_path,
+                mapify_cli.__version__,
+                UpdateMode.MANUAL,
+            )
+
+        assert update_result.status is UpdateStatus.ERROR
+        assert update_result.message is not None
+        action = update_result.message.splitlines()[-1]
+        assert action == (
+            "mapify init . --force --no-git --provider claude --refresh-existing"
+        )
+
+        command = shlex.split(action)
+        assert command[:2] == ["mapify", "init"]
+        recovery = runner.invoke(app, command[1:])
+
+        assert recovery.exit_code == 0, recovery.stdout
+        recovered_manifest = read_manifest(tmp_path)
+        assert recovered_manifest is not None
+        assert recovered_manifest.providers == ["claude"]
+        recovered_state = read_update_state(tmp_path)
+        assert recovered_state.pending_refresh is False
+        assert recovered_state.pending_providers == ()
+
     def test_refresh_existing_unreadable_manifest_is_fatal_and_non_mutating(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1672,6 +1964,51 @@ class TestInternalUpdateCommand:
         assert result.stdout == ""
         assert result.stderr == ""
         assert result.output == ""
+
+    def test_internal_update_automatic_late_metadata_failure_emits_updated_json(
+        self, tmp_path: Path
+    ) -> None:
+        with (
+            mock.patch(
+                "mapify_cli.auto_update.detect_install_kind",
+                return_value=InstallKind.PIP,
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.fetch_version_targets",
+                return_value=VersionTargets(
+                    StableVersion(3, 26, 0),
+                    StableVersion(4, 0, 0),
+                ),
+            ),
+            mock.patch("mapify_cli.auto_update.install_exact_version"),
+            mock.patch(
+                "mapify_cli.auto_update.installed_providers",
+                return_value=("claude", "codex"),
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.refresh_installed_providers",
+                return_value=("claude", "codex"),
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.fetch_release_highlights",
+                side_effect=OSError("GitHub offline"),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        assert json.loads(result.stdout) == {
+            "status": "updated",
+            "current_version": "3.25.0",
+            "installed_version": "3.26.0",
+            "refreshed_providers": ["claude", "codex"],
+            "reload_current_skill": True,
+        }
 
     @mock.patch("mapify_cli.auto_update.check_and_update")
     def test_internal_update_automatic_unexpected_exception_is_silent_success(

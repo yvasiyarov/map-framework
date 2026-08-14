@@ -781,6 +781,10 @@ def _read_refresh_mcp_config(project_path: Path) -> dict[str, Any] | None:
     return data
 
 
+class _InvalidRefreshManifest(RuntimeError):
+    """Existing manifest content does not match the generated schema."""
+
+
 def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
     """Strictly parse an existing install manifest before refresh mutations."""
     from mapify_cli.install_manifest import (
@@ -795,18 +799,28 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
     if not manifest_path.exists():
         return None
     try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw_manifest = manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
         raise RuntimeError(f"Could not read existing install manifest: {exc}") from exc
+    except UnicodeError as exc:
+        raise _InvalidRefreshManifest(
+            f"Could not read existing install manifest: {exc}"
+        ) from exc
+    try:
+        data = json.loads(raw_manifest)
+    except json.JSONDecodeError as exc:
+        raise _InvalidRefreshManifest(
+            f"Could not read existing install manifest: {exc}"
+        ) from exc
     if not isinstance(data, dict):
-        raise RuntimeError(
+        raise _InvalidRefreshManifest(
             "Could not read existing install manifest: expected a JSON object"
         )
 
     def require_string(record: dict[str, Any], field: str, label: str) -> str:
         value = record.get(field)
         if not isinstance(value, str):
-            raise RuntimeError(
+            raise _InvalidRefreshManifest(
                 "Could not read existing install manifest: "
                 f"{label}.{field} must be a string"
             )
@@ -818,7 +832,7 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
 
     raw_entries = data.get("entries")
     if not isinstance(raw_entries, list):
-        raise RuntimeError(
+        raise _InvalidRefreshManifest(
             "Could not read existing install manifest: entries must be a JSON array"
         )
     entry_fields = {
@@ -834,19 +848,19 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
     for index, raw_entry in enumerate(raw_entries):
         label = f"entries[{index}]"
         if not isinstance(raw_entry, dict) or set(raw_entry) != entry_fields:
-            raise RuntimeError(
+            raise _InvalidRefreshManifest(
                 "Could not read existing install manifest: "
                 f"{label} does not match the manifest-entry schema"
             )
         for field in entry_fields - {"committed"}:
             require_string(raw_entry, field, label)
         if not isinstance(raw_entry["committed"], bool):
-            raise RuntimeError(
+            raise _InvalidRefreshManifest(
                 "Could not read existing install manifest: "
                 f"{label}.committed must be a boolean"
             )
         if raw_entry["management_mode"] not in {"fenced", "full", "hooks-merge"}:
-            raise RuntimeError(
+            raise _InvalidRefreshManifest(
                 "Could not read existing install manifest: "
                 f"{label}.management_mode is invalid"
             )
@@ -854,7 +868,7 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
 
     raw_config_entries = data.get("config_entries", [])
     if not isinstance(raw_config_entries, list):
-        raise RuntimeError(
+        raise _InvalidRefreshManifest(
             "Could not read existing install manifest: "
             "config_entries must be a JSON array"
         )
@@ -863,7 +877,7 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
     for index, raw_entry in enumerate(raw_config_entries):
         label = f"config_entries[{index}]"
         if not isinstance(raw_entry, dict) or set(raw_entry) != config_fields:
-            raise RuntimeError(
+            raise _InvalidRefreshManifest(
                 "Could not read existing install manifest: "
                 f"{label} does not match the config-entry schema"
             )
@@ -874,7 +888,7 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
     legacy_providers = legacy_provider.split("+")
     normalized_legacy = normalize_providers(legacy_providers)
     if not normalized_legacy or len(normalized_legacy) != len(legacy_providers):
-        raise RuntimeError(
+        raise _InvalidRefreshManifest(
             "Could not read existing install manifest: provider is invalid"
         )
 
@@ -884,14 +898,14 @@ def _read_refresh_manifest(project_path: Path) -> "InstallManifest | None":
     elif not isinstance(raw_providers, list) or not all(
         isinstance(name, str) for name in raw_providers
     ):
-        raise RuntimeError(
+        raise _InvalidRefreshManifest(
             "Could not read existing install manifest: providers must be a JSON "
             "array of strings"
         )
     else:
         providers = normalize_providers(raw_providers)
         if providers != raw_providers or providers != normalized_legacy:
-            raise RuntimeError(
+            raise _InvalidRefreshManifest(
                 "Could not read existing install manifest: providers are invalid"
             )
 
@@ -1181,8 +1195,10 @@ def init(
 
     effective_agent_memory = agent_memory
     refresh_mcp_servers: list[str] | None = None
+    pending_update_refresh = False
     if refresh_existing:
         from mapify_cli.update_install import installed_providers
+        from mapify_cli.update_state import pending_refresh_state
 
         existing_providers = installed_providers(project_path)
         if (
@@ -1200,8 +1216,16 @@ def init(
                 "not an installed provider in the current MAP project."
             )
             raise typer.Exit(1)
+        pending_update_refresh = (
+            pending_refresh_state(project_path, provider) is not None
+        )
         try:
-            refresh_manifest = _read_refresh_manifest(project_path)
+            try:
+                refresh_manifest = _read_refresh_manifest(project_path)
+            except _InvalidRefreshManifest:
+                if not pending_update_refresh:
+                    raise
+                refresh_manifest = None
             refresh_mcp_config = _read_refresh_mcp_config(project_path)
             effective_agent_memory = _load_refresh_agent_memory(project_path)
             if provider != "codex":
@@ -1458,6 +1482,18 @@ def init(
                 f"{_manifest_exc}"
             )
             raise typer.Exit(1) from _manifest_exc
+
+    if pending_update_refresh:
+        try:
+            from mapify_cli.update_state import complete_pending_provider_refresh
+
+            complete_pending_provider_refresh(project_path, provider)
+        except Exception as _state_exc:
+            console.print(
+                "[red]Error:[/red] Failed to complete pending provider refresh "
+                f"state: {_state_exc}"
+            )
+            raise typer.Exit(1) from _state_exc
 
     tracker.add("finalize", "Finalize")
     tracker.complete("finalize", "project ready")

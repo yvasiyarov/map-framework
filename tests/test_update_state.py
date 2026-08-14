@@ -128,6 +128,80 @@ def test_missing_state_is_a_default_cache_miss(tmp_path: Path) -> None:
     assert read_update_state(tmp_path) == UpdateState()
 
 
+def test_pending_refresh_state_requires_flag_version_and_provider_membership(
+    tmp_path: Path,
+) -> None:
+    pending_refresh_state = getattr(
+        update_state_module,
+        "pending_refresh_state",
+        None,
+    )
+    assert callable(pending_refresh_state), (
+        "pending provider recovery needs an explicit validated-state boundary"
+    )
+    valid = UpdateState(
+        last_installed_version="3.26.0",
+        pending_refresh=True,
+        pending_providers=("claude",),
+    )
+    write_update_state(tmp_path, valid)
+    assert pending_refresh_state(tmp_path, "claude") == valid
+
+    invalid_states = (
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=False,
+            pending_providers=("claude",),
+        ),
+        UpdateState(
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("codex",),
+        ),
+    )
+    for state in invalid_states:
+        write_update_state(tmp_path, state)
+        assert pending_refresh_state(tmp_path, "claude") is None
+
+
+def test_complete_pending_provider_refresh_narrows_then_clears_state(
+    tmp_path: Path,
+) -> None:
+    complete_pending_provider_refresh = getattr(
+        update_state_module,
+        "complete_pending_provider_refresh",
+        None,
+    )
+    assert callable(complete_pending_provider_refresh), (
+        "successful standalone recovery needs a provider completion transition"
+    )
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude", "codex"),
+        ),
+    )
+
+    narrowed = complete_pending_provider_refresh(tmp_path, "claude")
+
+    assert narrowed.pending_refresh is True
+    assert narrowed.pending_providers == ("codex",)
+    assert read_update_state(tmp_path) == narrowed
+
+    completed = complete_pending_provider_refresh(tmp_path, "codex")
+
+    assert completed.pending_refresh is False
+    assert completed.pending_providers == ()
+    assert completed.last_installed_version == "3.26.0"
+    assert read_update_state(tmp_path) == completed
+
+
 @pytest.mark.parametrize(
     ("last_attempt_at", "expected"),
     [
