@@ -218,6 +218,23 @@ CODEX_AUTO_UPDATE_SKILLS = {
     "map-review",
     "map-understand",
 }
+RENDERED_AUTO_UPDATE_SKILL_ROOTS = [
+    (Path(".claude/skills"), CLAUDE_AUTO_UPDATE_SKILLS),
+    (Path(".agents/skills"), CODEX_AUTO_UPDATE_SKILLS),
+    (Path("src/mapify_cli/templates/skills"), CLAUDE_AUTO_UPDATE_SKILLS),
+    (Path("src/mapify_cli/templates/codex/skills"), CODEX_AUTO_UPDATE_SKILLS),
+]
+
+
+def _assert_rendered_preflight_placement(content: str, label: str) -> None:
+    """Assert that a rendered normal skill starts with exactly one preflight."""
+    _frontmatter, separator, body = content.partition("\n---\n")
+    assert separator, f"{label} has no closing frontmatter"
+    assert body.startswith("## MAP update preflight\n"), (
+        f"{label} must render the update preflight immediately after "
+        "closing frontmatter"
+    )
+    assert content.count("mapify _update --mode automatic --project .") == 1, label
 
 
 def _json_output_contract_contexts(content: str) -> list[tuple[int, str]]:
@@ -302,12 +319,9 @@ class TestProviderUpdateSkills:
 
     @pytest.mark.parametrize(
         ("relative_root", "expected_skills"),
-        [
-            (Path(".claude/skills"), CLAUDE_AUTO_UPDATE_SKILLS),
-            (Path(".agents/skills"), CODEX_AUTO_UPDATE_SKILLS),
-        ],
+        RENDERED_AUTO_UPDATE_SKILL_ROOTS,
     )
-    def test_every_rendered_normal_map_skill_has_exactly_one_update_preflight(
+    def test_every_rendered_normal_map_skill_starts_with_exactly_one_update_preflight(
         self,
         project_root: Path,
         relative_root: Path,
@@ -321,17 +335,32 @@ class TestProviderUpdateSkills:
         }
         assert set(skills) == expected_skills
 
-        for skill_name, skill in skills.items():
+        for skill in skills.values():
             content = skill.read_text(encoding="utf-8")
-            assert (
-                content.count("mapify _update --mode automatic --project .") == 1
-            ), skill_name
+            _assert_rendered_preflight_placement(content, str(skill))
             assert "Never report automatic updater errors." in content
             assert "untrusted quoted release notes" in content
             assert (
                 "mapify _update --mode manual --project . --approve-major "
                 "<validated major.version>"
             ) in content
+
+    def test_rendered_preflight_placement_guard_rejects_moved_heading(self) -> None:
+        misplaced = (
+            "---\n"
+            "name: map-check\n"
+            "description: fixture\n"
+            "---\n"
+            "# Map check body started first\n\n"
+            "## MAP update preflight\n\n"
+            "Run `mapify _update --mode automatic --project .`.\n"
+        )
+
+        with pytest.raises(
+            AssertionError,
+            match="must render the update preflight immediately after closing frontmatter",
+        ):
+            _assert_rendered_preflight_placement(misplaced, "misplaced fixture")
 
     def test_map_upgrade_sources_are_frontmatter_plus_shared_manual_include(
         self, project_root: Path
