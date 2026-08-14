@@ -182,6 +182,33 @@ class TestGitOperations:
 class TestInitCommand:
     """Test the init command."""
 
+    @pytest.mark.parametrize("provider", ["claude", "codex"])
+    def test_init_installs_manual_upgrade_and_default_auto_config(
+        self, tmp_path: Path, provider: str
+    ) -> None:
+        os.chdir(tmp_path)
+        args = [
+            "init",
+            ".",
+            "--force",
+            "--no-git",
+            "--mcp",
+            "none",
+            "--provider",
+            provider,
+        ]
+
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 0, result.stdout
+        assert "updates.auto: true" in (
+            tmp_path / ".map" / "config.yaml"
+        ).read_text(encoding="utf-8")
+        skill_root = tmp_path / (
+            ".claude/skills" if provider == "claude" else ".agents/skills"
+        )
+        assert (skill_root / "map-upgrade" / "SKILL.md").is_file()
+
     def test_init_no_auto_update_persists_false(self, tmp_path: Path) -> None:
         os.chdir(tmp_path)
         result = runner.invoke(
@@ -435,9 +462,6 @@ class TestInitCommand:
         assert "sequential-thinking" in mcp_config["mcp_servers"]
         assert "deepwiki" not in mcp_config["mcp_servers"]
 
-    @pytest.mark.skip(
-        reason="Test isolation issue: passes in isolation but fails in full suite after 332 tests due to stdin/stdout state. TODO: Investigate and fix test infrastructure issue."
-    )
     def test_init_defaults_to_all_mcp_servers(self, tmp_path, monkeypatch):
         """Test that init without --mcp flag defaults to installing all MCP servers.
 
@@ -648,6 +672,54 @@ class TestRefreshExistingInit:
         assert second.exit_code == 0, second.stdout
         assert refresh.exit_code == 0, refresh.stdout
         assert not (tmp_path / ".mcp.json").exists()
+        manifest = read_manifest(tmp_path)
+        assert manifest is not None
+        assert manifest.providers == ["claude", "codex"]
+
+    def test_dual_provider_refresh_smoke_retains_both_skill_catalogs(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+
+        first = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                "claude",
+            ],
+        )
+        second = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--provider", "codex"],
+        )
+        refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert first.exit_code == 0, first.stdout
+        assert second.exit_code == 0, second.stdout
+        assert refresh.exit_code == 0, refresh.stdout
+        assert (
+            tmp_path / ".claude" / "skills" / "map-upgrade" / "SKILL.md"
+        ).is_file()
+        assert (
+            tmp_path / ".agents" / "skills" / "map-upgrade" / "SKILL.md"
+        ).is_file()
         manifest = read_manifest(tmp_path)
         assert manifest is not None
         assert manifest.providers == ["claude", "codex"]

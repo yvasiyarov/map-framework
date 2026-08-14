@@ -1277,13 +1277,13 @@ class TestPromptToneCalibration:
         return Path(__file__).parent.parent
 
     @pytest.mark.parametrize("skills_root", PROMPT_TONE_SKILL_ROOTS)
-    @pytest.mark.parametrize("skill_name", sorted(WORKFLOW_EFFORT_PROFILES))
+    @pytest.mark.parametrize(
+        "skill_name",
+        sorted(set(WORKFLOW_EFFORT_PROFILES) - PROMPT_TONE_EXEMPT_SKILLS),
+    )
     def test_non_release_skills_avoid_blanket_prohibition_blocks(
         self, project_root, skill_name, skills_root
     ):
-        if skill_name in PROMPT_TONE_EXEMPT_SKILLS:
-            pytest.skip("Release keeps explicit hard-stop language for tag/PyPI safety")
-
         skill_md = project_root / skills_root / skill_name / "SKILL.md"
         content = skill_md.read_text(encoding="utf-8")
 

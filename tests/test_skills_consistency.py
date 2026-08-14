@@ -136,6 +136,33 @@ SCANNABLE_KEYS: tuple[str, ...] = tuple(
     k for k in SKILL_REQUIREMENTS_KEYS if k != "requires-skills"
 )
 
+EXPECTED_SKILL_NAMES: frozenset[str] = frozenset(
+    {
+        "map-architecture",
+        "map-check",
+        "map-debug",
+        "map-efficient",
+        "map-explain",
+        "map-fast",
+        "map-learn",
+        "map-memory-now",
+        "map-plan",
+        "map-prd-review",
+        "map-release",
+        "map-resume",
+        "map-review",
+        "map-skill-eval",
+        "map-so-search",
+        "map-state",
+        "map-task",
+        "map-tdd",
+        "map-tokenreport",
+        "map-understand",
+        "map-upgrade",
+        "map-wayfind",
+    }
+)
+
 # Command-position regex: first word after start-of-line, ;, |, &&, ||, (, {
 _CMD_POSITION_RE = re.compile(
     r"(?:^|[;|{(&]|&&|\|\|)\s*([A-Za-z0-9_./-]+)",
@@ -477,15 +504,8 @@ def detect_skill_deps(skill_dir: Path) -> dict[str, set[str]]:
 
 
 def test_skill_discovery_non_empty(skill_names: list[str]) -> None:
-    """Guard: skill-rules.json must list exactly 21 skills (prevents vacuous pass).
-
-    21 = the 16 core MAP skills + map-so-search + map-understand + map-wayfind
-         + map-architecture (#363) + map-prd-review (#413).
-    """
-    assert len(skill_names) == 21, (
-        f"Expected 21 skills in skill-rules.json, found {len(skill_names)}: "
-        f"{sorted(skill_names)}"
-    )
+    """Guard: skill-rules.json must list the complete shipped skill catalog."""
+    assert set(skill_names) == EXPECTED_SKILL_NAMES
 
 
 # ---------------------------------------------------------------------------
