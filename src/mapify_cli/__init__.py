@@ -1398,7 +1398,14 @@ def init(
     )
 
     try:
-        merge_update_runtime_gitignore(project_path)
+        merge_update_runtime_gitignore(
+            project_path,
+            sofa=sofa,
+            agent_memory_local=(
+                provider != "codex" and effective_agent_memory == "local"
+            ),
+            settings_local=(provider != "codex" and autonomy is True),
+        )
     except UpdateRuntimeGitignoreSecurityError as exc:
         console.print(
             "[red]Error:[/red] unsafe project .gitignore was rejected. "
@@ -1411,6 +1418,17 @@ def init(
             f"automatic-update runtime files: {exc}"
         )
         raise typer.Exit(1) from exc
+
+    def require_feature_gitignore(merger: Any, feature: str) -> None:
+        """Revalidate a requested privacy block immediately before enablement."""
+        try:
+            merger(project_path)
+        except Exception as exc:
+            console.print(
+                f"[red]Error:[/red] Failed to secure {feature} in the project "
+                f".gitignore before enabling it: {exc}"
+            )
+            raise typer.Exit(1) from exc
 
     if provider == "codex":
         # Codex provider: install .agents/.codex files + .map/scripts/ (skip-if-exists)
@@ -1449,10 +1467,10 @@ def init(
                 _apply_verified_auto_update_override(config_path, auto_update)
                 auto_update_persisted = True
             if sofa:
-                apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
 
-                merge_sofa_gitignore(project_path)
+                require_feature_gitignore(merge_sofa_gitignore, "SOFA credentials")
+                apply_sofa_overrides(config_path)
             if effective_agent_memory != "off":
                 apply_agent_memory_overrides(config_path, effective_agent_memory)
             tracker.complete("map-config", str(config_path.relative_to(project_path)))
@@ -1523,20 +1541,23 @@ def init(
                 _apply_verified_auto_update_override(config_path, auto_update)
                 auto_update_persisted = True
             if sofa:
-                apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
 
-                merge_sofa_gitignore(project_path)
+                require_feature_gitignore(merge_sofa_gitignore, "SOFA credentials")
+                apply_sofa_overrides(config_path)
             if effective_agent_memory != "off":
-                apply_agent_memory_overrides(config_path, effective_agent_memory)
                 from mapify_cli.delivery.file_copier import (
                     apply_reflector_memory_field,
                     merge_agent_memory_gitignore,
                 )
 
-                apply_reflector_memory_field(project_path, effective_agent_memory)
                 if effective_agent_memory == "local":
-                    merge_agent_memory_gitignore(project_path)
+                    require_feature_gitignore(
+                        merge_agent_memory_gitignore,
+                        "user-local agent memory",
+                    )
+                apply_agent_memory_overrides(config_path, effective_agent_memory)
+                apply_reflector_memory_field(project_path, effective_agent_memory)
             tracker.complete("map-config", str(config_path.relative_to(project_path)))
         except typer.Exit:
             raise
@@ -1571,7 +1592,15 @@ def init(
 
         tracker.add("project-permissions", "Configure project approvals")
         tracker.start("project-permissions")
-        create_or_merge_project_settings_local(project_path, autonomy=autonomy)
+        try:
+            create_or_merge_project_settings_local(project_path, autonomy=autonomy)
+        except Exception as exc:
+            tracker.error("project-permissions", f"failed: {exc}")
+            console.print(
+                "[red]Error:[/red] Failed to configure project-local approvals "
+                f"safely: {exc}"
+            )
+            raise typer.Exit(1) from exc
         tracker.complete("project-permissions", ".claude/settings.local.json")
 
     # Initialize git (shared, provider-agnostic)

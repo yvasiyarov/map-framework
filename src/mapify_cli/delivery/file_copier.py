@@ -469,6 +469,19 @@ _SOFA_GITIGNORE_BLOCK = (
     ".sofa/\n"
 )
 
+_AGENT_MEMORY_LOCAL_GITIGNORE_MARKER = "# map:agent-memory-local"
+_AGENT_MEMORY_LOCAL_GITIGNORE_BLOCK = (
+    "# map:agent-memory-local — user-local agent memory (opt-in); never commit.\n"
+    ".claude/agent-memory-local/\n"
+)
+
+_SETTINGS_LOCAL_GITIGNORE_MARKER = "# map:settings-local"
+_SETTINGS_LOCAL_GITIGNORE_BLOCK = (
+    "# map:settings-local — per-user Claude Code approvals / autonomy posture; "
+    "never commit\n"
+    ".claude/settings.local.json\n"
+)
+
 
 _UPDATE_RUNTIME_GITIGNORE_MARKER = (
     "# map:update-runtime — local automatic-update state; never commit."
@@ -589,31 +602,90 @@ def _atomic_replace_gitignore(
             pass
 
 
-def merge_update_runtime_gitignore(project_path: Path) -> int:
-    """Atomically ignore project-local update files without following links."""
+def _merge_project_gitignore(
+    project_path: Path,
+    *,
+    include_runtime: bool = False,
+    include_sofa: bool = False,
+    include_agent_memory_local: bool = False,
+    include_settings_local: bool = False,
+) -> int:
+    """Safely and atomically append selected MAP-owned ignore blocks."""
     project_root = project_path.resolve(strict=True)
     if not project_root.is_dir():
         raise NotADirectoryError(f"MAP project root is not a directory: {project_root}")
     gitignore = project_root / ".gitignore"
     existing, original = _read_safe_gitignore(gitignore)
     ignored_lines = {line.strip() for line in existing.splitlines()}
-    missing = [
-        path.encode()
-        for path in _UPDATE_RUNTIME_GITIGNORE_PATHS
-        if path.encode() not in ignored_lines
-    ]
-    if not missing:
-        return 0
 
     additions: list[bytes] = []
-    marker = _UPDATE_RUNTIME_GITIGNORE_MARKER.encode()
-    if marker not in ignored_lines:
-        additions.append(marker)
-    additions.extend(missing)
+    if include_runtime:
+        missing_runtime_paths = [
+            path.encode()
+            for path in _UPDATE_RUNTIME_GITIGNORE_PATHS
+            if path.encode() not in ignored_lines
+        ]
+        if missing_runtime_paths:
+            runtime_lines: list[bytes] = []
+            marker = _UPDATE_RUNTIME_GITIGNORE_MARKER.encode()
+            if marker not in ignored_lines:
+                runtime_lines.append(marker)
+            runtime_lines.extend(missing_runtime_paths)
+            additions.append(b"\n".join(runtime_lines) + b"\n")
+
+    def append_optional_block(
+        *, marker: str, required_line: str, block: str, enabled: bool
+    ) -> None:
+        if not enabled:
+            return
+        if marker.encode() in existing or required_line.encode() in ignored_lines:
+            return
+        additions.append(block.encode())
+
+    # Preserve each legacy feature's OR-idempotency contract: an existing MAP
+    # marker OR an already-active exact ignore line suppresses the whole block.
+    append_optional_block(
+        marker=_SOFA_GITIGNORE_MARKER,
+        required_line=".sofa/",
+        block=_SOFA_GITIGNORE_BLOCK,
+        enabled=include_sofa,
+    )
+    append_optional_block(
+        marker=_AGENT_MEMORY_LOCAL_GITIGNORE_MARKER,
+        required_line=".claude/agent-memory-local/",
+        block=_AGENT_MEMORY_LOCAL_GITIGNORE_BLOCK,
+        enabled=include_agent_memory_local,
+    )
+    append_optional_block(
+        marker=_SETTINGS_LOCAL_GITIGNORE_MARKER,
+        required_line=".claude/settings.local.json",
+        block=_SETTINGS_LOCAL_GITIGNORE_BLOCK,
+        enabled=include_settings_local,
+    )
+
+    if not additions:
+        return 0
     separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
-    replacement = existing + separator + b"\n".join(additions) + b"\n"
+    replacement = existing + separator + b"".join(additions)
     _atomic_replace_gitignore(gitignore, replacement, original)
     return 1
+
+
+def merge_update_runtime_gitignore(
+    project_path: Path,
+    *,
+    sofa: bool = False,
+    agent_memory_local: bool = False,
+    settings_local: bool = False,
+) -> int:
+    """Atomically establish runtime and requested privacy ignore entries."""
+    return _merge_project_gitignore(
+        project_path,
+        include_runtime=True,
+        include_sofa=sofa,
+        include_agent_memory_local=agent_memory_local,
+        include_settings_local=settings_local,
+    )
 
 
 def merge_sofa_gitignore(project_path: Path) -> int:
@@ -623,35 +695,7 @@ def merge_sofa_gitignore(project_path: Path) -> int:
     Returns 1 when the file was created or modified, 0 when already up-to-date
     (no-op / idempotent).
     """
-    gitignore = project_path / ".gitignore"
-
-    if not gitignore.exists():
-        gitignore.write_text(_SOFA_GITIGNORE_BLOCK)
-        return 1
-
-    existing = gitignore.read_text()
-
-    # Idempotency: skip if our marker OR an active `.sofa/` line is already
-    # present. The OR is deliberate (not AND): if the user already ignores
-    # `.sofa/` without our marker, appending the block would create a duplicate
-    # entry. Skipping on either signal keeps `.sofa/` present exactly once. The
-    # stripped-line-set check is symmetric with ensure_sofa_gitignore in the
-    # shipped sofa_client.py (avoids false matches on comments/path fragments).
-    ignored_lines = {line.strip() for line in existing.splitlines()}
-    if _SOFA_GITIGNORE_MARKER in existing or ".sofa/" in ignored_lines:
-        return 0
-
-    # Append with a separating newline if the file does not end with one.
-    separator = "" if existing.endswith("\n") else "\n"
-    gitignore.write_text(existing + separator + _SOFA_GITIGNORE_BLOCK)
-    return 1
-
-
-_AGENT_MEMORY_LOCAL_GITIGNORE_MARKER = "# map:agent-memory-local"
-_AGENT_MEMORY_LOCAL_GITIGNORE_BLOCK = (
-    "# map:agent-memory-local — user-local agent memory (opt-in); never commit.\n"
-    ".claude/agent-memory-local/\n"
-)
+    return _merge_project_gitignore(project_path, include_sofa=True)
 
 
 def merge_agent_memory_gitignore(project_path: Path) -> int:
@@ -663,26 +707,12 @@ def merge_agent_memory_gitignore(project_path: Path) -> int:
 
     Returns 1 when the file was created or modified, 0 when already up-to-date.
     """
-    gitignore = project_path / ".gitignore"
+    return _merge_project_gitignore(project_path, include_agent_memory_local=True)
 
-    if not gitignore.exists():
-        gitignore.write_text(_AGENT_MEMORY_LOCAL_GITIGNORE_BLOCK)
-        return 1
 
-    existing = gitignore.read_text()
-
-    # OR-not-AND idempotency guard: skip if our marker OR the exact path is
-    # already present (prevents duplicates when user already has the line).
-    ignored_lines = {line.strip() for line in existing.splitlines()}
-    if (
-        _AGENT_MEMORY_LOCAL_GITIGNORE_MARKER in existing
-        or ".claude/agent-memory-local/" in ignored_lines
-    ):
-        return 0
-
-    separator = "" if existing.endswith("\n") else "\n"
-    gitignore.write_text(existing + separator + _AGENT_MEMORY_LOCAL_GITIGNORE_BLOCK)
-    return 1
+def merge_settings_local_gitignore(project_path: Path) -> int:
+    """Safely ignore the user-local Claude settings file for autonomy mode."""
+    return _merge_project_gitignore(project_path, include_settings_local=True)
 
 
 def apply_reflector_memory_field(project_path: Path, level: str) -> int:

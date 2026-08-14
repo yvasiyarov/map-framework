@@ -393,6 +393,167 @@ class TestInitCommand:
             assert os.path.samefile(gitignore, outside)
             assert outside.stat().st_nlink == 2
 
+    @pytest.mark.parametrize(
+        ("provider", "extra_args", "required_line", "feature_path", "feature_marker"),
+        [
+            (
+                "codex",
+                ["--sofa"],
+                ".sofa/",
+                ".map/config.yaml",
+                "sofa.enabled: true",
+            ),
+            (
+                "claude",
+                ["--agent-memory", "local"],
+                ".claude/agent-memory-local/",
+                ".map/config.yaml",
+                "claude_agents.persistent_memory: local",
+            ),
+            (
+                "claude",
+                ["--autonomy"],
+                ".claude/settings.local.json",
+                ".claude/settings.local.json",
+                '"autonomy": true',
+            ),
+        ],
+    )
+    def test_init_premerges_requested_feature_into_readonly_gitignore(
+        self,
+        tmp_path: Path,
+        provider: str,
+        extra_args: list[str],
+        required_line: str,
+        feature_path: str,
+        feature_marker: str,
+    ) -> None:
+        os.chdir(tmp_path)
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text("user-rule/\n", encoding="utf-8")
+        gitignore.chmod(0o444)
+
+        with mock.patch("mapify_cli.configure_global_permissions"):
+            result = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--mcp",
+                    "none",
+                    "--provider",
+                    provider,
+                    *extra_args,
+                ],
+            )
+
+        feature_file = tmp_path / feature_path
+        feature_text = (
+            feature_file.read_text(encoding="utf-8") if feature_file.is_file() else ""
+        )
+        if result.exit_code == 0:
+            ignore_text = gitignore.read_text(encoding="utf-8")
+            assert required_line in ignore_text.splitlines()
+            assert ignore_text.startswith("user-rule/\n")
+            assert stat.S_IMODE(gitignore.stat().st_mode) == 0o444
+            assert feature_marker in feature_text
+        else:
+            # Platforms that cannot replace a read-only file must fail during
+            # the early atomic merge, before enabling the requested feature.
+            assert feature_marker not in feature_text
+
+    @pytest.mark.parametrize("feature", ["sofa", "agent-memory", "settings-local"])
+    @pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+    def test_feature_gitignore_mergers_reject_unsafe_targets(
+        self,
+        tmp_path: Path,
+        feature: str,
+        attack: str,
+    ) -> None:
+        from mapify_cli.delivery.file_copier import UpdateRuntimeGitignoreSecurityError
+
+        if attack == "hardlink" and os.name == "nt":
+            pytest.skip("POSIX hardlink security contract")
+        if feature == "sofa":
+            from mapify_cli.delivery.file_copier import merge_sofa_gitignore as merge
+        elif feature == "agent-memory":
+            from mapify_cli.delivery.file_copier import (
+                merge_agent_memory_gitignore as merge,
+            )
+        else:
+            from mapify_cli.config.settings import (
+                ensure_settings_local_gitignored as merge,
+            )
+
+        outside = tmp_path / f"outside-{feature}-gitignore"
+        outside.write_bytes(b"outside-feature-sentinel\n")
+        outside.chmod(0o640)
+        gitignore = tmp_path / ".gitignore"
+        if attack == "symlink":
+            gitignore.symlink_to(outside)
+        else:
+            try:
+                os.link(outside, gitignore)
+            except (NotImplementedError, OSError) as exc:
+                pytest.skip(f"hardlinks unavailable: {exc}")
+
+        with pytest.raises(UpdateRuntimeGitignoreSecurityError):
+            merge(tmp_path)
+
+        assert outside.read_bytes() == b"outside-feature-sentinel\n"
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+
+    @pytest.mark.parametrize(
+        ("feature", "marker", "required_line"),
+        [
+            ("sofa", "# map:sofa", ".sofa/"),
+            (
+                "agent-memory",
+                "# map:agent-memory-local",
+                ".claude/agent-memory-local/",
+            ),
+            (
+                "settings-local",
+                "# map:settings-local",
+                ".claude/settings.local.json",
+            ),
+        ],
+    )
+    def test_feature_gitignore_mergers_are_atomic_and_idempotent(
+        self,
+        tmp_path: Path,
+        feature: str,
+        marker: str,
+        required_line: str,
+    ) -> None:
+        if feature == "sofa":
+            from mapify_cli.delivery.file_copier import merge_sofa_gitignore as merge
+        elif feature == "agent-memory":
+            from mapify_cli.delivery.file_copier import (
+                merge_agent_memory_gitignore as merge,
+            )
+        else:
+            from mapify_cli.config.settings import (
+                ensure_settings_local_gitignored as merge,
+            )
+
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text("user-rule/\n", encoding="utf-8")
+        gitignore.chmod(0o640)
+
+        first = merge(tmp_path)
+        second = merge(tmp_path)
+        content = gitignore.read_text(encoding="utf-8")
+
+        assert first == 1
+        assert second == 0
+        assert content.startswith("user-rule/\n")
+        assert content.count(marker) == 1
+        assert content.splitlines().count(required_line) == 1
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+
     def test_update_runtime_gitignore_replace_failure_preserves_file(
         self,
         tmp_path: Path,
