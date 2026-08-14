@@ -25,6 +25,7 @@ from mapify_cli.update_state import (
     UpdateLockSecurityError,
     UpdateState,
     automatic_check_due,
+    installer_process_probe,
     project_update_lock,
     provider_refresh_lock,
     read_update_state,
@@ -37,6 +38,8 @@ from mapify_cli.update_versions import (
     fetch_release_highlights,
     fetch_version_targets,
 )
+
+_DEFAULT_INSTALL_EXACT_VERSION = install_exact_version
 
 LOCK_TIMEOUT_SECONDS = 0.0
 REFRESH_BARRIER_TIMEOUT_SECONDS = 0.0
@@ -180,18 +183,31 @@ def _install_and_refresh(
             "Codex provider before updating mapify-cli."
         )
 
-    # Intent: Persist package-mutation authority before an installer can change
-    # the environment; a failed installer remains deliberately ambiguous.
+    # Intent: The installer controller acquires its child-owned barrier and signals
+    # READY before this callback persists mutation authority. Only a successful
+    # write authorizes GO, so an intent-write failure cannot launch the package.
     install_intent = replace(
         progress.state,
         pending_install_version=str(target),
         pending_refresh=False,
         pending_providers=providers,
     )
-    write_update_state(project_path, install_intent)
-    progress.state = install_intent
 
-    install_exact_version(project_path, target)
+    def authorize_install_start() -> None:
+        write_update_state(project_path, install_intent)
+        progress.state = install_intent
+
+    if install_exact_version is _DEFAULT_INSTALL_EXACT_VERSION:
+        install_exact_version(
+            project_path,
+            target,
+            authorize_start=authorize_install_start,
+        )
+    else:
+        # Injected installers used by embedders and tests predate the controller
+        # callback. Preserve their boundary while keeping intent durable first.
+        authorize_install_start()
+        install_exact_version(project_path, target)
     progress.installed_version = str(target)
     refresh_pending = replace(
         progress.state,
@@ -605,8 +621,13 @@ def check_and_update(
 
         try:
             with project_update_lock(project_path, timeout_s=LOCK_TIMEOUT_SECONDS):
-                # Intent: Wait for an orphaned provider child from a dead updater
-                # before reading state or starting another package mutation.
+                # Intent: Under update.lock, probe child-owned barriers before
+                # reading recovery state or starting any package/provider mutation.
+                with installer_process_probe(
+                    project_path,
+                    timeout_s=REFRESH_BARRIER_TIMEOUT_SECONDS,
+                ):
+                    pass
                 with provider_refresh_lock(
                     project_path,
                     timeout_s=REFRESH_BARRIER_TIMEOUT_SECONDS,
@@ -639,9 +660,7 @@ def check_and_update(
                 completed_result.installed_version
                 if completed_result is not None
                 and completed_result.installed_version is not None
-                else state.last_installed_version
-                if state.pending_refresh
-                else None
+                else state.last_installed_version if state.pending_refresh else None
             ),
             message=_actionable_error_message(exc, mode, state),
             refreshed_providers=(

@@ -6,11 +6,14 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
+import mapify_cli.update_install as update_install_module
 import mapify_cli.update_state as update_state_module
 from mapify_cli.update_install import (
     InstallKind,
@@ -24,7 +27,10 @@ from mapify_cli.update_install import (
     resolve_mapify_executable,
     run_command,
 )
-from mapify_cli.update_state import project_update_lock
+from mapify_cli.update_state import (
+    UpdateLockBusy,
+    project_update_lock,
+)
 from mapify_cli.update_versions import StableVersion
 
 
@@ -134,6 +140,302 @@ def test_install_exact_command_uses_project_and_300_second_timeout(
             300.0,
         )
     ]
+
+
+def test_install_authorizer_runs_before_package_start(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    def authorize() -> None:
+        events.append("intent-durable")
+
+    def runner(
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout, env
+        assert events == ["intent-durable"]
+        events.append("package-started")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    install_exact_version(
+        tmp_path,
+        StableVersion(3, 26, 0),
+        module_file="/venv/lib/python3.11/site-packages/mapify_cli/__init__.py",
+        runner=runner,
+        authorize_start=authorize,
+    )
+
+    assert events == ["intent-durable", "package-started"]
+
+
+def test_install_authorizer_failure_prevents_package_start(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "package-started"
+
+    def runner(
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        del command, cwd, timeout, env
+        marker.write_text("started\n", encoding="utf-8")
+        raise AssertionError("package must not start")
+
+    def reject() -> None:
+        raise OSError("intent disk full")
+
+    with pytest.raises(OSError, match="intent disk full"):
+        install_exact_version(
+            tmp_path,
+            StableVersion(3, 26, 0),
+            module_file="/venv/lib/python3.11/site-packages/mapify_cli/__init__.py",
+            runner=runner,
+            authorize_start=reject,
+        )
+
+    assert not marker.exists()
+
+
+def _wait_for_path(path: Path, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.02)
+    raise TimeoutError(f"timed out waiting for {path.name}")
+
+
+ORPHAN_INSTALLER_PARENT = r'''
+import os
+import sys
+from pathlib import Path
+
+from mapify_cli.update_install import run_installer_controller
+from mapify_cli.update_state import UpdateState, write_update_state
+
+project = Path(sys.argv[1])
+started = Path(sys.argv[2])
+release = Path(sys.argv[3])
+finished = Path(sys.argv[4])
+child_code = r"""
+import sys
+import time
+from pathlib import Path
+
+started = Path(sys.argv[1])
+release = Path(sys.argv[2])
+finished = Path(sys.argv[3])
+started.write_text("started\\n", encoding="utf-8")
+while not release.exists():
+    time.sleep(0.02)
+finished.write_text("finished\\n", encoding="utf-8")
+"""
+
+def authorize() -> None:
+    write_update_state(
+        project,
+        UpdateState(
+            pending_install_version="3.26.0",
+            pending_providers=("claude",),
+        ),
+    )
+    (project / "intent-durable").write_text("ready\\n", encoding="utf-8")
+
+run_installer_controller(
+    [sys.executable, "-c", child_code, str(started), str(release), str(finished)],
+    project,
+    10.0,
+    os.environ.copy(),
+    authorize_start=authorize,
+)
+'''
+
+
+PRE_GO_INSTALLER_PARENT = r'''
+import os
+import sys
+import time
+from pathlib import Path
+
+from mapify_cli.update_install import run_installer_controller
+
+project = Path(sys.argv[1])
+authorized = Path(sys.argv[2])
+package_started = Path(sys.argv[3])
+child_code = r"""
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text("started\\n", encoding="utf-8")
+"""
+
+def authorize() -> None:
+    authorized.write_text("ready\\n", encoding="utf-8")
+    while True:
+        time.sleep(1)
+
+run_installer_controller(
+    [sys.executable, "-c", child_code, str(package_started)],
+    project,
+    10.0,
+    os.environ.copy(),
+    authorize_start=authorize,
+)
+'''
+
+
+@pytest.mark.timeout(15)
+def test_parent_death_before_go_releases_barrier_without_starting_package(
+    tmp_path: Path,
+) -> None:
+    installer_lock = getattr(update_state_module, "installer_process_lock", None)
+    assert callable(installer_lock)
+    authorized = tmp_path / "authorize-entered"
+    package_started = tmp_path / "package-started"
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            PRE_GO_INSTALLER_PARENT,
+            str(tmp_path),
+            str(authorized),
+            str(package_started),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_path(authorized)
+        with (
+            pytest.raises(UpdateLockBusy),
+            installer_lock(tmp_path, timeout_s=0.0),
+        ):
+            raise AssertionError("READY must mean the controller owns the barrier")
+
+        parent.kill()
+        assert parent.wait(timeout=5.0) != 0
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                with installer_lock(tmp_path, timeout_s=0.0):
+                    break
+            except UpdateLockBusy:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5.0)
+
+    assert not package_started.exists()
+    assert parent.stderr is not None
+    assert parent.stderr.read() == ""
+
+
+@pytest.mark.timeout(15)
+def test_orphan_installer_holds_project_barrier_until_package_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mapify_cli import auto_update
+    from mapify_cli.auto_update import UpdateMode, UpdateStatus, check_and_update
+
+    controller = getattr(update_install_module, "run_installer_controller", None)
+    installer_lock = getattr(update_state_module, "installer_process_lock", None)
+    assert callable(controller), "package installs need a child-owned controller"
+    assert callable(installer_lock), "orphan installers need their own barrier lock"
+    started = tmp_path / "installer-started"
+    release = tmp_path / "release-installer"
+    finished = tmp_path / "installer-finished"
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            ORPHAN_INSTALLER_PARENT,
+            str(tmp_path),
+            str(started),
+            str(release),
+            str(finished),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_path(tmp_path / "intent-durable")
+        _wait_for_path(started)
+        parent.kill()
+        assert parent.wait(timeout=5.0) != 0
+
+        with (
+            pytest.raises(UpdateLockBusy),
+            installer_lock(tmp_path, timeout_s=0.0),
+        ):
+            raise AssertionError("orphan package manager must retain its barrier")
+
+        fetch = Mock(side_effect=AssertionError("orphan must precede network"))
+        install = Mock(side_effect=AssertionError("second install must not start"))
+        refresh = Mock(side_effect=AssertionError("refresh must wait for installer"))
+        monkeypatch.setattr(
+            auto_update,
+            "detect_install_kind",
+            lambda module_file: InstallKind.PIP,
+        )
+        monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
+        monkeypatch.setattr(auto_update, "install_exact_version", install)
+        monkeypatch.setattr(auto_update, "refresh_installed_providers", refresh)
+
+        automatic = check_and_update(
+            tmp_path,
+            "3.26.0",
+            UpdateMode.AUTOMATIC,
+        )
+        manual = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL)
+
+        assert automatic.status is UpdateStatus.SKIPPED
+        assert manual.status is UpdateStatus.ERROR
+        assert manual.message is not None and "already running" in manual.message
+        fetch.assert_not_called()
+        install.assert_not_called()
+        refresh.assert_not_called()
+
+        release.write_text("go\n", encoding="utf-8")
+        _wait_for_path(finished)
+
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                with installer_lock(tmp_path, timeout_s=0.0):
+                    break
+            except UpdateLockBusy:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+
+        monkeypatch.setattr(
+            auto_update,
+            "refresh_installed_providers",
+            lambda project, providers: tuple(providers),
+        )
+        recovered = check_and_update(
+            tmp_path,
+            "3.26.0",
+            UpdateMode.AUTOMATIC,
+        )
+        assert recovered.status is UpdateStatus.UPDATED
+        fetch.assert_not_called()
+        install.assert_not_called()
+    finally:
+        release.write_text("go\n", encoding="utf-8")
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5.0)
+
+    assert parent.stderr is not None
+    assert parent.stderr.read() == ""
 
 
 def test_install_exact_command_failure_has_bounded_actionable_stderr(

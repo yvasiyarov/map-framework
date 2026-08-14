@@ -299,9 +299,9 @@ def test_pending_refresh_state_requires_flag_version_and_provider_membership(
         "pending_refresh_state",
         None,
     )
-    assert callable(pending_refresh_state), (
-        "pending provider recovery needs an explicit validated-state boundary"
-    )
+    assert callable(
+        pending_refresh_state
+    ), "pending provider recovery needs an explicit validated-state boundary"
     valid = UpdateState(
         last_installed_version="3.26.0",
         pending_refresh=True,
@@ -353,9 +353,9 @@ def test_complete_pending_provider_refresh_narrows_then_clears_state(
         "complete_pending_provider_refresh",
         None,
     )
-    assert callable(complete_pending_provider_refresh), (
-        "successful standalone recovery needs a provider completion transition"
-    )
+    assert callable(
+        complete_pending_provider_refresh
+    ), "successful standalone recovery needs a provider completion transition"
     write_update_state(
         tmp_path,
         UpdateState(
@@ -420,7 +420,9 @@ def test_lock_refuses_symlink(tmp_path: Path) -> None:
         raise AssertionError("symlink lock must not open")
 
 
-@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+@pytest.mark.parametrize(
+    "lock_name", ["update.lock", "installer.lock", "provider-refresh.lock"]
+)
 def test_lock_refuses_symlinked_map_ancestor_without_outside_creation(
     tmp_path: Path,
     lock_name: str,
@@ -430,11 +432,11 @@ def test_lock_refuses_symlinked_map_ancestor_without_outside_creation(
     sentinel = outside / "sentinel"
     sentinel.write_bytes(b"outside-bytes")
     (tmp_path / ".map").symlink_to(outside, target_is_directory=True)
-    lock = (
-        project_update_lock
-        if lock_name == "update.lock"
-        else update_state_module.provider_refresh_lock
-    )
+    lock = {
+        "update.lock": project_update_lock,
+        "installer.lock": update_state_module.installer_process_lock,
+        "provider-refresh.lock": update_state_module.provider_refresh_lock,
+    }[lock_name]
 
     with pytest.raises(UpdateLockSecurityError), lock(tmp_path, timeout_s=0.0):
         raise AssertionError("a symlinked .map ancestor must not be used")
@@ -444,7 +446,9 @@ def test_lock_refuses_symlinked_map_ancestor_without_outside_creation(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink security contract")
-@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+@pytest.mark.parametrize(
+    "lock_name", ["update.lock", "installer.lock", "provider-refresh.lock"]
+)
 def test_lock_refuses_hardlinked_sentinel_without_mutating_outside_file(
     tmp_path: Path,
     lock_name: str,
@@ -458,11 +462,11 @@ def test_lock_refuses_hardlinked_sentinel_without_mutating_outside_file(
         os.link(outside, map_dir / lock_name)
     except (NotImplementedError, OSError) as exc:
         pytest.skip(f"hardlinks unavailable: {exc}")
-    lock = (
-        project_update_lock
-        if lock_name == "update.lock"
-        else update_state_module.provider_refresh_lock
-    )
+    lock = {
+        "update.lock": project_update_lock,
+        "installer.lock": update_state_module.installer_process_lock,
+        "provider-refresh.lock": update_state_module.provider_refresh_lock,
+    }[lock_name]
 
     with pytest.raises(UpdateLockSecurityError), lock(tmp_path, timeout_s=0.0):
         raise AssertionError("a hardlinked lock must not open")
@@ -471,17 +475,19 @@ def test_lock_refuses_hardlinked_sentinel_without_mutating_outside_file(
     assert stat.S_IMODE(outside.stat().st_mode) == 0o644
 
 
-@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+@pytest.mark.parametrize(
+    "lock_name", ["update.lock", "installer.lock", "provider-refresh.lock"]
+)
 def test_lock_refuses_nonregular_path(tmp_path: Path, lock_name: str) -> None:
     map_dir = tmp_path / ".map"
     map_dir.mkdir()
     lock_path = map_dir / lock_name
     lock_path.mkdir()
-    lock = (
-        project_update_lock
-        if lock_name == "update.lock"
-        else update_state_module.provider_refresh_lock
-    )
+    lock = {
+        "update.lock": project_update_lock,
+        "installer.lock": update_state_module.installer_process_lock,
+        "provider-refresh.lock": update_state_module.provider_refresh_lock,
+    }[lock_name]
 
     with pytest.raises(UpdateLockSecurityError), lock(tmp_path, timeout_s=0.0):
         raise AssertionError("a non-regular lock must not open")
@@ -592,6 +598,33 @@ def test_provider_refresh_lock_is_an_independent_orphan_barrier(
         assert (tmp_path / ".map" / "provider-refresh.lock").is_file()
 
 
+def test_installer_process_lock_is_an_independent_orphan_barrier(
+    tmp_path: Path,
+) -> None:
+    installer_lock = getattr(update_state_module, "installer_process_lock", None)
+    assert callable(installer_lock), "orphan installers need their own barrier lock"
+
+    with (
+        installer_lock(tmp_path, timeout_s=0.0),
+        pytest.raises(UpdateLockBusy),
+        installer_lock(tmp_path, timeout_s=0.0),
+    ):
+        raise AssertionError("a second installer must not cross the barrier")
+
+
+def test_installer_probe_does_not_create_barrier_when_no_controller_exists(
+    tmp_path: Path,
+) -> None:
+    probe = getattr(update_state_module, "installer_process_probe", None)
+    assert callable(probe)
+    (tmp_path / ".map").mkdir()
+
+    with probe(tmp_path, timeout_s=0.0):
+        pass
+
+    assert not (tmp_path / ".map" / "installer.lock").exists()
+
+
 def test_standalone_provider_refresh_session_owns_locks_in_global_order(
     tmp_path: Path,
 ) -> None:
@@ -615,6 +648,36 @@ def test_standalone_provider_refresh_session_owns_locks_in_global_order(
             update_state_module.provider_refresh_lock(tmp_path, timeout_s=0.0),
         ):
             raise AssertionError("standalone refresh must own provider-refresh.lock")
+
+
+def test_standalone_provider_refresh_waits_for_orphan_installer(
+    tmp_path: Path,
+) -> None:
+    installer_lock = getattr(update_state_module, "installer_process_lock", None)
+    session = getattr(update_state_module, "provider_refresh_session", None)
+    assert callable(installer_lock)
+    assert callable(session)
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+    )
+
+    with (
+        installer_lock(tmp_path, timeout_s=0.0),
+        pytest.raises(UpdateLockBusy),
+        session(
+            tmp_path,
+            provider="claude",
+            running_version="3.26.0",
+            raw_parent_lease=None,
+            timeout_s=0.0,
+        ),
+    ):
+        raise AssertionError("refresh must not overlap an orphan installer")
 
 
 def test_borrowed_provider_refresh_session_promotes_matching_intent_without_deadlock(

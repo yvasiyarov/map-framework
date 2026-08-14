@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
@@ -29,6 +29,7 @@ from mapify_cli.update_state import (
     UpdateLockBusy,
     UpdateLockSecurityError,
     UpdateState,
+    installer_process_lock,
     provider_refresh_lock,
     read_update_state,
     write_update_state,
@@ -52,6 +53,24 @@ def _write_config(project: Path, body: str) -> None:
     config_path = project / ".map" / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(body, encoding="utf-8")
+
+
+def _authorized_installer(
+    effect: Callable[[Path, StableVersion], None],
+) -> Callable[..., None]:
+    """Model READY -> durable intent -> GO without mocking the authorization."""
+
+    def install(
+        project: Path,
+        version: StableVersion,
+        *,
+        authorize_start: Callable[[], None] | None = None,
+    ) -> None:
+        if authorize_start is not None:
+            authorize_start()
+        effect(project, version)
+
+    return install
 
 
 def test_result_serializes_only_present_optional_fields() -> None:
@@ -263,7 +282,9 @@ def test_lock_contention_skips_automatic_and_errors_manual(
     assert manual.message is not None and "already running" in manual.message
 
 
-@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+@pytest.mark.parametrize(
+    "lock_name", ["update.lock", "installer.lock", "provider-refresh.lock"]
+)
 def test_manual_unsafe_lock_path_is_actionable_before_state_or_network(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -318,6 +339,42 @@ def test_provider_refresh_barrier_contention_is_failfast_before_state_or_network
     fetch.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    [
+        (UpdateMode.AUTOMATIC, UpdateStatus.SKIPPED),
+        (UpdateMode.MANUAL, UpdateStatus.ERROR),
+    ],
+)
+@pytest.mark.timeout(1)
+def test_installer_barrier_contention_is_failfast_before_state_or_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: UpdateMode,
+    expected_status: UpdateStatus,
+) -> None:
+    fetch = Mock(side_effect=AssertionError("busy installer must precede network"))
+    refresh = Mock(side_effect=AssertionError("busy installer must precede refresh"))
+    install = Mock(side_effect=AssertionError("busy installer must precede install"))
+    monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
+    monkeypatch.setattr(auto_update, "refresh_installed_providers", refresh)
+    monkeypatch.setattr(auto_update, "install_exact_version", install)
+
+    with installer_process_lock(tmp_path, timeout_s=0.0):
+        started = time.monotonic()
+        result = check_and_update(tmp_path, "3.25.0", mode, now=NOW)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert result.status is expected_status
+    if mode is UpdateMode.MANUAL:
+        assert result.message is not None and "already running" in result.message
+    assert not (tmp_path / ".map" / "update-state.json").exists()
+    fetch.assert_not_called()
+    refresh.assert_not_called()
+    install.assert_not_called()
+
+
 @pytest.mark.parametrize("mode", [UpdateMode.AUTOMATIC, UpdateMode.MANUAL])
 def test_unstable_current_version_is_rejected_before_network(
     tmp_path: Path,
@@ -370,7 +427,9 @@ def test_same_major_installs_refreshes_then_offers_major(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: calls.append(f"install:{version}"),
+        _authorized_installer(
+            lambda project, version: calls.append(f"install:{version}")
+        ),
         raising=False,
     )
     monkeypatch.setattr(
@@ -445,7 +504,7 @@ def test_same_major_without_higher_major_returns_updated(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
         raising=False,
     )
     monkeypatch.setattr(
@@ -552,7 +611,7 @@ def test_missing_major_metadata_after_same_major_update_preserves_updated_result
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
         raising=False,
     )
     monkeypatch.setattr(
@@ -661,7 +720,7 @@ def test_approved_major_skips_new_same_major_and_installs_only_exact_approval(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: installed.append(str(version)),
+        _authorized_installer(lambda project, version: installed.append(str(version))),
         raising=False,
     )
     monkeypatch.setattr(
@@ -851,7 +910,7 @@ def test_package_install_failure_preserves_ambiguous_install_intent(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        Mock(side_effect=PackageUpdateError("pip failed")),
+        _authorized_installer(Mock(side_effect=PackageUpdateError("pip failed"))),
     )
 
     result = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL, now=NOW)
@@ -883,7 +942,7 @@ def test_package_success_is_persisted_as_pending_before_refresh_starts(
         lambda project: ("claude", "codex"),
     )
 
-    def install(project: Path, version: StableVersion) -> None:
+    def install_effect(project: Path, version: StableVersion) -> None:
         assert version == StableVersion(3, 26, 0)
         assert read_update_state(project) == UpdateState(
             last_attempt_at="2026-08-13T12:00:00Z",
@@ -892,7 +951,11 @@ def test_package_success_is_persisted_as_pending_before_refresh_starts(
             pending_providers=("claude", "codex"),
         )
 
-    monkeypatch.setattr(auto_update, "install_exact_version", install)
+    monkeypatch.setattr(
+        auto_update,
+        "install_exact_version",
+        _authorized_installer(install_effect),
+    )
 
     def refresh(project: Path, providers: tuple[str, ...]) -> tuple[str, ...]:
         assert providers == ("claude", "codex")
@@ -916,7 +979,10 @@ def test_install_intent_write_failure_never_calls_package_installer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_write = auto_update.write_update_state
-    installer = Mock(side_effect=AssertionError("installer must wait for intent"))
+    package_installer = Mock(
+        side_effect=AssertionError("package must wait for durable intent")
+    )
+    installer = _authorized_installer(package_installer)
 
     def fail_intent_write(project: Path, state: UpdateState) -> None:
         if state.pending_install_version is not None:
@@ -937,7 +1003,7 @@ def test_install_intent_write_failure_never_calls_package_installer(
     assert result.status is UpdateStatus.ERROR
     assert result.installed_version is None
     assert result.message is not None and "intent disk full" in result.message
-    installer.assert_not_called()
+    package_installer.assert_not_called()
 
 
 def test_promotion_write_failure_retains_intent_for_fresh_invocation(
@@ -967,7 +1033,7 @@ def test_promotion_write_failure_retains_intent_for_fresh_invocation(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(auto_update, "refresh_installed_providers", refresh)
     monkeypatch.setattr(auto_update, "write_update_state", fail_pending_write)
@@ -1048,7 +1114,7 @@ def test_second_fresh_invocation_recovers_after_promotion_write_failure(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: installs.append(str(version)),
+        _authorized_installer(lambda project, version: installs.append(str(version))),
     )
     monkeypatch.setattr(auto_update, "write_update_state", write_with_one_crash)
     monkeypatch.setattr(
@@ -1151,7 +1217,7 @@ def test_package_success_refresh_failure_sets_exact_pending_state_and_result(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(
         auto_update,
@@ -1388,7 +1454,7 @@ def test_manual_successful_update_never_changes_automatic_attempt_timestamp(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(
         auto_update,
@@ -1506,7 +1572,7 @@ def test_lock_cleanup_failure_preserves_completed_update_progress(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(
         auto_update,
@@ -1549,7 +1615,7 @@ def test_failure_after_same_major_refresh_preserves_all_completed_progress(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(
         auto_update,
@@ -1593,7 +1659,7 @@ def test_automatic_late_highlight_failure_returns_message_free_updated_progress(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(
         auto_update,
@@ -1646,7 +1712,7 @@ def test_approved_major_refresh_failure_uses_the_same_durable_recovery_path(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
     monkeypatch.setattr(
         auto_update,
@@ -1717,7 +1783,7 @@ def test_manual_recovery_then_second_refresh_failure_merges_progress(
     monkeypatch.setattr(
         auto_update,
         "install_exact_version",
-        lambda project, version: None,
+        _authorized_installer(lambda project, version: None),
     )
 
     result = check_and_update(tmp_path, "3.25.1", UpdateMode.MANUAL, now=NOW)

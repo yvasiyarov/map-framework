@@ -561,6 +561,66 @@ def provider_refresh_lock(
             os.close(fd)
 
 
+@contextlib.contextmanager
+def installer_process_lock(
+    project_path: Path,
+    *,
+    timeout_s: float,
+) -> Generator[None, None, None]:
+    """Serialize package mutation across updater-parent process death."""
+    lock_path = project_path.resolve() / ".map" / "installer.lock"
+    fd = _open_lock_file(lock_path, create=True)
+    acquired = False
+    try:
+        _acquire_fd(fd, lock_path, timeout_s)
+        acquired = True
+        yield
+    finally:
+        try:
+            if acquired:
+                _unlock(fd)
+        finally:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def installer_process_probe(
+    project_path: Path,
+    *,
+    timeout_s: float,
+) -> Generator[None, None, None]:
+    """Probe an existing child-owned installer barrier without creating one."""
+    lock_path = project_path.resolve() / ".map" / "installer.lock"
+    try:
+        os.lstat(lock_path.parent)
+    except FileNotFoundError:
+        # A live controller necessarily created both the directory and lock file
+        # before READY, so an absent directory is also an absent barrier.
+        yield
+        return
+    except OSError as exc:
+        raise _lock_security_error(lock_path) from exc
+    try:
+        fd = _open_lock_file(lock_path, create=False)
+    except FileNotFoundError:
+        # An authorized installer controller creates and owns this file before GO.
+        # A controller that has not created it cannot have received GO, and exits
+        # on control-pipe EOF if its updater parent is already dead.
+        yield
+        return
+    acquired = False
+    try:
+        _acquire_fd(fd, lock_path, timeout_s)
+        acquired = True
+        yield
+    finally:
+        try:
+            if acquired:
+                _unlock(fd)
+        finally:
+            os.close(fd)
+
+
 def _promote_matching_install_intent(
     project_path: Path,
     state: UpdateState,
@@ -626,9 +686,12 @@ def provider_refresh_session(
             yield
         return
 
-    # Intent: Standalone recovery always follows update -> provider-refresh order.
+    # Intent: Standalone recovery follows update -> installer -> provider order.
+    # The installer probe prevents a direct recovery command from refreshing files
+    # while a package-manager child outlives its updater parent.
     with (
         project_update_lock(project, timeout_s=timeout_s),
+        installer_process_probe(project, timeout_s=timeout_s),
         provider_refresh_lock(project, timeout_s=timeout_s),
     ):
         state = read_update_state(project)
