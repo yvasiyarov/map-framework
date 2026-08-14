@@ -823,6 +823,7 @@ _CAN_USE_DIRECTORY_FD = (
     hasattr(os, "O_DIRECTORY")
     and os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
+    and os.rename in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
     and _replace_supports_directory_fds()
@@ -837,6 +838,8 @@ def _open_sofa_directory(
     repo_root: Path,
     *,
     create: bool,
+    project_directory_fd: int | None = None,
+    project_original: os.stat_result | None = None,
 ) -> tuple[Path, os.stat_result, int | None] | None:
     """Validate and optionally create the direct .sofa directory.
 
@@ -846,23 +849,47 @@ def _open_sofa_directory(
     project_root = repo_root.resolve(strict=True)
     if not project_root.is_dir():
         _unsafe_credentials("the project root is not a directory")
+    if project_original is not None:
+        _validate_project_root_unchanged(project_root, project_original)
     sofa_dir = project_root / ".sofa"
     try:
-        current = os.lstat(sofa_dir)
+        if project_directory_fd is None:
+            current = os.lstat(sofa_dir)
+        else:
+            current = os.stat(
+                sofa_dir.name,
+                dir_fd=project_directory_fd,
+                follow_symlinks=False,
+            )
     except FileNotFoundError:
         if not create:
             return None
         try:
-            sofa_dir.mkdir(mode=0o700)
+            if project_directory_fd is None:
+                sofa_dir.mkdir(mode=0o700)
+            else:
+                os.mkdir(sofa_dir.name, mode=0o700, dir_fd=project_directory_fd)
         except FileExistsError:
             pass
-        current = os.lstat(sofa_dir)
+        if project_original is not None:
+            _validate_project_root_unchanged(project_root, project_original)
+        if project_directory_fd is None:
+            current = os.lstat(sofa_dir)
+        else:
+            current = os.stat(
+                sofa_dir.name,
+                dir_fd=project_directory_fd,
+                follow_symlinks=False,
+            )
 
     if stat.S_ISLNK(current.st_mode):
         _unsafe_credentials(".sofa must not be a symbolic link")
     if not stat.S_ISDIR(current.st_mode):
         _unsafe_credentials(".sofa must be a directory")
-    if sofa_dir.resolve(strict=True) != project_root / ".sofa":
+    if (
+        project_directory_fd is None
+        and sofa_dir.resolve(strict=True) != project_root / ".sofa"
+    ):
         _unsafe_credentials(".sofa resolved outside the project root")
 
     if not _CAN_USE_DIRECTORY_FD:
@@ -875,7 +902,14 @@ def _open_sofa_directory(
         | getattr(os, "O_DIRECTORY", 0)
     )
     try:
-        descriptor = os.open(sofa_dir, flags)
+        if project_directory_fd is None:
+            descriptor = os.open(sofa_dir, flags)
+        else:
+            descriptor = os.open(
+                sofa_dir.name,
+                flags,
+                dir_fd=project_directory_fd,
+            )
     except OSError as exc:
         _unsafe_credentials(f"could not open .sofa safely ({exc})")
     opened = os.fstat(descriptor)
@@ -885,6 +919,8 @@ def _open_sofa_directory(
     ):
         os.close(descriptor)
         _unsafe_credentials(".sofa changed while being opened")
+    if project_original is not None:
+        _validate_project_root_unchanged(project_root, project_original)
     return sofa_dir, opened, descriptor
 
 
@@ -1156,14 +1192,255 @@ def _load_credentials(
             os.close(directory_fd)
 
 
+def _installed_credentials_stat(
+    credentials_file: Path,
+    prepared: os.stat_result,
+    directory_fd: int | None,
+) -> os.stat_result:
+    installed = _validated_credentials_stat(credentials_file, directory_fd)
+    if installed is None or (installed.st_dev, installed.st_ino) != (
+        prepared.st_dev,
+        prepared.st_ino,
+    ):
+        _unsafe_credentials("credentials.json changed while being installed")
+    return installed
+
+
+def _create_credentials_rollback_file(
+    sofa_dir: Path,
+    previous_content: bytes,
+    previous_mode: int,
+    directory_fd: int | None,
+) -> tuple[str | Path, os.stat_result]:
+    descriptor = -1
+    temporary: str | Path = ""
+    try:
+        if directory_fd is None:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=sofa_dir,
+                prefix=".credentials.json.rollback.",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
+        else:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            for _ in range(32):
+                candidate = f".credentials.json.rollback.{secrets.token_hex(12)}.tmp"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        flags,
+                        previous_mode,
+                        dir_fd=directory_fd,
+                    )
+                except FileExistsError:
+                    continue
+                temporary = candidate
+                break
+            if descriptor < 0:
+                raise FileExistsError("could not allocate a credential rollback file")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, previous_mode)
+        elif not _descriptor_mode_matches(descriptor, previous_mode):
+            _unsafe_credentials(
+                "cannot preserve the credential rollback mode without descriptor "
+                "chmod support"
+            )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(previous_content)
+            stream.flush()
+            os.fsync(stream.fileno())
+            prepared = os.fstat(stream.fileno())
+        return temporary, prepared
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                if directory_fd is None:
+                    Path(temporary).unlink()
+                else:
+                    os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _validated_credentials_rollback_stat(
+    rollback_file: str | Path,
+    expected: os.stat_result,
+    directory_fd: int | None,
+) -> os.stat_result:
+    try:
+        if directory_fd is None:
+            current = os.lstat(rollback_file)
+        else:
+            current = os.stat(
+                rollback_file,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+    except FileNotFoundError:
+        _unsafe_credentials("the credential rollback file disappeared")
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        _unsafe_credentials("the credential rollback file changed")
+    return current
+
+
+def _installed_credentials_match(
+    credentials_file: Path,
+    expected: os.stat_result,
+    directory_fd: int | None,
+) -> bool:
+    current = _validated_credentials_stat(credentials_file, directory_fd)
+    return current is not None and (current.st_dev, current.st_ino) == (
+        expected.st_dev,
+        expected.st_ino,
+    )
+
+
+def _rename_credentials_rollback(
+    rollback_file: str | Path,
+    credentials_file: Path,
+    directory_fd: int | None,
+) -> None:
+    if directory_fd is None:
+        os.rename(rollback_file, credentials_file)
+    else:
+        os.rename(
+            rollback_file,
+            credentials_file.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+
+
+def _rollback_installed_credentials(
+    credentials_file: Path,
+    prepared: os.stat_result,
+    directory_fd: int | None,
+    rollback_file: str | Path | None,
+    rollback_prepared: os.stat_result | None,
+) -> None:
+    _installed_credentials_stat(credentials_file, prepared, directory_fd)
+    if rollback_file is None or rollback_prepared is None:
+        if directory_fd is None:
+            credentials_file.unlink()
+        else:
+            os.unlink(credentials_file.name, dir_fd=directory_fd)
+        return
+
+    _validated_credentials_rollback_stat(
+        rollback_file,
+        rollback_prepared,
+        directory_fd,
+    )
+    try:
+        if directory_fd is None:
+            os.replace(rollback_file, credentials_file)
+        else:
+            os.replace(
+                rollback_file,
+                credentials_file.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+    except OSError:
+        if _installed_credentials_match(
+            credentials_file,
+            rollback_prepared,
+            directory_fd,
+        ):
+            return
+        _installed_credentials_stat(credentials_file, prepared, directory_fd)
+        try:
+            _rename_credentials_rollback(
+                rollback_file,
+                credentials_file,
+                directory_fd,
+            )
+        except OSError:
+            if _installed_credentials_match(
+                credentials_file,
+                rollback_prepared,
+                directory_fd,
+            ):
+                return
+            _remove_installed_credentials_if_ours(
+                credentials_file,
+                prepared,
+                directory_fd,
+            )
+            try:
+                _rename_credentials_rollback(
+                    rollback_file,
+                    credentials_file,
+                    directory_fd,
+                )
+            except OSError:
+                _validated_credentials_rollback_stat(
+                    rollback_file,
+                    rollback_prepared,
+                    directory_fd,
+                )
+                raise
+    _installed_credentials_stat(credentials_file, rollback_prepared, directory_fd)
+
+
+def _remove_installed_credentials_if_ours(
+    credentials_file: Path,
+    prepared: os.stat_result,
+    directory_fd: int | None,
+) -> None:
+    _installed_credentials_stat(credentials_file, prepared, directory_fd)
+    if directory_fd is None:
+        credentials_file.unlink()
+    else:
+        os.unlink(credentials_file.name, dir_fd=directory_fd)
+
+
+def _remove_credentials_rollback_if_ours(
+    rollback_file: str | Path,
+    rollback_prepared: os.stat_result,
+    directory_fd: int | None,
+) -> None:
+    _validated_credentials_rollback_stat(
+        rollback_file,
+        rollback_prepared,
+        directory_fd,
+    )
+    if directory_fd is None:
+        Path(rollback_file).unlink()
+    else:
+        os.unlink(rollback_file, dir_fd=directory_fd)
+
+
 def _atomic_write_credentials(
     credentials_file: Path,
     content: bytes,
+    previous_content: bytes | None,
     original: os.stat_result | None,
     sofa_dir: Path,
     sofa_original: os.stat_result,
     directory_fd: int | None,
+    project_root: Path,
+    project_original: os.stat_result,
 ) -> None:
+    rollback_file: str | Path | None = None
+    rollback_prepared: os.stat_result | None = None
+    preserve_rollback = False
     if directory_fd is not None:
         descriptor = -1
         temporary_name = ""
@@ -1195,6 +1472,7 @@ def _atomic_write_credentials(
                 _unsafe_credentials(
                     "cannot enforce private credential mode without descriptor chmod support"
                 )
+            prepared = os.fstat(descriptor)
             with os.fdopen(descriptor, "wb") as stream:
                 descriptor = -1
                 stream.write(content)
@@ -1206,12 +1484,56 @@ def _atomic_write_credentials(
                 original,
                 directory_fd,
             )
+            if previous_content is not None:
+                if original is None:
+                    _unsafe_credentials("credential rollback state is inconsistent")
+                rollback_file, rollback_prepared = _create_credentials_rollback_file(
+                    sofa_dir,
+                    previous_content,
+                    stat.S_IMODE(original.st_mode),
+                    directory_fd,
+                )
             os.replace(
                 temporary_name,
                 credentials_file.name,
                 src_dir_fd=directory_fd,
                 dst_dir_fd=directory_fd,
             )
+            _installed_credentials_stat(credentials_file, prepared, directory_fd)
+            try:
+                _validate_project_root_unchanged(project_root, project_original)
+            except SofaGitignoreSecurityError:
+                try:
+                    _rollback_installed_credentials(
+                        credentials_file,
+                        prepared,
+                        directory_fd,
+                        rollback_file,
+                        rollback_prepared,
+                    )
+                except (OSError, SofaCredentialsSecurityError):
+                    preserve_rollback = rollback_file is not None
+                    removal_failed = False
+                    try:
+                        _remove_installed_credentials_if_ours(
+                            credentials_file,
+                            prepared,
+                            directory_fd,
+                        )
+                    except (OSError, SofaCredentialsSecurityError):
+                        removal_failed = True
+                    suffix = (
+                        "; installed credential removal also failed"
+                        if removal_failed
+                        else ""
+                    )
+                    _unsafe_credentials(
+                        "credential rollback failed after the project root changed"
+                        f"{suffix}"
+                    )
+                rollback_file = None
+                rollback_prepared = None
+                raise
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -1220,6 +1542,16 @@ def _atomic_write_credentials(
                     os.unlink(temporary_name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
+            if (
+                rollback_file is not None
+                and rollback_prepared is not None
+                and not preserve_rollback
+            ):
+                _remove_credentials_rollback_if_ours(
+                    rollback_file,
+                    rollback_prepared,
+                    directory_fd,
+                )
         return
 
     # Without directory-relative syscalls we cannot pin the parent directory,
@@ -1241,6 +1573,7 @@ def _atomic_write_credentials(
             _unsafe_credentials(
                 "cannot enforce private credential mode without descriptor chmod support"
             )
+        prepared = os.fstat(descriptor)
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             secret_written = True
             stream.write(content)
@@ -1248,11 +1581,55 @@ def _atomic_write_credentials(
             os.fsync(stream.fileno())
         _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
         _validate_credentials_unchanged(credentials_file, original, directory_fd)
+        if previous_content is not None:
+            if original is None:
+                _unsafe_credentials("credential rollback state is inconsistent")
+            rollback_file, rollback_prepared = _create_credentials_rollback_file(
+                sofa_dir,
+                previous_content,
+                stat.S_IMODE(original.st_mode),
+                directory_fd,
+            )
         # Windows cannot atomically replace a file while this descriptor is
         # open. Close only after both target identities have been revalidated.
         os.close(descriptor)
         descriptor = -1
         os.replace(temporary, credentials_file)
+        _installed_credentials_stat(credentials_file, prepared, directory_fd)
+        try:
+            _validate_project_root_unchanged(project_root, project_original)
+        except SofaGitignoreSecurityError:
+            try:
+                _rollback_installed_credentials(
+                    credentials_file,
+                    prepared,
+                    directory_fd,
+                    rollback_file,
+                    rollback_prepared,
+                )
+            except (OSError, SofaCredentialsSecurityError):
+                preserve_rollback = rollback_file is not None
+                removal_failed = False
+                try:
+                    _remove_installed_credentials_if_ours(
+                        credentials_file,
+                        prepared,
+                        directory_fd,
+                    )
+                except (OSError, SofaCredentialsSecurityError):
+                    removal_failed = True
+                suffix = (
+                    "; installed credential removal also failed"
+                    if removal_failed
+                    else ""
+                )
+                _unsafe_credentials(
+                    "credential rollback failed after the project root changed"
+                    f"{suffix}"
+                )
+            rollback_file = None
+            rollback_prepared = None
+            raise
     finally:
         if descriptor >= 0:
             if secret_written and hasattr(os, "ftruncate"):
@@ -1266,6 +1643,16 @@ def _atomic_write_credentials(
             temporary.unlink()
         except FileNotFoundError:
             pass
+        if (
+            rollback_file is not None
+            and rollback_prepared is not None
+            and not preserve_rollback
+        ):
+            _remove_credentials_rollback_if_ours(
+                rollback_file,
+                rollback_prepared,
+                directory_fd,
+            )
 
 
 def store_credentials(
@@ -1300,63 +1687,90 @@ def store_credentials(
         if not isinstance(value, str):
             return _err("invalid_input", f"{field_name} must be a string.")
 
-    # STEP 1: gitignore BEFORE key (ordering invariant)
+    phase = "gitignore"
+    directory_fd: int | None = None
     try:
-        ensure_sofa_gitignore(repo_root)
-    except Exception as exc:  # noqa: BLE001 -- typed security boundary
+        project_root = repo_root.resolve(strict=True)
+        if not project_root.is_dir():
+            raise NotADirectoryError("SOFA project root is not a directory")
+        # Keep one project-root identity pinned from ignore authority through
+        # the final secret write. There is no post-ignore root-swap gap.
+        with _project_gitignore_lock(project_root) as (
+            project_directory_fd,
+            project_original,
+        ):
+            _ensure_sofa_gitignore_locked(
+                project_root,
+                project_directory_fd,
+                project_original,
+            )
+            _validate_project_root_unchanged(project_root, project_original)
+            phase = "credentials"
+            opened_directory = _open_sofa_directory(
+                project_root,
+                create=True,
+                project_directory_fd=project_directory_fd,
+                project_original=project_original,
+            )
+            if opened_directory is None:
+                _unsafe_credentials("could not create .sofa")
+            sofa_dir, sofa_original, directory_fd = opened_directory
+            creds_file = sofa_dir / "credentials.json"
+            with _credentials_transaction_lock(
+                sofa_dir,
+                sofa_original,
+                directory_fd,
+            ):
+                content, original = _read_credentials_bytes(
+                    creds_file,
+                    sofa_dir,
+                    sofa_original,
+                    directory_fd,
+                )
+                data = {} if content is None else _parse_credentials(content)
+
+                if agent_id in data:
+                    _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+                    _validate_credentials_unchanged(creds_file, original, directory_fd)
+                    return _err(
+                        "duplicate_agent",
+                        f"Credentials for agent_id={agent_id!r} already exist. "
+                        "Remove the entry manually to re-register.",
+                    )
+
+                data[agent_id] = {
+                    "agent_name": agent_name,
+                    "base_url": base_url,
+                    "api_key_prefix": api_key_prefix,
+                    "api_key_suffix": api_key_suffix,
+                    "api_key": api_key,
+                }
+                _atomic_write_credentials(
+                    creds_file,
+                    json.dumps(data, indent=2).encode("utf-8"),
+                    content,
+                    original,
+                    sofa_dir,
+                    sofa_original,
+                    directory_fd,
+                    project_root,
+                    project_original,
+                )
+                _validate_project_root_unchanged(project_root, project_original)
+                return _ok(agent_id=agent_id, path=str(creds_file))
+    except SofaCredentialsFormatError as exc:
+        return _err("bad_json", str(exc))
+    except SofaGitignoreSecurityError as exc:
         return _err(
             "gitignore_error",
             f"Refusing to store credentials because .gitignore is unsafe: {exc}",
         )
-
-    directory_fd: int | None = None
-    try:
-        opened_directory = _open_sofa_directory(repo_root, create=True)
-        if opened_directory is None:
-            _unsafe_credentials("could not create .sofa")
-        sofa_dir, sofa_original, directory_fd = opened_directory
-        creds_file = sofa_dir / "credentials.json"
-        with _credentials_transaction_lock(
-            sofa_dir,
-            sofa_original,
-            directory_fd,
-        ):
-            content, original = _read_credentials_bytes(
-                creds_file,
-                sofa_dir,
-                sofa_original,
-                directory_fd,
-            )
-            data = {} if content is None else _parse_credentials(content)
-
-            if agent_id in data:
-                _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
-                _validate_credentials_unchanged(creds_file, original, directory_fd)
-                return _err(
-                    "duplicate_agent",
-                    f"Credentials for agent_id={agent_id!r} already exist. "
-                    "Remove the entry manually to re-register.",
-                )
-
-            data[agent_id] = {
-                "agent_name": agent_name,
-                "base_url": base_url,
-                "api_key_prefix": api_key_prefix,
-                "api_key_suffix": api_key_suffix,
-                "api_key": api_key,
-            }
-            _atomic_write_credentials(
-                creds_file,
-                json.dumps(data, indent=2).encode("utf-8"),
-                original,
-                sofa_dir,
-                sofa_original,
-                directory_fd,
-            )
-            return _ok(agent_id=agent_id, path=str(creds_file))
-    except SofaCredentialsFormatError as exc:
-        return _err("bad_json", str(exc))
     except (OSError, SofaCredentialsSecurityError) as exc:
+        if phase == "gitignore":
+            return _err(
+                "gitignore_error",
+                f"Refusing to store credentials because .gitignore is unsafe: {exc}",
+            )
         return _err(
             "credential_storage_error",
             f"Refusing to store credentials securely: {exc}",

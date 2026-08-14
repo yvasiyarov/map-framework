@@ -563,16 +563,22 @@ def test_vc3_gitignore_ensured_before_key_write_idempotent():
 
         # Track call order
         order: list[str] = []
-        real_ensure = sofa.ensure_sofa_gitignore
+        real_ensure = sofa._ensure_sofa_gitignore_locked
 
-        def tracking_ensure(root):
+        def tracking_ensure(
+            root: Path,
+            directory_fd: int | None,
+            project_original: os.stat_result,
+        ) -> bool:
             order.append("gitignore")
             assert (
                 not creds_file.exists()
             ), ".gitignore must be updated BEFORE credentials.json is created"
-            return real_ensure(root)
+            return real_ensure(root, directory_fd, project_original)
 
-        with patch.object(sofa, "ensure_sofa_gitignore", side_effect=tracking_ensure):
+        with patch.object(
+            sofa, "_ensure_sofa_gitignore_locked", side_effect=tracking_ensure
+        ):
             result = sofa.store_credentials(
                 repo_root=repo_root,
                 agent_id="agent-001",
@@ -1404,6 +1410,238 @@ def test_vc3_gitignore_failure_blocks_credential_write_without_secret_exposure(
     assert api_key not in json.dumps(result)
     assert not (tmp_path / ".sofa" / "credentials.json").exists()
     assert outside.read_bytes() == b"outside-sentinel\n"
+
+
+def test_vc3_root_swap_after_ignore_blocks_credential_write_without_secret_exposure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    moved_project = tmp_path / "moved-project"
+    secret = "sofa_boundary_secret_must_not_escape"
+    real_open_sofa_directory = sofa._open_sofa_directory
+
+    def swap_then_open(
+        repo_root: Path,
+        *,
+        create: bool,
+        **kwargs: object,
+    ):
+        project.rename(moved_project)
+        project.mkdir()
+        (project / ".gitignore").write_text("replacement-without-sofa-ignore\n")
+        return real_open_sofa_directory(
+            repo_root,
+            create=create,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(sofa, "_open_sofa_directory", swap_then_open)
+
+    result = sofa.store_credentials(
+        repo_root=project,
+        agent_id="boundary-agent",
+        api_key=secret,
+        agent_name="Boundary Agent",
+        base_url="https://sofa.invalid",
+        api_key_prefix="sofa_boundary",
+        api_key_suffix="escape",
+    )
+
+    assert result["ok"] is False
+    assert result["kind"] in {"gitignore_error", "credential_storage_error"}
+    assert secret not in json.dumps(result)
+    assert not (project / ".sofa" / "credentials.json").exists()
+    assert not (moved_project / ".sofa" / "credentials.json").exists()
+
+
+@pytest.mark.parametrize("existing_credentials", [False, True])
+def test_vc3_root_swap_during_credential_replace_rolls_back_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_credentials: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    moved_project = tmp_path / "moved-project"
+    prior_content = b'{"existing": {"api_key": "keep"}}'
+    if existing_credentials:
+        sofa_dir = project / ".sofa"
+        sofa_dir.mkdir()
+        credentials_file = sofa_dir / "credentials.json"
+        credentials_file.write_bytes(prior_content)
+        credentials_file.chmod(0o640)
+    secret = "sofa_replace_boundary_secret_must_not_persist"
+    real_replace = sofa.os.replace
+    swapped = False
+
+    def replace_then_swap(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        real_replace(*args, **kwargs)
+        destination = args[1]
+        if not swapped and str(destination).endswith("credentials.json"):
+            swapped = True
+            project.rename(moved_project)
+            project.mkdir()
+            (project / ".gitignore").write_text("replacement-without-sofa-ignore\n")
+
+    monkeypatch.setattr(sofa.os, "replace", replace_then_swap)
+
+    result = sofa.store_credentials(
+        repo_root=project,
+        agent_id="boundary-agent",
+        api_key=secret,
+        agent_name="Boundary Agent",
+        base_url="https://sofa.invalid",
+        api_key_prefix="sofa_boundary",
+        api_key_suffix="persist",
+    )
+
+    assert swapped is True
+    assert result["ok"] is False
+    assert result["kind"] == "gitignore_error"
+    assert secret not in json.dumps(result)
+    moved_credentials = moved_project / ".sofa" / "credentials.json"
+    if existing_credentials:
+        assert moved_credentials.read_bytes() == prior_content
+        assert stat.S_IMODE(moved_credentials.stat().st_mode) == 0o640
+        assert (
+            list(moved_credentials.parent.glob(".credentials.json.rollback.*.tmp"))
+            == []
+        )
+    else:
+        assert not moved_credentials.exists()
+    assert not (project / ".sofa" / "credentials.json").exists()
+    for root in (project, moved_project):
+        for candidate in root.rglob("*"):
+            if candidate.is_file():
+                assert secret.encode() not in candidate.read_bytes()
+
+
+def test_vc3_failed_restore_removes_newly_installed_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    sofa_dir = project / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    prior_content = b'{"existing": {"api_key": "keep"}}'
+    credentials_file.write_bytes(prior_content)
+    credentials_file.chmod(0o640)
+    moved_project = tmp_path / "moved-project"
+    secret = "sofa_failed_restore_secret_must_not_persist"
+    real_replace = sofa.os.replace
+    credential_replace_count = 0
+
+    def replace_swap_then_fail_restore(*args: object, **kwargs: object) -> None:
+        nonlocal credential_replace_count
+        destination = args[1]
+        if str(destination).endswith("credentials.json"):
+            credential_replace_count += 1
+            if credential_replace_count == 2:
+                raise OSError("rollback replace failed")
+        real_replace(*args, **kwargs)
+        if credential_replace_count == 1:
+            project.rename(moved_project)
+            project.mkdir()
+            (project / ".gitignore").write_text("replacement-without-sofa-ignore\n")
+
+    monkeypatch.setattr(sofa.os, "replace", replace_swap_then_fail_restore)
+
+    result = sofa.store_credentials(
+        repo_root=project,
+        agent_id="boundary-agent",
+        api_key=secret,
+        agent_name="Boundary Agent",
+        base_url="https://sofa.invalid",
+        api_key_prefix="sofa_boundary",
+        api_key_suffix="persist",
+    )
+
+    assert credential_replace_count == 2
+    assert result["ok"] is False
+    assert result["kind"] == "gitignore_error"
+    assert secret not in json.dumps(result)
+    restored = moved_project / ".sofa" / "credentials.json"
+    assert restored.read_bytes() == prior_content
+    assert stat.S_IMODE(restored.stat().st_mode) == 0o640
+    assert list(restored.parent.glob(".credentials.json.rollback.*.tmp")) == []
+    for root in (project, moved_project):
+        for candidate in root.rglob("*"):
+            if candidate.is_file():
+                assert secret.encode() not in candidate.read_bytes()
+
+
+def test_vc3_failed_restore_and_fallback_retains_only_recovery_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    sofa_dir = project / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    prior_content = b'{"existing": {"api_key": "keep"}}'
+    credentials_file.write_bytes(prior_content)
+    credentials_file.chmod(0o640)
+    moved_project = tmp_path / "moved-project"
+    secret = "sofa_failed_fallback_secret_must_not_persist"
+    real_replace = sofa.os.replace
+    real_rename = sofa.os.rename
+    credential_replace_count = 0
+
+    def replace_swap_then_fail_restore(*args: object, **kwargs: object) -> None:
+        nonlocal credential_replace_count
+        destination = args[1]
+        if str(destination).endswith("credentials.json"):
+            credential_replace_count += 1
+            if credential_replace_count == 2:
+                raise OSError("rollback replace failed")
+        real_replace(*args, **kwargs)
+        if credential_replace_count == 1:
+            project.rename(moved_project)
+            project.mkdir()
+            (project / ".gitignore").write_text("replacement-without-sofa-ignore\n")
+
+    def fail_rollback_rename(*args: object, **kwargs: object) -> None:
+        if str(args[0]).startswith(".credentials.json.rollback."):
+            raise OSError("rename failed")
+        real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(sofa.os, "replace", replace_swap_then_fail_restore)
+    monkeypatch.setattr(sofa.os, "rename", fail_rollback_rename)
+
+    result = sofa.store_credentials(
+        repo_root=project,
+        agent_id="boundary-agent",
+        api_key=secret,
+        agent_name="Boundary Agent",
+        base_url="https://sofa.invalid",
+        api_key_prefix="sofa_boundary",
+        api_key_suffix="persist",
+    )
+
+    assert credential_replace_count == 2
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert secret not in json.dumps(result)
+    assert not (moved_project / ".sofa" / "credentials.json").exists()
+    recoveries = list(
+        (moved_project / ".sofa").glob(".credentials.json.rollback.*.tmp")
+    )
+    assert len(recoveries) == 1
+    assert recoveries[0].read_bytes() == prior_content
+    assert stat.S_IMODE(recoveries[0].stat().st_mode) == 0o640
+    for root in (project, moved_project):
+        for candidate in root.rglob("*"):
+            if candidate.is_file() and candidate not in recoveries:
+                assert secret.encode() not in candidate.read_bytes()
 
 
 @pytest.mark.parametrize(
