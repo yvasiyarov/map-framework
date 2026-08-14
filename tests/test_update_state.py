@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -547,6 +548,62 @@ def test_borrowed_provider_refresh_session_promotes_matching_intent_without_dead
             assert state.last_installed_version == "3.26.0"
             assert state.pending_refresh is True
             assert state.pending_providers == ("claude", "codex")
+
+
+def test_borrowed_refresh_revalidates_parent_inside_provider_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_update_state(
+        tmp_path,
+        UpdateState(
+            last_installed_version="3.26.0",
+            pending_refresh=True,
+            pending_providers=("claude",),
+        ),
+    )
+    barrier_held = False
+
+    @contextlib.contextmanager
+    def observed_provider_barrier(
+        _project_path: Path,
+        *,
+        timeout_s: float,
+    ) -> Any:
+        nonlocal barrier_held
+        assert timeout_s == 0.0
+        barrier_held = True
+        try:
+            yield
+        finally:
+            barrier_held = False
+
+    def validate_inside_barrier(*_args: object, **_kwargs: object) -> bool:
+        assert barrier_held, (
+            "parent death after validation must not let a delayed child cross a "
+            "replacement updater's completed barrier probe"
+        )
+        return True
+
+    monkeypatch.setattr(
+        update_state_module,
+        "provider_refresh_lock",
+        observed_provider_barrier,
+    )
+    monkeypatch.setattr(
+        update_state_module,
+        "validate_parent_update_lease",
+        validate_inside_barrier,
+    )
+
+    with update_state_module.provider_refresh_session(
+        tmp_path,
+        provider="claude",
+        running_version="3.26.0",
+        raw_parent_lease="x" * 43,
+        timeout_s=0.0,
+    ):
+        assert barrier_held
 
 
 @pytest.mark.parametrize("raw_lease", [None, "x" * 43])

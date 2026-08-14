@@ -535,16 +535,18 @@ def provider_refresh_session(
     """Serialize one complete ``init --refresh-existing`` mutation."""
     project = project_path.resolve()
     if raw_parent_lease is not None:
-        if not validate_parent_update_lease(
-            project,
-            provider,
-            running_version,
-            raw_parent_lease,
-        ):
-            raise UpdateLeaseRejected("invalid parent update lease")
         # Intent: The parent retains update.lock; the child owns only the orphan
-        # barrier, avoiding a recursive acquisition deadlock.
+        # barrier, avoiding a recursive acquisition deadlock. Validate only after
+        # acquiring that barrier: if the parent dies in between, a delayed child
+        # cannot cross a replacement updater's already-completed barrier probe.
         with provider_refresh_lock(project, timeout_s=timeout_s):
+            if not validate_parent_update_lease(
+                project,
+                provider,
+                running_version,
+                raw_parent_lease,
+            ):
+                raise UpdateLeaseRejected("invalid parent update lease")
             state = read_update_state(project)
             if not _state_authorizes_provider_child(state, provider, running_version):
                 raise UpdateLeaseRejected("invalid parent update lease state")
