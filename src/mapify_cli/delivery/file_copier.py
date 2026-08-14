@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import hashlib
+import importlib
 import importlib.util
 import json
 import os
 import shutil
 import stat
 import tempfile
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from mapify_cli.delivery.agent_generator import (
     create_actor_content,
@@ -496,11 +502,18 @@ _SETTINGS_LOCAL_GITIGNORE_BLOCK = (
 _UPDATE_RUNTIME_GITIGNORE_MARKER = (
     "# map:update-runtime — local automatic-update state; never commit."
 )
+_GITIGNORE_LOCK_MARKER = "# map:gitignore-lock"
+_GITIGNORE_LOCK_PATH = ".map-gitignore.lock"
+_GITIGNORE_LOCK_BLOCK = (
+    "# map:gitignore-lock — MAP root ignore synchronization; never commit.\n"
+    ".map-gitignore.lock\n"
+)
 _UPDATE_RUNTIME_GITIGNORE_PATHS = (
     ".map/update-state.json",
     ".map/update.lock",
     ".map/provider-refresh.lock",
     ".map/installer.lock",
+    _GITIGNORE_LOCK_PATH,
 )
 
 
@@ -512,6 +525,147 @@ def _unsafe_project_gitignore(gitignore: Path, reason: str) -> NoReturn:
     raise UpdateRuntimeGitignoreSecurityError(
         f"unsafe project .gitignore at {gitignore}: {reason}"
     )
+
+
+def _uses_project_gitignore_lock() -> bool:
+    """Return whether this platform needs the ignored project-local fallback."""
+    return os.name == "nt"
+
+
+def _gitignore_lock_path(project_root: Path) -> Path:
+    """Return the shared lock path used by every MAP .gitignore writer.
+
+    The lock is persistent by design: unlinking it after release would create
+    an inode race between a waiter and a new caller. POSIX uses a fixed system
+    temp root so differing TMPDIR environments cannot split the lock identity;
+    Windows uses the centrally ignored direct-project fallback.
+    """
+    if _uses_project_gitignore_lock():
+        # Windows has no environment-independent system temp root. Keep the
+        # persistent direct-child lock in the project, where the central
+        # runtime ignore rule ensures it is never committed.
+        return project_root / _GITIGNORE_LOCK_PATH
+    identity = os.path.normcase(str(project_root)).encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()
+    # A fixed POSIX root makes independent processes agree even when TMPDIR,
+    # TMP, or TEMP differ. The lock file itself is private and identity-checked.
+    return Path("/tmp") / f"mapify-gitignore-{digest}.lock"
+
+
+def _unsafe_gitignore_lock(lock_path: Path, reason: str) -> NoReturn:
+    raise UpdateRuntimeGitignoreSecurityError(
+        f"unsafe MAP .gitignore lock at {lock_path}: {reason}"
+    )
+
+
+def _validate_lock_stat(lock_path: Path, current: os.stat_result) -> None:
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_gitignore_lock(lock_path, "symbolic links are not allowed")
+    if not stat.S_ISREG(current.st_mode):
+        _unsafe_gitignore_lock(lock_path, "the path must be a regular file")
+    if current.st_nlink != 1:
+        _unsafe_gitignore_lock(lock_path, "hard-linked files are not allowed")
+    if hasattr(os, "getuid") and current.st_uid != os.getuid():
+        _unsafe_gitignore_lock(lock_path, "the file must be owned by the current user")
+
+
+def _required_lock_stat(lock_path: Path) -> os.stat_result:
+    try:
+        current = os.lstat(lock_path)
+    except FileNotFoundError:
+        _unsafe_gitignore_lock(lock_path, "the path disappeared")
+    _validate_lock_stat(lock_path, current)
+    return current
+
+
+def _open_gitignore_lock(lock_path: Path) -> int:
+    """Open a private persistent lock without following or accepting links."""
+    try:
+        initial = os.lstat(lock_path)
+    except FileNotFoundError:
+        initial = None
+    if initial is not None:
+        _validate_lock_stat(lock_path, initial)
+
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        _unsafe_gitignore_lock(lock_path, f"could not open it safely ({exc})")
+    try:
+        opened = os.fstat(descriptor)
+        _validate_lock_stat(lock_path, opened)
+        current = _required_lock_stat(lock_path)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            _unsafe_gitignore_lock(lock_path, "the path changed while being opened")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        else:
+            os.chmod(lock_path, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _lock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        msvcrt: Any = importlib.import_module("msvcrt")
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as exc:
+                if exc.errno not in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EDEADLK,
+                } and getattr(exc, "winerror", None) not in {33, 36}:
+                    raise
+                time.sleep(0.05)
+        return
+    fcntl: Any = importlib.import_module("fcntl")
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        msvcrt: Any = importlib.import_module("msvcrt")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    fcntl: Any = importlib.import_module("fcntl")
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
+    """Serialize a complete MAP-owned root .gitignore transaction."""
+    lock_path = _gitignore_lock_path(project_root)
+    descriptor = _open_gitignore_lock(lock_path)
+    locked = False
+    try:
+        _lock_descriptor(descriptor)
+        locked = True
+        opened = os.fstat(descriptor)
+        _validate_lock_stat(lock_path, opened)
+        current = _required_lock_stat(lock_path)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            _unsafe_gitignore_lock(lock_path, "the path changed while waiting")
+        yield
+    finally:
+        if locked:
+            _unlock_descriptor(descriptor)
+        os.close(descriptor)
 
 
 def _validated_gitignore_stat(gitignore: Path) -> os.stat_result | None:
@@ -637,28 +791,33 @@ def _has_gitignore_marker(lines: list[bytes], marker: str) -> bool:
     return any(line == encoded or line.startswith(encoded + b" ") for line in lines)
 
 
-def _merge_project_gitignore(
-    project_path: Path,
+def _merge_project_gitignore_locked(
+    project_root: Path,
     *,
     include_runtime: bool = False,
     include_sofa: bool = False,
     include_agent_memory_local: bool = False,
     include_settings_local: bool = False,
 ) -> int:
-    """Safely and atomically append selected MAP-owned ignore blocks."""
-    project_root = project_path.resolve(strict=True)
-    if not project_root.is_dir():
-        raise NotADirectoryError(f"MAP project root is not a directory: {project_root}")
+    """Append selected MAP-owned blocks while the shared lock is held."""
     gitignore = project_root / ".gitignore"
     existing, original = _read_safe_gitignore(gitignore)
     existing_lines = existing.splitlines()
 
     additions: list[bytes] = []
+    if _uses_project_gitignore_lock() and not _has_effective_gitignore_path(
+        existing_lines, _GITIGNORE_LOCK_PATH
+    ):
+        if _has_gitignore_marker(existing_lines, _GITIGNORE_LOCK_MARKER):
+            additions.append(f"{_GITIGNORE_LOCK_PATH}\n".encode())
+        else:
+            additions.append(_GITIGNORE_LOCK_BLOCK.encode())
     if include_runtime:
         missing_runtime_paths = [
             path
             for path in _UPDATE_RUNTIME_GITIGNORE_PATHS
-            if not _has_effective_gitignore_path(existing_lines, path)
+            if not (_uses_project_gitignore_lock() and path == _GITIGNORE_LOCK_PATH)
+            and not _has_effective_gitignore_path(existing_lines, path)
         ]
         if missing_runtime_paths:
             runtime_lines: list[bytes] = []
@@ -708,6 +867,28 @@ def _merge_project_gitignore(
     replacement = existing + separator + b"".join(additions)
     _atomic_replace_gitignore(gitignore, replacement, original)
     return 1
+
+
+def _merge_project_gitignore(
+    project_path: Path,
+    *,
+    include_runtime: bool = False,
+    include_sofa: bool = False,
+    include_agent_memory_local: bool = False,
+    include_settings_local: bool = False,
+) -> int:
+    """Safely, atomically, and serially append MAP-owned ignore blocks."""
+    project_root = project_path.resolve(strict=True)
+    if not project_root.is_dir():
+        raise NotADirectoryError(f"MAP project root is not a directory: {project_root}")
+    with _project_gitignore_lock(project_root):
+        return _merge_project_gitignore_locked(
+            project_root,
+            include_runtime=include_runtime,
+            include_sofa=include_sofa,
+            include_agent_memory_local=include_agent_memory_local,
+            include_settings_local=include_settings_local,
+        )
 
 
 def merge_update_runtime_gitignore(

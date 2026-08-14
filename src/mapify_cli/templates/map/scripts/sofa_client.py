@@ -14,6 +14,10 @@ Responsibilities:
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import hashlib
+import importlib
 import inspect
 import json
 import os
@@ -24,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -204,6 +209,9 @@ def _request(
 
 _SOFA_MARKER = "# map:sofa"
 _SOFA_BLOCK = "# map:sofa — SOFA credential dir (opt-in); never commit. See docs/USAGE.md\n.sofa/\n"
+_LOCK_MARKER = "# map:gitignore-lock"
+_LOCK_PATH = ".map-gitignore.lock"
+_LOCK_BLOCK = "# map:gitignore-lock — MAP root ignore synchronization; never commit.\n.map-gitignore.lock\n"
 
 
 class SofaGitignoreSecurityError(RuntimeError):
@@ -212,6 +220,131 @@ class SofaGitignoreSecurityError(RuntimeError):
 
 def _unsafe_gitignore(gitignore: Path, reason: str) -> NoReturn:
     raise SofaGitignoreSecurityError(f"unsafe project .gitignore: {reason}")
+
+
+def _gitignore_lock_path(project_root: Path) -> Path:
+    """Return the shared lock path used by every MAP .gitignore writer."""
+    if os.name == "nt":
+        return project_root / _LOCK_PATH
+    identity = os.path.normcase(str(project_root)).encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()
+    return Path("/tmp") / f"mapify-gitignore-{digest}.lock"
+
+
+def _unsafe_gitignore_lock(lock_path: Path, reason: str) -> NoReturn:
+    raise SofaGitignoreSecurityError(
+        f"unsafe MAP .gitignore lock at {lock_path}: {reason}"
+    )
+
+
+def _validate_lock_stat(lock_path: Path, current: os.stat_result) -> None:
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_gitignore_lock(lock_path, "symbolic links are not allowed")
+    if not stat.S_ISREG(current.st_mode):
+        _unsafe_gitignore_lock(lock_path, "the path must be a regular file")
+    if current.st_nlink != 1:
+        _unsafe_gitignore_lock(lock_path, "hard-linked files are not allowed")
+    if hasattr(os, "getuid") and current.st_uid != os.getuid():
+        _unsafe_gitignore_lock(lock_path, "the file must be owned by the current user")
+
+
+def _required_lock_stat(lock_path: Path) -> os.stat_result:
+    try:
+        current = os.lstat(lock_path)
+    except FileNotFoundError:
+        _unsafe_gitignore_lock(lock_path, "the path disappeared")
+    _validate_lock_stat(lock_path, current)
+    return current
+
+
+def _open_private_lock(lock_path: Path) -> int:
+    """Open a private persistent lock without following or accepting links."""
+    try:
+        initial = os.lstat(lock_path)
+    except FileNotFoundError:
+        initial = None
+    if initial is not None:
+        _validate_lock_stat(lock_path, initial)
+
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        _unsafe_gitignore_lock(lock_path, f"could not open it safely ({exc})")
+    try:
+        opened = os.fstat(descriptor)
+        _validate_lock_stat(lock_path, opened)
+        current = _required_lock_stat(lock_path)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            _unsafe_gitignore_lock(lock_path, "the path changed while being opened")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        else:
+            os.chmod(lock_path, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _lock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        msvcrt: Any = importlib.import_module("msvcrt")
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as exc:
+                if exc.errno not in {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    errno.EDEADLK,
+                } and getattr(exc, "winerror", None) not in {33, 36}:
+                    raise
+                time.sleep(0.05)
+        return
+    fcntl: Any = importlib.import_module("fcntl")
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        msvcrt: Any = importlib.import_module("msvcrt")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    fcntl: Any = importlib.import_module("fcntl")
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
+    """Serialize the complete root .gitignore read/merge/replace transaction."""
+    lock_path = _gitignore_lock_path(project_root)
+    descriptor = _open_private_lock(lock_path)
+    locked = False
+    try:
+        _lock_descriptor(descriptor)
+        locked = True
+        opened = os.fstat(descriptor)
+        _validate_lock_stat(lock_path, opened)
+        current = _required_lock_stat(lock_path)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            _unsafe_gitignore_lock(lock_path, "the path changed while waiting")
+        yield
+    finally:
+        if locked:
+            _unlock_descriptor(descriptor)
+        os.close(descriptor)
 
 
 def _validated_gitignore_stat(gitignore: Path) -> os.stat_result | None:
@@ -316,32 +449,71 @@ def _has_effective_sofa_ignore(lines: list[bytes]) -> bool:
     )
 
 
+def _has_effective_exact_ignore(lines: list[bytes], required: str) -> bool:
+    encoded = required.encode()
+    last_exact = max(
+        (index for index, line in enumerate(lines) if line == encoded),
+        default=-1,
+    )
+    return last_exact >= 0 and not any(
+        line.startswith(b"!") for line in lines[last_exact + 1 :]
+    )
+
+
 def _has_sofa_marker(lines: list[bytes]) -> bool:
     marker = _SOFA_MARKER.encode()
     return any(line == marker or line.startswith(marker + b" ") for line in lines)
 
 
+def _ensure_sofa_gitignore_locked(project_root: Path) -> bool:
+    """Update .gitignore while the shared MAP writer lock is held."""
+    gitignore = project_root / ".gitignore"
+    existing, original = _read_safe_gitignore(gitignore)
+    existing_lines = existing.splitlines()
+    sofa_present = _has_effective_sofa_ignore(existing_lines)
+    lock_present = os.name != "nt" or _has_effective_exact_ignore(
+        existing_lines, _LOCK_PATH
+    )
+    if sofa_present and lock_present:
+        _validate_gitignore_unchanged(gitignore, original)
+        return False
+
+    additions: list[bytes] = []
+    if not lock_present:
+        lock_marker = _LOCK_MARKER.encode()
+        additions.append(
+            f"{_LOCK_PATH}\n".encode()
+            if any(
+                line == lock_marker or line.startswith(lock_marker + b" ")
+                for line in existing_lines
+            )
+            else _LOCK_BLOCK.encode()
+        )
+    if not sofa_present:
+        additions.append(
+            b".sofa/\n" if _has_sofa_marker(existing_lines) else _SOFA_BLOCK.encode()
+        )
+    separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
+    _atomic_replace_gitignore(
+        gitignore,
+        existing + separator + b"".join(additions),
+        original,
+    )
+    return True
+
+
 def ensure_sofa_gitignore(repo_root: Path) -> bool:
-    """Ensure .sofa/ is in repo_root/.gitignore under the `# map:sofa` marker.
+    """Ensure .sofa/ is authoritative in the root .gitignore.
 
     The exact canonical path is authoritative only when no later unescaped
     negation follows it. Marker-only and superseded states are repaired.
-    Returns True if the file was modified, False if already present.
+    Returns only after this writer's path is authoritative.
     """
     project_root = repo_root.resolve(strict=True)
     if not project_root.is_dir():
         raise NotADirectoryError("SOFA project root is not a directory")
-    gitignore = project_root / ".gitignore"
-    existing, original = _read_safe_gitignore(gitignore)
-    existing_lines = existing.splitlines()
-    if _has_effective_sofa_ignore(existing_lines):
-        _validate_gitignore_unchanged(gitignore, original)
-        return False
-
-    addition = b".sofa/\n" if _has_sofa_marker(existing_lines) else _SOFA_BLOCK.encode()
-    separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
-    _atomic_replace_gitignore(gitignore, existing + separator + addition, original)
-    return True
+    with _project_gitignore_lock(project_root):
+        return _ensure_sofa_gitignore_locked(project_root)
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +620,111 @@ def _validate_sofa_directory_unchanged(
         or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
     ):
         _unsafe_credentials(".sofa changed during credential access")
+
+
+def _validated_credentials_lock_stat(
+    lock_file: Path,
+    directory_fd: int | None,
+) -> os.stat_result | None:
+    try:
+        if directory_fd is None:
+            current = os.lstat(lock_file)
+        else:
+            current = os.stat(
+                lock_file.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_credentials("credentials.lock must not be a symbolic link")
+    if not stat.S_ISREG(current.st_mode):
+        _unsafe_credentials("credentials.lock must be a regular file")
+    if current.st_nlink != 1:
+        _unsafe_credentials("credentials.lock must not be hard-linked")
+    if hasattr(os, "getuid") and current.st_uid != os.getuid():
+        _unsafe_credentials("credentials.lock must be owned by the current user")
+    return current
+
+
+def _open_credentials_lock(
+    lock_file: Path,
+    sofa_dir: Path,
+    sofa_original: os.stat_result,
+    directory_fd: int | None,
+) -> int:
+    """Open the transaction lock relative to the pinned .sofa directory."""
+    _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+    _validated_credentials_lock_stat(lock_file, directory_fd)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    target: str | Path = lock_file if directory_fd is None else lock_file.name
+    try:
+        if directory_fd is None:
+            descriptor = os.open(target, flags, 0o600)
+        else:
+            descriptor = os.open(target, flags, 0o600, dir_fd=directory_fd)
+    except OSError as exc:
+        _unsafe_credentials(f"could not open credentials.lock safely ({exc})")
+    try:
+        opened = os.fstat(descriptor)
+        current = _validated_credentials_lock_stat(lock_file, directory_fd)
+        if current is None or (opened.st_dev, opened.st_ino) != (
+            current.st_dev,
+            current.st_ino,
+        ):
+            _unsafe_credentials("credentials.lock changed while being opened")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            _unsafe_credentials("the opened credentials.lock is not private")
+        if hasattr(os, "getuid") and opened.st_uid != os.getuid():
+            _unsafe_credentials("credentials.lock must be owned by the current user")
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        else:
+            os.chmod(lock_file, 0o600)
+        _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextlib.contextmanager
+def _credentials_transaction_lock(
+    sofa_dir: Path,
+    sofa_original: os.stat_result,
+    directory_fd: int | None,
+) -> Iterator[None]:
+    """Serialize one complete credentials read/merge/write transaction."""
+    lock_file = sofa_dir / "credentials.lock"
+    descriptor = _open_credentials_lock(
+        lock_file,
+        sofa_dir,
+        sofa_original,
+        directory_fd,
+    )
+    locked = False
+    try:
+        _lock_descriptor(descriptor)
+        locked = True
+        opened = os.fstat(descriptor)
+        current = _validated_credentials_lock_stat(lock_file, directory_fd)
+        if current is None or (opened.st_dev, opened.st_ino) != (
+            current.st_dev,
+            current.st_ino,
+        ):
+            _unsafe_credentials("credentials.lock changed while waiting")
+        _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+        yield
+    finally:
+        if locked:
+            _unlock_descriptor(descriptor)
+        os.close(descriptor)
 
 
 def _validated_credentials_stat(
@@ -719,6 +996,20 @@ def store_credentials(
     Never silently overwrites an existing agent_id entry.
     Sets file permissions to 0600.
     """
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        return _err("invalid_input", "agent_id must be a non-empty string.")
+    if not isinstance(api_key, str) or not api_key.strip():
+        return _err("invalid_input", "api_key must be a non-empty string.")
+    metadata = {
+        "agent_name": agent_name,
+        "base_url": base_url,
+        "api_key_prefix": api_key_prefix,
+        "api_key_suffix": api_key_suffix,
+    }
+    for field_name, value in metadata.items():
+        if not isinstance(value, str):
+            return _err("invalid_input", f"{field_name} must be a string.")
+
     # STEP 1: gitignore BEFORE key (ordering invariant)
     try:
         ensure_sofa_gitignore(repo_root)
@@ -735,39 +1026,44 @@ def store_credentials(
             _unsafe_credentials("could not create .sofa")
         sofa_dir, sofa_original, directory_fd = opened_directory
         creds_file = sofa_dir / "credentials.json"
-        content, original = _read_credentials_bytes(
-            creds_file,
+        with _credentials_transaction_lock(
             sofa_dir,
             sofa_original,
             directory_fd,
-        )
-        data = {} if content is None else _parse_credentials(content)
-
-        if agent_id in data:
-            _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
-            _validate_credentials_unchanged(creds_file, original, directory_fd)
-            return _err(
-                "duplicate_agent",
-                f"Credentials for agent_id={agent_id!r} already exist. "
-                "Remove the entry manually to re-register.",
+        ):
+            content, original = _read_credentials_bytes(
+                creds_file,
+                sofa_dir,
+                sofa_original,
+                directory_fd,
             )
+            data = {} if content is None else _parse_credentials(content)
 
-        data[agent_id] = {
-            "agent_name": agent_name,
-            "base_url": base_url,
-            "api_key_prefix": api_key_prefix,
-            "api_key_suffix": api_key_suffix,
-            "api_key": api_key,
-        }
-        _atomic_write_credentials(
-            creds_file,
-            json.dumps(data, indent=2).encode("utf-8"),
-            original,
-            sofa_dir,
-            sofa_original,
-            directory_fd,
-        )
-        return _ok(agent_id=agent_id, path=str(creds_file))
+            if agent_id in data:
+                _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+                _validate_credentials_unchanged(creds_file, original, directory_fd)
+                return _err(
+                    "duplicate_agent",
+                    f"Credentials for agent_id={agent_id!r} already exist. "
+                    "Remove the entry manually to re-register.",
+                )
+
+            data[agent_id] = {
+                "agent_name": agent_name,
+                "base_url": base_url,
+                "api_key_prefix": api_key_prefix,
+                "api_key_suffix": api_key_suffix,
+                "api_key": api_key,
+            }
+            _atomic_write_credentials(
+                creds_file,
+                json.dumps(data, indent=2).encode("utf-8"),
+                original,
+                sofa_dir,
+                sofa_original,
+                directory_fd,
+            )
+            return _ok(agent_id=agent_id, path=str(creds_file))
     except SofaCredentialsFormatError as exc:
         return _err("bad_json", str(exc))
     except (OSError, SofaCredentialsSecurityError) as exc:
@@ -880,34 +1176,64 @@ def onboarding_register(
     Returns agent_id, api_key (returned once), api_key_prefix, api_key_suffix,
     storage_guidance, next_step.
     """
-    if not agent_name or not agent_name.strip():
+    if not isinstance(base_url, str) or not base_url.strip():
+        return _err("invalid_input", "base_url must be a non-empty string.")
+    if not isinstance(auth_code, str) or not auth_code.strip():
+        return _err("invalid_input", "auth_code must be a non-empty string.")
+    if not isinstance(agent_name, str) or not agent_name.strip():
         return _err(
             "need_agent_name",
             "agent_name is mandatory and must be provided by the human — never invent it.",
         )
-    if not description or not description.strip():
+    if not isinstance(description, str) or not description.strip():
         return _err(
             "need_description",
             "description is mandatory and must be provided by the human — never invent it.",
         )
+    if persona is not None and not isinstance(persona, str):
+        return _err("invalid_input", "persona must be a string when provided.")
 
     body: dict[str, Any] = {
-        "auth_code": auth_code,
+        "auth_code": auth_code.strip(),
         "agent_name": agent_name.strip(),
         "description": description.strip(),
     }
-    if persona:
+    if persona and persona.strip():
         body["persona"] = persona.strip()
 
     result = _request("POST", f"{base_url}/api/onboarding/registrations", body=body)
     if not result["ok"]:
         return result
     d = result["data"]
+    agent_id = d.get("agent_id")
+    api_key = d.get("api_key")
+    api_key_prefix = d.get("api_key_prefix")
+    api_key_suffix = d.get("api_key_suffix")
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        return _err(
+            "invalid_registration",
+            "Registration response did not contain valid credentials.",
+        )
+    if not isinstance(api_key, str) or not api_key.strip():
+        return _err(
+            "invalid_registration",
+            "Registration response did not contain valid credentials.",
+        )
+    if api_key_prefix is not None and not isinstance(api_key_prefix, str):
+        return _err(
+            "invalid_registration",
+            "Registration response contained invalid credential metadata.",
+        )
+    if api_key_suffix is not None and not isinstance(api_key_suffix, str):
+        return _err(
+            "invalid_registration",
+            "Registration response contained invalid credential metadata.",
+        )
     return _ok(
-        agent_id=d.get("agent_id"),
-        api_key=d.get("api_key"),
-        api_key_prefix=d.get("api_key_prefix"),
-        api_key_suffix=d.get("api_key_suffix"),
+        agent_id=agent_id,
+        api_key=api_key,
+        api_key_prefix=api_key_prefix or "",
+        api_key_suffix=api_key_suffix or "",
         storage_guidance=d.get("storage_guidance"),
         next_step=d.get("next_step"),
     )

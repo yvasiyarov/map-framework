@@ -18,7 +18,9 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -44,6 +46,89 @@ def _load_sofa_client():
 
 
 sofa = _load_sofa_client()
+
+_SAFE_SOFA_GITIGNORE = (
+    "# map:gitignore-lock — MAP root ignore synchronization; never commit.\n"
+    ".map-gitignore.lock\n"
+    "# map:sofa\n"
+    ".sofa/\n"
+)
+
+_CONCURRENCY_WORKER = r"""from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+operation = sys.argv[1]
+project = Path(sys.argv[2])
+sofa_source = Path(sys.argv[3])
+attempted = Path(sys.argv[4])
+ready = Path(sys.argv[5])
+release = Path(sys.argv[6])
+done = Path(sys.argv[7])
+pause = sys.argv[8] == "1"
+agent_id = sys.argv[9]
+
+
+def load_sofa():
+    spec = importlib.util.spec_from_file_location("worker_sofa_client", sofa_source)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def pause_after_read(module, attribute: str) -> None:
+    original = getattr(module, attribute)
+
+    def wrapped(*args, **kwargs):
+        result = original(*args, **kwargs)
+        ready.write_text("ready", encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("release marker was not created")
+            time.sleep(0.01)
+        return result
+
+    setattr(module, attribute, wrapped)
+
+
+attempted.write_text("attempted", encoding="utf-8")
+if operation == "gitignore-cli":
+    from mapify_cli.delivery import file_copier
+
+    if pause:
+        pause_after_read(file_copier, "_read_safe_gitignore")
+    changed = file_copier.merge_update_runtime_gitignore(project)
+    result = {"changed": changed}
+elif operation == "gitignore-sofa":
+    sofa = load_sofa()
+    if pause:
+        pause_after_read(sofa, "_read_safe_gitignore")
+    changed = sofa.ensure_sofa_gitignore(project)
+    result = {"changed": changed}
+elif operation == "credential":
+    sofa = load_sofa()
+    if pause:
+        pause_after_read(sofa, "_read_credentials_bytes")
+    result = sofa.store_credentials(
+        repo_root=project,
+        agent_id=agent_id,
+        api_key=f"secret-{agent_id}",
+        agent_name=f"Agent {agent_id}",
+        base_url="https://sofa.invalid",
+        api_key_prefix="secret",
+        api_key_suffix=agent_id,
+    )
+else:
+    raise AssertionError(operation)
+
+done.write_text(json.dumps(result), encoding="utf-8")
+"""
 
 # ---------------------------------------------------------------------------
 # Helpers — urlopen mock factory
@@ -84,6 +169,69 @@ def _store_test_credentials(
         api_key_prefix="sofa_test",
         api_key_suffix="key",
     )
+
+
+def _wait_for_path(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.01)
+    return path.exists()
+
+
+def _start_concurrency_worker(
+    tmp_path: Path,
+    *,
+    name: str,
+    operation: str,
+    project: Path,
+    pause: bool,
+    agent_id: str = "agent",
+    temp_dir: Path | None = None,
+) -> tuple[subprocess.Popen[str], Path, Path, Path, Path]:
+    script = tmp_path / "concurrency-worker.py"
+    script.write_text(_CONCURRENCY_WORKER, encoding="utf-8")
+    attempted = tmp_path / f"{name}.attempted"
+    ready = tmp_path / f"{name}.ready"
+    release = tmp_path / f"{name}.release"
+    done = tmp_path / f"{name}.done"
+    worker_env = None
+    if temp_dir is not None:
+        temp_dir.mkdir()
+        worker_env = {**os.environ, "TMPDIR": str(temp_dir), "TMP": str(temp_dir)}
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            operation,
+            str(project),
+            str(_RENDERED_PATH),
+            str(attempted),
+            str(ready),
+            str(release),
+            str(done),
+            "1" if pause else "0",
+            agent_id,
+        ],
+        cwd=_REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=worker_env,
+    )
+    return process, attempted, ready, release, done
+
+
+def _finish_worker(process: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        stdout, stderr = process.communicate()
+        pytest.fail(f"concurrency worker timed out: {stdout}\n{stderr}")
+    assert process.returncode == 0, f"worker failed: {stdout}\n{stderr}"
+    return stdout, stderr
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +693,87 @@ def test_vc3_secure_merge_rejects_nonregular_gitignore(tmp_path: Path) -> None:
     assert (tmp_path / ".gitignore").is_dir()
 
 
+def test_vc3_cli_and_standalone_share_private_persistent_lock(tmp_path: Path) -> None:
+    from mapify_cli.delivery import file_copier
+
+    project_root = tmp_path.resolve(strict=True)
+    assert sofa._gitignore_lock_path(project_root) == file_copier._gitignore_lock_path(
+        project_root
+    )
+
+    assert sofa.ensure_sofa_gitignore(project_root) is True
+
+    lock_path = sofa._gitignore_lock_path(project_root)
+    lock_stat = os.lstat(lock_path)
+    assert stat.S_ISREG(lock_stat.st_mode)
+    assert lock_stat.st_nlink == 1
+    if os.name != "nt":
+        assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+
+
+def test_vc3_windows_runtime_merge_adds_project_lock_ignore_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    monkeypatch.setattr(file_copier, "_uses_project_gitignore_lock", lambda: True)
+
+    assert (
+        file_copier._merge_project_gitignore_locked(
+            tmp_path,
+            include_runtime=True,
+        )
+        == 1
+    )
+
+    lines = (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert lines.count(".map-gitignore.lock") == 1
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "nonregular"])
+def test_vc3_gitignore_writer_rejects_unsafe_shared_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+    attack: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    if attack == "hardlink" and os.name == "nt":
+        pytest.skip("POSIX hardlink security contract")
+    lock_path = tmp_path / "shared-gitignore.lock"
+    outside = tmp_path / "outside-lock"
+    outside.write_bytes(b"outside-sentinel")
+    if attack == "symlink":
+        lock_path.symlink_to(outside)
+    elif attack == "hardlink":
+        try:
+            os.link(outside, lock_path)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"hardlinks unavailable: {exc}")
+    else:
+        lock_path.mkdir()
+
+    if writer == "cli":
+        monkeypatch.setattr(
+            file_copier, "_gitignore_lock_path", lambda _root: lock_path
+        )
+        operation = lambda: file_copier.merge_update_runtime_gitignore(tmp_path)
+        error = file_copier.UpdateRuntimeGitignoreSecurityError
+    else:
+        monkeypatch.setattr(sofa, "_gitignore_lock_path", lambda _root: lock_path)
+        operation = lambda: sofa.ensure_sofa_gitignore(tmp_path)
+        error = sofa.SofaGitignoreSecurityError
+
+    with pytest.raises(error):
+        operation()
+
+    assert not (tmp_path / ".gitignore").exists()
+    assert outside.read_bytes() == b"outside-sentinel"
+
+
 def test_vc3_secure_merge_replace_failure_preserves_file(tmp_path: Path) -> None:
     gitignore = tmp_path / ".gitignore"
     gitignore.write_bytes(b"user-rule/\n")
@@ -604,7 +833,7 @@ def test_vc3_secure_merge_noop_rejects_post_read_swap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gitignore = tmp_path / ".gitignore"
-    gitignore.write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    gitignore.write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
     real_read = sofa._read_safe_gitignore
 
     def read_then_swap(path: Path):
@@ -645,9 +874,112 @@ def test_vc3_gitignore_failure_blocks_credential_write_without_secret_exposure(
     assert outside.read_bytes() == b"outside-sentinel\n"
 
 
+@pytest.mark.parametrize(
+    ("first_operation", "second_operation"),
+    [
+        ("gitignore-cli", "gitignore-sofa"),
+        ("gitignore-sofa", "gitignore-cli"),
+    ],
+)
+def test_vc3_cli_and_standalone_gitignore_merges_serialize_across_processes(
+    tmp_path: Path,
+    first_operation: str,
+    second_operation: str,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text(
+        "user-rule/\n!.map/**\n!.sofa/**\n", encoding="utf-8"
+    )
+    first, _, first_ready, first_release, first_done = _start_concurrency_worker(
+        tmp_path,
+        name="first",
+        operation=first_operation,
+        project=project,
+        pause=True,
+        temp_dir=tmp_path / "first-process-tmp",
+    )
+    assert _wait_for_path(first_ready), "first writer never reached its protected read"
+
+    second, second_attempted, _, _, second_done = _start_concurrency_worker(
+        tmp_path,
+        name="second",
+        operation=second_operation,
+        project=project,
+        pause=False,
+        temp_dir=tmp_path / "second-process-tmp",
+    )
+    assert _wait_for_path(second_attempted), "second writer never attempted its merge"
+    second_returned_while_first_was_paused = _wait_for_path(second_done, timeout=0.75)
+
+    first_release.write_text("release", encoding="utf-8")
+    _finish_worker(first)
+    _finish_worker(second)
+
+    assert not second_returned_while_first_was_paused
+    assert first_done.is_file()
+    lines = (project / ".gitignore").read_text(encoding="utf-8").splitlines()
+    for required in (
+        ".map/update-state.json",
+        ".map/update.lock",
+        ".map/provider-refresh.lock",
+        ".map/installer.lock",
+        ".map-gitignore.lock",
+        ".sofa/",
+    ):
+        assert lines.count(required) >= 1
+
+
 # ---------------------------------------------------------------------------
 # VC4: no silent overwrite; no secret literal shipped in repo/generated trees
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("agent_id", None),
+        ("agent_id", 42),
+        ("agent_id", ""),
+        ("agent_id", "   "),
+        ("api_key", None),
+        ("api_key", 42),
+        ("api_key", ""),
+        ("api_key", "   "),
+        ("agent_name", None),
+        ("agent_name", 42),
+        ("base_url", None),
+        ("base_url", 42),
+        ("api_key_prefix", None),
+        ("api_key_prefix", 42),
+        ("api_key_suffix", None),
+        ("api_key_suffix", 42),
+    ],
+)
+def test_vc4_store_rejects_invalid_inputs_before_any_filesystem_write(
+    tmp_path: Path,
+    field: str,
+    invalid: object,
+) -> None:
+    secret = "must_not_be_persisted"
+    arguments: dict[str, object] = {
+        "repo_root": tmp_path,
+        "agent_id": "agent-valid",
+        "api_key": secret,
+        "agent_name": "Agent",
+        "base_url": "https://sofa.invalid",
+        "api_key_prefix": "prefix",
+        "api_key_suffix": "suffix",
+    }
+    arguments[field] = invalid
+
+    result = sofa.store_credentials(**arguments)
+
+    assert result["ok"] is False
+    assert result["kind"] == "invalid_input"
+    assert secret not in json.dumps(result)
+    assert not (tmp_path / ".gitignore").exists()
+    assert not (tmp_path / ".sofa").exists()
 
 
 def test_vc4_no_silent_overwrite_and_no_secrets_in_repo():
@@ -873,7 +1205,7 @@ def test_vc4_credential_replace_failure_is_atomic_and_redacted(
     tmp_path: Path,
 ) -> None:
     gitignore = tmp_path / ".gitignore"
-    gitignore.write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    gitignore.write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
     sofa_dir = tmp_path / ".sofa"
     sofa_dir.mkdir()
     credentials_file = sofa_dir / "credentials.json"
@@ -897,7 +1229,7 @@ def test_vc4_fallback_revalidates_sofa_before_allocating_secret_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / ".gitignore").write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
     sofa_dir = tmp_path / ".sofa"
     sofa_dir.mkdir()
     moved_sofa = tmp_path / "moved-sofa"
@@ -932,7 +1264,7 @@ def test_vc4_fallback_revalidates_sofa_after_temp_allocation_before_secret_write
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / ".gitignore").write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
     sofa_dir = tmp_path / ".sofa"
     sofa_dir.mkdir()
     moved_sofa = tmp_path / "moved-sofa"
@@ -970,7 +1302,7 @@ def test_vc4_fallback_sanitizes_temp_if_sofa_swaps_before_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / ".gitignore").write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
     sofa_dir = tmp_path / ".sofa"
     sofa_dir.mkdir()
     moved_sofa = tmp_path / "moved-sofa"
@@ -1084,6 +1416,105 @@ def test_vc4_safe_atomic_store_and_resolve_preserve_entries(tmp_path: Path) -> N
     assert data["existing"]["api_key"] == "keep"
     assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
     assert stat.S_IMODE(sofa_dir.stat().st_mode) == 0o700
+    if os.name != "nt":
+        assert stat.S_IMODE((sofa_dir / "credentials.lock").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "nonregular"])
+def test_vc4_store_rejects_unsafe_credentials_transaction_lock(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    if attack == "hardlink" and os.name == "nt":
+        pytest.skip("POSIX hardlink security contract")
+    (tmp_path / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    lock_file = sofa_dir / "credentials.lock"
+    outside = tmp_path / "outside-credentials-lock"
+    outside.write_bytes(b"outside-sentinel")
+    if attack == "symlink":
+        lock_file.symlink_to(outside)
+    elif attack == "hardlink":
+        try:
+            os.link(outside, lock_file)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"hardlinks unavailable: {exc}")
+    else:
+        lock_file.mkdir()
+    api_key = "secret-must-not-leak"
+
+    result = sofa.store_credentials(
+        repo_root=tmp_path,
+        agent_id="agent",
+        api_key=api_key,
+        agent_name="Agent",
+        base_url="https://sofa.invalid",
+        api_key_prefix="prefix",
+        api_key_suffix="suffix",
+    )
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert api_key not in json.dumps(result)
+    assert not (sofa_dir / "credentials.json").exists()
+    assert outside.read_bytes() == b"outside-sentinel"
+
+
+@pytest.mark.parametrize(
+    ("first_agent", "second_agent", "expected_successes"),
+    [
+        ("agent-a", "agent-b", 2),
+        ("same-agent", "same-agent", 1),
+    ],
+)
+def test_vc4_credential_transactions_serialize_across_processes(
+    tmp_path: Path,
+    first_agent: str,
+    second_agent: str,
+    expected_successes: int,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    first, _, first_ready, first_release, first_done = _start_concurrency_worker(
+        tmp_path,
+        name="first-credential",
+        operation="credential",
+        project=project,
+        pause=True,
+        agent_id=first_agent,
+    )
+    assert _wait_for_path(first_ready), "first credential writer never reached read"
+
+    second, second_attempted, _, _, second_done = _start_concurrency_worker(
+        tmp_path,
+        name="second-credential",
+        operation="credential",
+        project=project,
+        pause=False,
+        agent_id=second_agent,
+    )
+    assert _wait_for_path(second_attempted), "second credential writer never attempted"
+    second_returned_while_first_was_paused = _wait_for_path(second_done, timeout=0.75)
+
+    first_release.write_text("release", encoding="utf-8")
+    _finish_worker(first)
+    _finish_worker(second)
+
+    assert not second_returned_while_first_was_paused
+    results = [
+        json.loads(first_done.read_text(encoding="utf-8")),
+        json.loads(second_done.read_text(encoding="utf-8")),
+    ]
+    assert sum(result["ok"] is True for result in results) == expected_successes
+    credentials = json.loads(
+        (project / ".sofa" / "credentials.json").read_text(encoding="utf-8")
+    )
+    assert set(credentials) == {first_agent, second_agent}
+    assert (
+        stat.S_IMODE((project / ".sofa" / "credentials.json").stat().st_mode) == 0o600
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1137,6 +1568,82 @@ def test_vc5_onboarding_asks_human_and_baseurl_resolution():
     )
     assert not r3["ok"]
     assert r3["kind"] == "need_agent_name"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "expected_kind"),
+    [
+        ("base_url", None, "invalid_input"),
+        ("base_url", 42, "invalid_input"),
+        ("base_url", "   ", "invalid_input"),
+        ("auth_code", None, "invalid_input"),
+        ("auth_code", 42, "invalid_input"),
+        ("auth_code", "", "invalid_input"),
+        ("agent_name", None, "need_agent_name"),
+        ("agent_name", 42, "need_agent_name"),
+        ("agent_name", "", "need_agent_name"),
+        ("description", None, "need_description"),
+        ("description", 42, "need_description"),
+        ("description", "", "need_description"),
+        ("persona", 42, "invalid_input"),
+    ],
+)
+def test_vc5_registration_rejects_invalid_inputs_before_network_call(
+    field: str,
+    invalid: object,
+    expected_kind: str,
+) -> None:
+    arguments: dict[str, object] = {
+        "base_url": "https://sofa.invalid",
+        "auth_code": "auth-code",
+        "agent_name": "Agent",
+        "description": "Description",
+        "persona": None,
+    }
+    arguments[field] = invalid
+
+    with patch.object(sofa, "_request") as request:
+        result = sofa.onboarding_register(**arguments)
+
+    assert result["ok"] is False
+    assert result["kind"] == expected_kind
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "registration_data",
+    [
+        {"agent_id": None, "api_key": "secret"},
+        {"agent_id": 42, "api_key": "secret"},
+        {"agent_id": "", "api_key": "secret"},
+        {"agent_id": "agent", "api_key": None},
+        {"agent_id": "agent", "api_key": 42},
+        {"agent_id": "agent", "api_key": ""},
+        {
+            "agent_id": "agent",
+            "api_key": "secret",
+            "api_key_prefix": [],
+        },
+    ],
+)
+def test_vc5_registration_rejects_malformed_success_payload(
+    registration_data: dict[str, object],
+) -> None:
+    with patch.object(
+        sofa,
+        "_request",
+        return_value={"ok": True, "status": 201, "data": registration_data},
+    ):
+        result = sofa.onboarding_register(
+            "https://sofa.invalid",
+            auth_code="auth-code",
+            agent_name="Agent",
+            description="Description",
+        )
+
+    assert result["ok"] is False
+    assert result["kind"] == "invalid_registration"
+    assert "secret" not in json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
