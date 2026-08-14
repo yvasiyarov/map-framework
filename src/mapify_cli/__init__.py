@@ -1404,7 +1404,7 @@ def init(
             agent_memory_local=(
                 provider != "codex" and effective_agent_memory == "local"
             ),
-            settings_local=(provider != "codex" and autonomy is True),
+            settings_local=(provider != "codex"),
         )
     except UpdateRuntimeGitignoreSecurityError as exc:
         console.print(

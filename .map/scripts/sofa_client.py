@@ -14,15 +14,18 @@ Responsibilities:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
+import secrets
 import stat
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 # ---------------------------------------------------------------------------
 # Typed result helpers
@@ -80,19 +83,17 @@ def resolve_key(agent_id: str | None = None, credentials_path: Path | None = Non
     if credentials_path is None:
         return _err("no_key", "SOFA_API_KEY not set and no credentials_path provided.")
 
-    creds_file = Path(credentials_path)
-    if not creds_file.exists():
-        return _err("no_key", f"No credentials file at {creds_file}")
-
     try:
-        data: Any = json.loads(creds_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return _err("bad_json", f"Cannot read credentials file: {exc}")
-    if not isinstance(data, dict):
+        data = _load_credentials(Path(credentials_path), missing_ok=True)
+    except SofaCredentialsFormatError as exc:
+        return _err("bad_json", str(exc))
+    except (OSError, SofaCredentialsSecurityError) as exc:
         return _err(
-            "bad_json",
-            f"credentials.json must contain a JSON object, got {type(data).__name__}.",
+            "credential_storage_error",
+            f"Cannot securely read credentials: {exc}",
         )
+    if data is None:
+        return _err("no_key", "No credentials file is available.")
 
     if agent_id:
         entry = data.get(agent_id)
@@ -194,37 +195,506 @@ _SOFA_MARKER = "# map:sofa"
 _SOFA_BLOCK = "# map:sofa — SOFA credential dir (opt-in); never commit. See docs/USAGE.md\n.sofa/\n"
 
 
+class SofaGitignoreSecurityError(RuntimeError):
+    """Raised when the project .gitignore cannot be updated safely."""
+
+
+def _unsafe_gitignore(gitignore: Path, reason: str) -> NoReturn:
+    raise SofaGitignoreSecurityError(f"unsafe project .gitignore: {reason}")
+
+
+def _validated_gitignore_stat(gitignore: Path) -> os.stat_result | None:
+    try:
+        current = os.lstat(gitignore)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_gitignore(gitignore, "symbolic links are not allowed")
+    if not stat.S_ISREG(current.st_mode):
+        _unsafe_gitignore(gitignore, "the path must be a regular file")
+    if current.st_nlink != 1:
+        _unsafe_gitignore(gitignore, "hard-linked files are not allowed")
+    return current
+
+
+def _read_safe_gitignore(
+    gitignore: Path,
+) -> tuple[bytes, os.stat_result | None]:
+    initial = _validated_gitignore_stat(gitignore)
+    if initial is None:
+        return b"", None
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(gitignore, flags)
+    except OSError as exc:
+        _unsafe_gitignore(gitignore, f"could not open it safely ({exc})")
+
+    try:
+        opened = os.fstat(descriptor)
+        current = _validated_gitignore_stat(gitignore)
+        if current is None or (opened.st_dev, opened.st_ino) != (
+            current.st_dev,
+            current.st_ino,
+        ):
+            _unsafe_gitignore(gitignore, "the path changed while being read")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            _unsafe_gitignore(gitignore, "the opened file is not private")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read(), opened
+    finally:
+        os.close(descriptor)
+
+
+def _validate_gitignore_unchanged(
+    gitignore: Path,
+    original: os.stat_result | None,
+) -> None:
+    current = _validated_gitignore_stat(gitignore)
+    if original is None:
+        if current is not None:
+            _unsafe_gitignore(gitignore, "the path appeared during the update")
+        return
+    if current is None or (current.st_dev, current.st_ino) != (
+        original.st_dev,
+        original.st_ino,
+    ):
+        _unsafe_gitignore(gitignore, "the path changed during the update")
+
+
+def _atomic_replace_gitignore(
+    gitignore: Path,
+    content: bytes,
+    original: os.stat_result | None,
+) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=gitignore.parent,
+        prefix=".gitignore.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        mode = stat.S_IMODE(original.st_mode) if original is not None else 0o644
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, mode)
+        else:
+            os.chmod(temporary, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _validate_gitignore_unchanged(gitignore, original)
+        os.replace(temporary, gitignore)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _has_effective_sofa_ignore(lines: list[bytes]) -> bool:
+    last_exact = -1
+    for index, line in enumerate(lines):
+        if line == b".sofa/":
+            last_exact = index
+    return last_exact >= 0 and not any(
+        line.startswith(b"!") for line in lines[last_exact + 1 :]
+    )
+
+
+def _has_sofa_marker(lines: list[bytes]) -> bool:
+    marker = _SOFA_MARKER.encode()
+    return any(line == marker or line.startswith(marker + b" ") for line in lines)
+
+
 def ensure_sofa_gitignore(repo_root: Path) -> bool:
     """Ensure .sofa/ is in repo_root/.gitignore under the `# map:sofa` marker.
 
-    Idempotent: skips if the marker OR a `.sofa/` line already present.
+    The exact canonical path is authoritative only when no later unescaped
+    negation follows it. Marker-only and superseded states are repaired.
     Returns True if the file was modified, False if already present.
     """
-    gitignore = repo_root / ".gitignore"
-    existing = ""
-    if gitignore.exists():
-        existing = gitignore.read_text(encoding="utf-8")
-
-    # Idempotency guard: skip if our marker is present OR `.sofa/` already
-    # appears as a standalone ignore line. OR (not AND) keeps `.sofa/` present
-    # exactly once even when the user added it without our marker. The
-    # stripped-line-set check (not a bare substring) avoids false matches on
-    # comments or path fragments and is symmetric with merge_sofa_gitignore in
-    # mapify_cli/delivery/file_copier.py.
-    ignored_lines = {line.strip() for line in existing.splitlines()}
-    if _SOFA_MARKER in existing or ".sofa/" in ignored_lines:
+    project_root = repo_root.resolve(strict=True)
+    if not project_root.is_dir():
+        raise NotADirectoryError("SOFA project root is not a directory")
+    gitignore = project_root / ".gitignore"
+    existing, original = _read_safe_gitignore(gitignore)
+    existing_lines = existing.splitlines()
+    if _has_effective_sofa_ignore(existing_lines):
+        _validate_gitignore_unchanged(gitignore, original)
         return False
 
-    # Append — ensure trailing newline before our block
-    separator = "" if existing.endswith("\n") or not existing else "\n"
-    with gitignore.open("a", encoding="utf-8") as fh:
-        fh.write(separator + _SOFA_BLOCK)
+    addition = (
+        b".sofa/\n"
+        if _has_sofa_marker(existing_lines)
+        else _SOFA_BLOCK.encode()
+    )
+    separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
+    _atomic_replace_gitignore(gitignore, existing + separator + addition, original)
     return True
 
 
 # ---------------------------------------------------------------------------
 # Credential storage (VC3 / VC4)
 # ---------------------------------------------------------------------------
+
+class SofaCredentialsSecurityError(RuntimeError):
+    """Raised when the local credential path is unsafe."""
+
+
+class SofaCredentialsFormatError(ValueError):
+    """Raised when existing credentials do not match the expected JSON shape."""
+
+
+def _replace_supports_directory_fds() -> bool:
+    """Return whether this platform's ``os.replace`` accepts directory FDs."""
+    try:
+        parameters = inspect.signature(os.replace).parameters
+    except (TypeError, ValueError):
+        return False
+    return "src_dir_fd" in parameters and "dst_dir_fd" in parameters
+
+
+_CAN_USE_DIRECTORY_FD = (
+    hasattr(os, "O_DIRECTORY")
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and _replace_supports_directory_fds()
+)
+
+
+def _unsafe_credentials(reason: str) -> NoReturn:
+    raise SofaCredentialsSecurityError(f"unsafe SOFA credentials path: {reason}")
+
+
+def _open_sofa_directory(
+    repo_root: Path,
+    *,
+    create: bool,
+) -> tuple[Path, os.stat_result, int | None] | None:
+    """Validate and optionally create the direct .sofa directory.
+
+    On platforms with directory-relative operations, the returned descriptor
+    pins the validated directory for the whole read or write transaction.
+    """
+    project_root = repo_root.resolve(strict=True)
+    if not project_root.is_dir():
+        _unsafe_credentials("the project root is not a directory")
+    sofa_dir = project_root / ".sofa"
+    try:
+        current = os.lstat(sofa_dir)
+    except FileNotFoundError:
+        if not create:
+            return None
+        try:
+            sofa_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        current = os.lstat(sofa_dir)
+
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_credentials(".sofa must not be a symbolic link")
+    if not stat.S_ISDIR(current.st_mode):
+        _unsafe_credentials(".sofa must be a directory")
+    if sofa_dir.resolve(strict=True) != project_root / ".sofa":
+        _unsafe_credentials(".sofa resolved outside the project root")
+
+    if not _CAN_USE_DIRECTORY_FD:
+        return sofa_dir, current, None
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        descriptor = os.open(sofa_dir, flags)
+    except OSError as exc:
+        _unsafe_credentials(f"could not open .sofa safely ({exc})")
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        os.close(descriptor)
+        _unsafe_credentials(".sofa changed while being opened")
+    return sofa_dir, opened, descriptor
+
+
+def _validate_sofa_directory_unchanged(
+    sofa_dir: Path,
+    original: os.stat_result,
+) -> None:
+    try:
+        current = os.lstat(sofa_dir)
+    except FileNotFoundError:
+        _unsafe_credentials(".sofa disappeared during credential access")
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+    ):
+        _unsafe_credentials(".sofa changed during credential access")
+
+
+def _validated_credentials_stat(
+    credentials_file: Path,
+    directory_fd: int | None,
+) -> os.stat_result | None:
+    try:
+        if directory_fd is None:
+            current = os.lstat(credentials_file)
+        else:
+            current = os.stat(
+                credentials_file.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_credentials("credentials.json must not be a symbolic link")
+    if not stat.S_ISREG(current.st_mode):
+        _unsafe_credentials("credentials.json must be a regular file")
+    if current.st_nlink != 1:
+        _unsafe_credentials("credentials.json must not be hard-linked")
+    return current
+
+
+def _validate_credentials_unchanged(
+    credentials_file: Path,
+    original: os.stat_result | None,
+    directory_fd: int | None,
+) -> None:
+    current = _validated_credentials_stat(credentials_file, directory_fd)
+    if original is None:
+        if current is not None:
+            _unsafe_credentials("credentials.json appeared during the update")
+        return
+    if current is None or (current.st_dev, current.st_ino) != (
+        original.st_dev,
+        original.st_ino,
+    ):
+        _unsafe_credentials("credentials.json changed during the update")
+
+
+def _read_credentials_bytes(
+    credentials_file: Path,
+    sofa_dir: Path,
+    sofa_original: os.stat_result,
+    directory_fd: int | None,
+) -> tuple[bytes | None, os.stat_result | None]:
+    initial = _validated_credentials_stat(credentials_file, directory_fd)
+    if initial is None:
+        _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+        return None, None
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    target: str | Path = (
+        credentials_file if directory_fd is None else credentials_file.name
+    )
+    try:
+        if directory_fd is None:
+            descriptor = os.open(target, flags)
+        else:
+            descriptor = os.open(target, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        _unsafe_credentials(f"could not open credentials.json safely ({exc})")
+
+    try:
+        opened = os.fstat(descriptor)
+        current = _validated_credentials_stat(credentials_file, directory_fd)
+        if current is None or (opened.st_dev, opened.st_ino) != (
+            current.st_dev,
+            current.st_ino,
+        ):
+            _unsafe_credentials("credentials.json changed while being read")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            _unsafe_credentials("the opened credentials file is not private")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read()
+        _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+        _validate_credentials_unchanged(credentials_file, opened, directory_fd)
+        return content, opened
+    finally:
+        os.close(descriptor)
+
+
+def _parse_credentials(content: bytes) -> dict[str, Any]:
+    try:
+        parsed: Any = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SofaCredentialsFormatError(
+            "credentials.json must contain valid UTF-8 JSON."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise SofaCredentialsFormatError(
+            "credentials.json must contain a JSON object."
+        )
+    for agent, entry in parsed.items():
+        if not isinstance(agent, str) or not isinstance(entry, dict):
+            raise SofaCredentialsFormatError(
+                "each credentials.json entry must be an object keyed by agent id."
+            )
+        api_key = entry.get("api_key")
+        if api_key is not None and not isinstance(api_key, str):
+            raise SofaCredentialsFormatError(
+                "each credentials.json api_key must be a string."
+            )
+    return parsed
+
+
+def _credentials_location(credentials_path: Path) -> tuple[Path, Path]:
+    requested = Path(os.path.abspath(credentials_path))
+    if requested.name != "credentials.json" or requested.parent.name != ".sofa":
+        _unsafe_credentials("expected a direct .sofa/credentials.json path")
+    try:
+        project_root = requested.parent.parent.resolve(strict=True)
+    except OSError as exc:
+        _unsafe_credentials(f"could not resolve the project root ({exc})")
+    return project_root, project_root / ".sofa" / "credentials.json"
+
+
+def _load_credentials(
+    credentials_path: Path,
+    *,
+    missing_ok: bool,
+) -> dict[str, Any] | None:
+    project_root, credentials_file = _credentials_location(credentials_path)
+    opened_directory = _open_sofa_directory(project_root, create=False)
+    if opened_directory is None:
+        if missing_ok:
+            return None
+        _unsafe_credentials(".sofa does not exist")
+    sofa_dir, sofa_original, directory_fd = opened_directory
+    try:
+        content, _ = _read_credentials_bytes(
+            credentials_file,
+            sofa_dir,
+            sofa_original,
+            directory_fd,
+        )
+        if content is None:
+            if missing_ok:
+                return None
+            _unsafe_credentials("credentials.json does not exist")
+        return _parse_credentials(content)
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _atomic_write_credentials(
+    credentials_file: Path,
+    content: bytes,
+    original: os.stat_result | None,
+    sofa_dir: Path,
+    sofa_original: os.stat_result,
+    directory_fd: int | None,
+) -> None:
+    if directory_fd is not None:
+        descriptor = -1
+        temporary_name = ""
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            for _ in range(32):
+                temporary_name = (
+                    f".credentials.json.{secrets.token_hex(12)}.tmp"
+                )
+                try:
+                    descriptor = os.open(
+                        temporary_name,
+                        flags,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            if descriptor < 0:
+                raise FileExistsError("could not allocate a private temporary file")
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+            _validate_credentials_unchanged(
+                credentials_file,
+                original,
+                directory_fd,
+            )
+            os.replace(
+                temporary_name,
+                credentials_file.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary_name:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+        return
+
+    # Without directory-relative syscalls we cannot pin the parent directory,
+    # so reject a swap before allocating any temp path and again immediately
+    # after allocation, before secret bytes are written.
+    _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=sofa_dir,
+        prefix=".credentials.json.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    secret_written = False
+    try:
+        _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        else:
+            os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            secret_written = True
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+        _validate_credentials_unchanged(credentials_file, original, directory_fd)
+        # Windows cannot atomically replace a file while this descriptor is
+        # open. Close only after both target identities have been revalidated.
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, credentials_file)
+    finally:
+        if descriptor >= 0:
+            if secret_written and hasattr(os, "ftruncate"):
+                try:
+                    os.ftruncate(descriptor, 0)
+                    os.fsync(descriptor)
+                except OSError:
+                    pass
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 def store_credentials(
     *,
@@ -245,45 +715,64 @@ def store_credentials(
     Sets file permissions to 0600.
     """
     # STEP 1: gitignore BEFORE key (ordering invariant)
-    ensure_sofa_gitignore(repo_root)
-
-    sofa_dir = repo_root / ".sofa"
-    sofa_dir.mkdir(mode=0o700, exist_ok=True)
-
-    creds_file = sofa_dir / "credentials.json"
-    data: dict[str, Any] = {}
-    if creds_file.exists():
-        try:
-            loaded: Any = json.loads(creds_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            loaded = {}
-        if not isinstance(loaded, dict):
-            # Refuse to clobber an existing-but-unexpected credentials file.
-            return _err(
-                "bad_json",
-                f"credentials.json must contain a JSON object, got {type(loaded).__name__}.",
-            )
-        data = loaded
-
-    if agent_id in data:
+    try:
+        ensure_sofa_gitignore(repo_root)
+    except Exception as exc:  # noqa: BLE001 -- typed security boundary
         return _err(
-            "duplicate_agent",
-            f"Credentials for agent_id={agent_id!r} already exist. "
-            "Remove the entry manually to re-register.",
+            "gitignore_error",
+            f"Refusing to store credentials because .gitignore is unsafe: {exc}",
         )
 
-    data[agent_id] = {
-        "agent_name": agent_name,
-        "base_url": base_url,
-        "api_key_prefix": api_key_prefix,
-        "api_key_suffix": api_key_suffix,
-        "api_key": api_key,
-    }
-    creds_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    # Restrict to owner read/write only
-    os.chmod(creds_file, stat.S_IRUSR | stat.S_IWUSR)
+    directory_fd: int | None = None
+    try:
+        opened_directory = _open_sofa_directory(repo_root, create=True)
+        if opened_directory is None:
+            _unsafe_credentials("could not create .sofa")
+        sofa_dir, sofa_original, directory_fd = opened_directory
+        creds_file = sofa_dir / "credentials.json"
+        content, original = _read_credentials_bytes(
+            creds_file,
+            sofa_dir,
+            sofa_original,
+            directory_fd,
+        )
+        data = {} if content is None else _parse_credentials(content)
 
-    return _ok(agent_id=agent_id, path=str(creds_file))
+        if agent_id in data:
+            _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
+            _validate_credentials_unchanged(creds_file, original, directory_fd)
+            return _err(
+                "duplicate_agent",
+                f"Credentials for agent_id={agent_id!r} already exist. "
+                "Remove the entry manually to re-register.",
+            )
+
+        data[agent_id] = {
+            "agent_name": agent_name,
+            "base_url": base_url,
+            "api_key_prefix": api_key_prefix,
+            "api_key_suffix": api_key_suffix,
+            "api_key": api_key,
+        }
+        _atomic_write_credentials(
+            creds_file,
+            json.dumps(data, indent=2).encode("utf-8"),
+            original,
+            sofa_dir,
+            sofa_original,
+            directory_fd,
+        )
+        return _ok(agent_id=agent_id, path=str(creds_file))
+    except SofaCredentialsFormatError as exc:
+        return _err("bad_json", str(exc))
+    except (OSError, SofaCredentialsSecurityError) as exc:
+        return _err(
+            "credential_storage_error",
+            f"Refusing to store credentials securely: {exc}",
+        )
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 # ---------------------------------------------------------------------------

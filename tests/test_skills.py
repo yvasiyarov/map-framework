@@ -442,6 +442,7 @@ class TestProviderUpdateSkills:
         assert ".map/update-state.json" in gitignore.splitlines()
         assert ".map/update.lock" in gitignore.splitlines()
         assert ".map/provider-refresh.lock" in gitignore.splitlines()
+        assert ".map/installer.lock" in gitignore.splitlines()
 
 
 class TestSkillStructure:

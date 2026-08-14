@@ -16,12 +16,15 @@ import ast
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # Load the rendered module (importlib — it lives in .map/scripts/, not a pkg)
@@ -62,6 +65,23 @@ def _make_http_error(status: int, body: Any) -> urllib.error.HTTPError:
     fp = io.BytesIO(raw)
     err = urllib.error.HTTPError(url="http://x", code=status, msg="err", hdrs=MagicMock(), fp=fp)  # type: ignore[arg-type]
     return err
+
+
+def _store_test_credentials(
+    repo_root: Path,
+    *,
+    api_key: str = "sofa_test_private_key",
+    agent_id: str = "agent-test",
+):
+    return sofa.store_credentials(
+        repo_root=repo_root,
+        agent_id=agent_id,
+        api_key=api_key,
+        agent_name="Test Agent",
+        base_url="http://fake",
+        api_key_prefix="sofa_test",
+        api_key_suffix="key",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +376,193 @@ def test_vc3_gitignore_ensured_before_key_write_idempotent():
         assert gi_content2.count(".sofa/") == 1, "Duplicate .sofa/ line appended!"
 
 
+@pytest.mark.parametrize(
+    "original",
+    [
+        "# map:sofa\n",
+        "# map:sofa\n.sofa/\n!.sofa/\n",
+        "# map:sofa\n.sofa/\n!.sofa/**\n",
+        "# map:sofa\n.sofa/\n!unrelated/**\n",
+        "user-rule/\n  .sofa/\n",
+    ],
+)
+def test_vc3_repairs_marker_only_leading_space_and_later_negations(
+    tmp_path: Path,
+    original: str,
+) -> None:
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text(original, encoding="utf-8")
+    gitignore.chmod(0o640)
+
+    assert sofa.ensure_sofa_gitignore(tmp_path) is True
+    repaired = gitignore.read_text(encoding="utf-8")
+    repaired_lines = repaired.splitlines()
+
+    assert repaired.startswith(original)
+    assert sum(line.startswith("# map:sofa") for line in repaired_lines) == 1
+    assert repaired_lines.count(".sofa/") == original.splitlines().count(".sofa/") + 1
+    negation_indexes = [
+        index for index, line in enumerate(repaired_lines) if line.startswith("!")
+    ]
+    if negation_indexes:
+        assert max(
+            index for index, line in enumerate(repaired_lines) if line == ".sofa/"
+        ) > max(negation_indexes)
+    assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+
+    assert sofa.ensure_sofa_gitignore(tmp_path) is False
+    assert gitignore.read_text(encoding="utf-8") == repaired
+
+
+def test_vc3_secure_merge_preserves_readonly_mode_and_content(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX read-only mode contract")
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_bytes(b"user-rule/\n")
+    gitignore.chmod(0o444)
+
+    assert sofa.ensure_sofa_gitignore(tmp_path) is True
+
+    assert gitignore.read_bytes().startswith(b"user-rule/\n")
+    assert b".sofa/\n" in gitignore.read_bytes()
+    assert stat.S_IMODE(gitignore.stat().st_mode) == 0o444
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+def test_vc3_secure_merge_rejects_linked_gitignore(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    if attack == "hardlink" and os.name == "nt":
+        pytest.skip("POSIX hardlink security contract")
+    outside = tmp_path / "outside-gitignore"
+    outside.write_bytes(b"outside-sentinel\n")
+    outside.chmod(0o640)
+    gitignore = tmp_path / ".gitignore"
+    if attack == "symlink":
+        gitignore.symlink_to(outside)
+    else:
+        try:
+            os.link(outside, gitignore)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"hardlinks unavailable: {exc}")
+
+    with pytest.raises(sofa.SofaGitignoreSecurityError):
+        sofa.ensure_sofa_gitignore(tmp_path)
+
+    assert outside.read_bytes() == b"outside-sentinel\n"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+
+
+def test_vc3_secure_merge_rejects_nonregular_gitignore(tmp_path: Path) -> None:
+    (tmp_path / ".gitignore").mkdir()
+
+    with pytest.raises(sofa.SofaGitignoreSecurityError):
+        sofa.ensure_sofa_gitignore(tmp_path)
+
+    assert (tmp_path / ".gitignore").is_dir()
+
+
+def test_vc3_secure_merge_replace_failure_preserves_file(tmp_path: Path) -> None:
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_bytes(b"user-rule/\n")
+    gitignore.chmod(0o640)
+
+    with (
+        patch.object(sofa.os, "replace", side_effect=OSError("replace failed")),
+        pytest.raises(OSError, match="replace failed"),
+    ):
+        sofa.ensure_sofa_gitignore(tmp_path)
+
+    assert gitignore.read_bytes() == b"user-rule/\n"
+    assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+    assert list(tmp_path.glob(".gitignore.*.tmp")) == []
+
+
+def test_vc3_secure_merge_supports_platform_without_fchmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(sofa.os, "fchmod", raising=False)
+
+    assert sofa.ensure_sofa_gitignore(tmp_path) is True
+
+    assert ".sofa/" in (tmp_path / ".gitignore").read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+
+def test_vc3_secure_merge_closes_temp_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_mkstemp = sofa.tempfile.mkstemp
+    real_replace = sofa.os.replace
+    captured_descriptor: dict[str, int] = {}
+
+    def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, temporary_name = real_mkstemp(*args, **kwargs)
+        captured_descriptor["value"] = descriptor
+        return descriptor, temporary_name
+
+    def replace_after_close(source: Path, destination: Path) -> None:
+        with pytest.raises(OSError):
+            os.fstat(captured_descriptor["value"])
+        real_replace(source, destination)
+
+    monkeypatch.setattr(sofa.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(sofa.os, "replace", replace_after_close)
+
+    assert sofa.ensure_sofa_gitignore(tmp_path) is True
+    assert (tmp_path / ".gitignore").is_file()
+
+
+def test_vc3_secure_merge_noop_rejects_post_read_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    real_read = sofa._read_safe_gitignore
+
+    def read_then_swap(path: Path):
+        existing, original = real_read(path)
+        replacement = path.with_name("replacement.gitignore")
+        replacement.write_bytes(existing)
+        os.replace(replacement, path)
+        return existing, original
+
+    monkeypatch.setattr(sofa, "_read_safe_gitignore", read_then_swap)
+
+    with pytest.raises(sofa.SofaGitignoreSecurityError):
+        sofa.ensure_sofa_gitignore(tmp_path)
+
+
+def test_vc3_gitignore_failure_blocks_credential_write_without_secret_exposure(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-gitignore"
+    outside.write_bytes(b"outside-sentinel\n")
+    (tmp_path / ".gitignore").symlink_to(outside)
+    api_key = "sofa_private_key_must_not_escape"
+
+    result = sofa.store_credentials(
+        repo_root=tmp_path,
+        agent_id="agent-private",
+        api_key=api_key,
+        agent_name="Private Agent",
+        base_url="http://fake",
+        api_key_prefix="sofa_private",
+        api_key_suffix="escape",
+    )
+
+    assert result["ok"] is False
+    assert result["kind"] == "gitignore_error"
+    assert api_key not in json.dumps(result)
+    assert not (tmp_path / ".sofa" / "credentials.json").exists()
+    assert outside.read_bytes() == b"outside-sentinel\n"
+
+
 # ---------------------------------------------------------------------------
 # VC4: no silent overwrite; no secret literal shipped in repo/generated trees
 # ---------------------------------------------------------------------------
@@ -445,6 +652,351 @@ def test_vc4_non_dict_credentials_returns_typed_error_no_raise():
             rk = sofa.resolve_key(agent_id="a1", credentials_path=creds_file)
         assert not rk["ok"]
         assert rk["kind"] == "bad_json"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"agent": ["not", "an", "object"]},
+        {"agent": {"api_key": 42}},
+    ],
+)
+def test_vc4_malformed_nested_credentials_return_typed_error(
+    tmp_path: Path,
+    payload: dict[str, Any],
+) -> None:
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    original = json.dumps(payload).encode()
+    credentials_file.write_bytes(original)
+    env_without_key = {key: value for key, value in os.environ.items() if key != "SOFA_API_KEY"}
+
+    with patch.dict(os.environ, env_without_key, clear=True):
+        resolved = sofa.resolve_key(
+            agent_id="agent",
+            credentials_path=credentials_file,
+        )
+    stored = _store_test_credentials(tmp_path, api_key="must_not_be_written")
+
+    assert resolved["ok"] is False
+    assert resolved["kind"] == "bad_json"
+    assert stored["ok"] is False
+    assert stored["kind"] == "bad_json"
+    assert credentials_file.read_bytes() == original
+
+
+@pytest.mark.parametrize("attack", ["sofa-symlink", "credential-symlink", "credential-hardlink"])
+def test_vc4_store_rejects_linked_credential_paths_without_secret_exposure(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    if attack == "credential-hardlink" and os.name == "nt":
+        pytest.skip("POSIX hardlink security contract")
+    outside_dir = tmp_path / "outside-sofa"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "credentials.json"
+    outside_file.write_bytes(b"{}")
+    sofa_dir = tmp_path / ".sofa"
+    credentials_file = sofa_dir / "credentials.json"
+    if attack == "sofa-symlink":
+        sofa_dir.symlink_to(outside_dir, target_is_directory=True)
+    else:
+        sofa_dir.mkdir()
+        if attack == "credential-symlink":
+            credentials_file.symlink_to(outside_file)
+        else:
+            try:
+                os.link(outside_file, credentials_file)
+            except (NotImplementedError, OSError) as exc:
+                pytest.skip(f"hardlinks unavailable: {exc}")
+    api_key = "sofa_link_attack_secret"
+
+    result = _store_test_credentials(tmp_path, api_key=api_key)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert api_key not in json.dumps(result)
+    assert outside_file.read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo"])
+def test_vc4_store_rejects_nonregular_credentials_path(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    if kind == "fifo" and (os.name == "nt" or not hasattr(os, "mkfifo")):
+        pytest.skip("FIFO unavailable")
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    if kind == "directory":
+        credentials_file.mkdir()
+    else:
+        os.mkfifo(credentials_file)
+
+    result = _store_test_credentials(tmp_path, api_key="sofa_nonregular_secret")
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert credentials_file.exists()
+
+
+@pytest.mark.parametrize("contents", [b"{broken-json", b"[]"])
+def test_vc4_store_does_not_clobber_invalid_existing_credentials(
+    tmp_path: Path,
+    contents: bytes,
+) -> None:
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    credentials_file.write_bytes(contents)
+    credentials_file.chmod(0o640)
+
+    result = _store_test_credentials(tmp_path, api_key="sofa_invalid_json_secret")
+
+    assert result["ok"] is False
+    assert result["kind"] == "bad_json"
+    assert credentials_file.read_bytes() == contents
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o640
+
+
+def test_vc4_store_does_not_clobber_unreadable_credentials(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX unreadable-file contract")
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    credentials_file.write_bytes(b'{"existing": {"api_key": "keep"}}')
+    credentials_file.chmod(0o000)
+
+    try:
+        result = _store_test_credentials(
+            tmp_path, api_key="sofa_unreadable_secret"
+        )
+    finally:
+        credentials_file.chmod(0o600)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert credentials_file.read_bytes() == b'{"existing": {"api_key": "keep"}}'
+
+
+def test_vc4_credential_replace_failure_is_atomic_and_redacted(
+    tmp_path: Path,
+) -> None:
+    gitignore = tmp_path / ".gitignore"
+    gitignore.write_text("# map:sofa\n.sofa/\n", encoding="utf-8")
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    credentials_file = sofa_dir / "credentials.json"
+    original = b'{"existing": {"api_key": "keep"}}'
+    credentials_file.write_bytes(original)
+    credentials_file.chmod(0o640)
+    api_key = "sofa_atomic_failure_secret"
+
+    with patch.object(sofa.os, "replace", side_effect=OSError("replace failed")):
+        result = _store_test_credentials(tmp_path, api_key=api_key)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert api_key not in json.dumps(result)
+    assert credentials_file.read_bytes() == original
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o640
+    assert list(sofa_dir.glob(".credentials.json.*.tmp")) == []
+
+
+def test_vc4_fallback_revalidates_sofa_before_allocating_secret_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "# map:sofa\n.sofa/\n", encoding="utf-8"
+    )
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    moved_sofa = tmp_path / "moved-sofa"
+    outside = tmp_path / "outside-sofa"
+    outside.mkdir()
+    real_read = sofa._read_credentials_bytes
+
+    def read_then_swap(*args: object, **kwargs: object):
+        result = real_read(*args, **kwargs)
+        sofa_dir.rename(moved_sofa)
+        sofa_dir.symlink_to(outside, target_is_directory=True)
+        return result
+
+    def forbidden_mkstemp(*args: object, **kwargs: object):
+        pytest.fail("unsafe .sofa must be rejected before allocating a temp file")
+
+    monkeypatch.setattr(sofa, "_CAN_USE_DIRECTORY_FD", False)
+    monkeypatch.setattr(sofa, "_read_credentials_bytes", read_then_swap)
+    monkeypatch.setattr(sofa.tempfile, "mkstemp", forbidden_mkstemp)
+
+    result = _store_test_credentials(
+        tmp_path,
+        api_key="sofa_fallback_preallocation_secret",
+    )
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert not list(outside.iterdir())
+
+
+def test_vc4_fallback_revalidates_sofa_after_temp_allocation_before_secret_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "# map:sofa\n.sofa/\n", encoding="utf-8"
+    )
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    moved_sofa = tmp_path / "moved-sofa"
+    outside = tmp_path / "outside-sofa"
+    outside.mkdir()
+    real_mkstemp = sofa.tempfile.mkstemp
+    real_fsync = sofa.os.fsync
+    secret = "sofa_fallback_allocation_secret"
+
+    def swap_during_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        sofa_dir.rename(moved_sofa)
+        sofa_dir.symlink_to(outside, target_is_directory=True)
+        return real_mkstemp(*args, **kwargs)
+
+    def reject_secret_write(descriptor: int) -> None:
+        position = os.lseek(descriptor, 0, os.SEEK_CUR)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        content = os.read(descriptor, 65536)
+        os.lseek(descriptor, position, os.SEEK_SET)
+        assert secret.encode() not in content
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(sofa, "_CAN_USE_DIRECTORY_FD", False)
+    monkeypatch.setattr(sofa.tempfile, "mkstemp", swap_during_mkstemp)
+    monkeypatch.setattr(sofa.os, "fsync", reject_secret_write)
+
+    result = _store_test_credentials(tmp_path, api_key=secret)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert not list(outside.iterdir())
+
+
+def test_vc4_fallback_sanitizes_temp_if_sofa_swaps_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".gitignore").write_text(
+        "# map:sofa\n.sofa/\n", encoding="utf-8"
+    )
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    moved_sofa = tmp_path / "moved-sofa"
+    outside = tmp_path / "outside-sofa"
+    outside.mkdir()
+    real_fsync = sofa.os.fsync
+    swapped = False
+    secret = "sofa_fallback_prereplace_secret"
+
+    def swap_after_secret_flush(descriptor: int) -> None:
+        nonlocal swapped
+        real_fsync(descriptor)
+        if not swapped:
+            swapped = True
+            sofa_dir.rename(moved_sofa)
+            sofa_dir.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(sofa, "_CAN_USE_DIRECTORY_FD", False)
+    monkeypatch.setattr(sofa.os, "fsync", swap_after_secret_flush)
+
+    result = _store_test_credentials(tmp_path, api_key=secret)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert secret not in json.dumps(result)
+    assert all(secret.encode() not in path.read_bytes() for path in moved_sofa.iterdir())
+    assert not list(outside.iterdir())
+
+
+def test_vc4_directory_fd_capability_checks_replace_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def replace_without_directory_fds(source: object, destination: object) -> None:
+        raise AssertionError((source, destination))
+
+    monkeypatch.setattr(sofa.os, "replace", replace_without_directory_fds)
+
+    assert sofa._replace_supports_directory_fds() is False
+
+
+@pytest.mark.parametrize("attack", ["sofa-symlink", "credential-symlink", "credential-hardlink"])
+def test_vc4_resolve_key_rejects_linked_credential_paths(
+    tmp_path: Path,
+    attack: str,
+) -> None:
+    if attack == "credential-hardlink" and os.name == "nt":
+        pytest.skip("POSIX hardlink security contract")
+    outside_dir = tmp_path / "outside-sofa"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "credentials.json"
+    outside_file.write_text(
+        '{"external": {"api_key": "outside_secret"}}', encoding="utf-8"
+    )
+    sofa_dir = tmp_path / ".sofa"
+    credentials_file = sofa_dir / "credentials.json"
+    if attack == "sofa-symlink":
+        sofa_dir.symlink_to(outside_dir, target_is_directory=True)
+    else:
+        sofa_dir.mkdir()
+        if attack == "credential-symlink":
+            credentials_file.symlink_to(outside_file)
+        else:
+            try:
+                os.link(outside_file, credentials_file)
+            except (NotImplementedError, OSError) as exc:
+                pytest.skip(f"hardlinks unavailable: {exc}")
+    env_without_key = {key: value for key, value in os.environ.items() if key != "SOFA_API_KEY"}
+
+    with patch.dict(os.environ, env_without_key, clear=True):
+        result = sofa.resolve_key(credentials_path=credentials_file)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert "outside_secret" not in json.dumps(result)
+
+
+def test_vc4_safe_atomic_store_and_resolve_preserve_entries(tmp_path: Path) -> None:
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir(mode=0o700)
+    credentials_file = sofa_dir / "credentials.json"
+    credentials_file.write_text(
+        '{"existing": {"api_key": "keep"}}', encoding="utf-8"
+    )
+    credentials_file.chmod(0o640)
+
+    stored = _store_test_credentials(
+        tmp_path,
+        api_key="sofa_new_safe_key",
+        agent_id="new-agent",
+    )
+    env_without_key = {key: value for key, value in os.environ.items() if key != "SOFA_API_KEY"}
+    with patch.dict(os.environ, env_without_key, clear=True):
+        resolved = sofa.resolve_key(
+            agent_id="new-agent",
+            credentials_path=credentials_file,
+        )
+
+    assert stored["ok"] is True
+    assert resolved == {
+        "ok": True,
+        "api_key": "sofa_new_safe_key",
+        "agent_id": "new-agent",
+    }
+    data = json.loads(credentials_file.read_text(encoding="utf-8"))
+    assert data["existing"]["api_key"] == "keep"
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(sofa_dir.stat().st_mode) == 0o700
 
 
 # ---------------------------------------------------------------------------

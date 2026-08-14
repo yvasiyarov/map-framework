@@ -272,6 +272,28 @@ def test_wires_statusline_into_settings_local_when_none_exists(tmp_path: Path) -
     assert "map-statusline.py" in data["statusLine"]["command"]
     # MAP-managed settings.json must stay free of statusLine (no drift churn).
     assert not (project / ".claude" / "settings.json").exists()
+    assert (
+        ".claude/settings.local.json"
+        in (project / ".gitignore").read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_refuses_unsafe_gitignore_before_writing_statusline(tmp_path: Path) -> None:
+    from mapify_cli.delivery.file_copier import (
+        UpdateRuntimeGitignoreSecurityError,
+        ensure_map_statusline,
+    )
+
+    project, home = _fresh_project(tmp_path)
+    outside = tmp_path / "outside-gitignore"
+    outside.write_text("outside-sentinel\n", encoding="utf-8")
+    (project / ".gitignore").symlink_to(outside)
+
+    with pytest.raises(UpdateRuntimeGitignoreSecurityError):
+        ensure_map_statusline(project, home=home)
+
+    assert not (project / ".claude" / "settings.local.json").exists()
+    assert outside.read_text(encoding="utf-8") == "outside-sentinel\n"
 
 
 def test_idempotent_second_install_skips(tmp_path: Path) -> None:

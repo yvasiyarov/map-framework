@@ -490,6 +490,7 @@ _UPDATE_RUNTIME_GITIGNORE_PATHS = (
     ".map/update-state.json",
     ".map/update.lock",
     ".map/provider-refresh.lock",
+    ".map/installer.lock",
 )
 
 
@@ -602,6 +603,30 @@ def _atomic_replace_gitignore(
             pass
 
 
+def _has_effective_gitignore_path(lines: list[bytes], required_path: str) -> bool:
+    """Return whether an exact path remains authoritative after later rules.
+
+    Git evaluates ignore rules in order.  MAP deliberately uses a conservative
+    rule here instead of attempting to reproduce git's wildmatch semantics: an
+    exact canonical path is effective only when no later unescaped negation
+    rule follows it.  Leading-space and otherwise non-canonical variants do not
+    count as the required path.
+    """
+    required = required_path.encode()
+    last_exact = -1
+    for index, line in enumerate(lines):
+        if line == required:
+            last_exact = index
+    return last_exact >= 0 and not any(
+        line.startswith(b"!") for line in lines[last_exact + 1 :]
+    )
+
+
+def _has_gitignore_marker(lines: list[bytes], marker: str) -> bool:
+    encoded = marker.encode()
+    return any(line == encoded or line.startswith(encoded + b" ") for line in lines)
+
+
 def _merge_project_gitignore(
     project_path: Path,
     *,
@@ -616,34 +641,39 @@ def _merge_project_gitignore(
         raise NotADirectoryError(f"MAP project root is not a directory: {project_root}")
     gitignore = project_root / ".gitignore"
     existing, original = _read_safe_gitignore(gitignore)
-    ignored_lines = {line.strip() for line in existing.splitlines()}
+    existing_lines = existing.splitlines()
 
     additions: list[bytes] = []
     if include_runtime:
         missing_runtime_paths = [
-            path.encode()
+            path
             for path in _UPDATE_RUNTIME_GITIGNORE_PATHS
-            if path.encode() not in ignored_lines
+            if not _has_effective_gitignore_path(existing_lines, path)
         ]
         if missing_runtime_paths:
             runtime_lines: list[bytes] = []
             marker = _UPDATE_RUNTIME_GITIGNORE_MARKER.encode()
-            if marker not in ignored_lines:
+            if not _has_gitignore_marker(
+                existing_lines, _UPDATE_RUNTIME_GITIGNORE_MARKER
+            ):
                 runtime_lines.append(marker)
-            runtime_lines.extend(missing_runtime_paths)
+            runtime_lines.extend(path.encode() for path in missing_runtime_paths)
             additions.append(b"\n".join(runtime_lines) + b"\n")
 
     def append_optional_block(
         *, marker: str, required_line: str, block: str, enabled: bool
     ) -> None:
-        if not enabled:
+        if not enabled or _has_effective_gitignore_path(
+            existing_lines, required_line
+        ):
             return
-        if marker.encode() in existing or required_line.encode() in ignored_lines:
-            return
-        additions.append(block.encode())
+        if _has_gitignore_marker(existing_lines, marker):
+            additions.append(f"{required_line}\n".encode())
+        else:
+            additions.append(block.encode())
 
-    # Preserve each legacy feature's OR-idempotency contract: an existing MAP
-    # marker OR an already-active exact ignore line suppresses the whole block.
+    # The exact privacy path is the completion authority. A marker alone is
+    # descriptive metadata and must never authorize feature enablement.
     append_optional_block(
         marker=_SOFA_GITIGNORE_MARKER,
         required_line=".sofa/",
@@ -664,6 +694,7 @@ def _merge_project_gitignore(
     )
 
     if not additions:
+        _validate_gitignore_unchanged(gitignore, original)
         return 0
     separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
     replacement = existing + separator + b"".join(additions)
@@ -980,6 +1011,11 @@ def ensure_map_statusline(
     settings = _read_json_object(local_settings) or {}
     settings["statusLine"] = {"type": "command", "command": command}
 
+    # Revalidate the user-local settings privacy boundary immediately before
+    # this direct writer runs.  Init's earlier combined preflight cannot protect
+    # against a later .gitignore swap, and this function is also a public test /
+    # provider seam that can be called independently.
+    merge_settings_local_gitignore(project_path)
     claude_dir.mkdir(parents=True, exist_ok=True)
     local_settings.write_text(
         json.dumps(settings, indent=2) + "\n", encoding="utf-8"

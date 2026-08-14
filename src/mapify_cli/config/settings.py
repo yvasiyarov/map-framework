@@ -37,10 +37,9 @@ _AUTONOMY_DENY = [
 def ensure_settings_local_gitignored(project_path: Path) -> int:
     """Idempotently add ``.claude/settings.local.json`` to the repo-root .gitignore.
 
-    A personal autonomy posture must not leak into the team via a committed
-    settings.local.json. Mirrors ``merge_sofa_gitignore``: the OR-guard skips the
-    append whenever our marker OR an active ignore line is already present, so the
-    entry is never duplicated regardless of how the user got it there.
+    User-local approvals and machine-specific statusline paths must not leak
+    into the team via a committed settings.local.json. The exact ignore path is
+    authoritative; descriptive markers and superseded rules are repaired.
 
     Returns 1 when the file was created or modified, 0 when already up-to-date.
     """
@@ -164,18 +163,17 @@ def create_or_merge_project_settings_local(
         project_path: Target project root.
         autonomy: Opt-in "YOLO-minus-git" posture.
             - ``True``  → merge a broad tool allowlist + git commit/push deny and
-              write the ``mapify.autonomy`` sentinel (also gitignores the file).
+              write the ``mapify.autonomy`` sentinel.
             - ``False`` → remove the autonomy allow/deny entries and the sentinel
               (teardown for ``--no-autonomy``).
             - ``None``  → leave any existing autonomy posture untouched (default on
               re-run, so re-init never silently flips a user's choice).
     """
 
-    # Establish the privacy boundary before writing the autonomy sentinel. A
-    # failure must leave the feature disabled rather than create commit-eligible
-    # local approval state.
-    if autonomy is True:
-        ensure_settings_local_gitignored(project_path)
+    # Establish and revalidate the privacy boundary before writing any local
+    # approval state, including the default narrow allowlist.  This also closes
+    # the gap between init's early preflight and this later writer.
+    ensure_settings_local_gitignored(project_path)
 
     settings_file = project_path / ".claude" / "settings.local.json"
     settings_file.parent.mkdir(parents=True, exist_ok=True)

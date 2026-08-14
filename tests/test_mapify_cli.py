@@ -240,6 +240,18 @@ class TestInitCommand:
             ".map/provider-refresh.lock"
             in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
         )
+        assert (
+            ".map/installer.lock"
+            in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+        )
+        settings_local_line = ".claude/settings.local.json"
+        gitignore_lines = (tmp_path / ".gitignore").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if provider == "claude":
+            assert settings_local_line in gitignore_lines
+        else:
+            assert settings_local_line not in gitignore_lines
         skill_root = tmp_path / (
             ".claude/skills" if provider == "claude" else ".agents/skills"
         )
@@ -284,8 +296,82 @@ class TestInitCommand:
             ".map/update-state.json",
             ".map/update.lock",
             ".map/provider-refresh.lock",
+            ".map/installer.lock",
         ):
             assert first_text.splitlines().count(path) == 1
+
+    @pytest.mark.parametrize(
+        "required_line",
+        [
+            ".map/update-state.json",
+            ".map/update.lock",
+            ".map/provider-refresh.lock",
+            ".map/installer.lock",
+        ],
+    )
+    @pytest.mark.parametrize("negation_kind", ["exact", "wildcard", "unrelated"])
+    def test_update_runtime_gitignore_repairs_paths_before_later_negations(
+        self,
+        tmp_path: Path,
+        required_line: str,
+        negation_kind: str,
+    ) -> None:
+        from mapify_cli.delivery.file_copier import merge_update_runtime_gitignore
+
+        negation = {
+            "exact": f"!{required_line}",
+            "wildcard": "!.map/**",
+            "unrelated": "!unrelated/**",
+        }[negation_kind]
+        original = f"user-rule/\n{required_line}\n{negation}\n"
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(original, encoding="utf-8")
+        gitignore.chmod(0o640)
+
+        changed = merge_update_runtime_gitignore(tmp_path)
+        repaired = gitignore.read_text(encoding="utf-8")
+        repaired_lines = repaired.splitlines()
+
+        assert changed == 1
+        assert repaired.startswith(original)
+        assert repaired_lines.count(required_line) == 2
+        assert max(
+            index for index, line in enumerate(repaired_lines) if line == required_line
+        ) > repaired_lines.index(negation)
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+
+        assert merge_update_runtime_gitignore(tmp_path) == 0
+        assert gitignore.read_text(encoding="utf-8") == repaired
+
+    def test_update_runtime_gitignore_noop_rejects_post_read_swap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mapify_cli.delivery import file_copier
+
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(
+            "# map:update-runtime\n"
+            ".map/update-state.json\n"
+            ".map/update.lock\n"
+            ".map/provider-refresh.lock\n"
+            ".map/installer.lock\n",
+            encoding="utf-8",
+        )
+        real_read = file_copier._read_safe_gitignore
+
+        def read_then_swap(path: Path):
+            existing, original = real_read(path)
+            replacement = path.with_name("replacement.gitignore")
+            replacement.write_bytes(existing)
+            os.replace(replacement, path)
+            return existing, original
+
+        monkeypatch.setattr(file_copier, "_read_safe_gitignore", read_then_swap)
+
+        with pytest.raises(file_copier.UpdateRuntimeGitignoreSecurityError):
+            file_copier.merge_update_runtime_gitignore(tmp_path)
 
     @pytest.mark.parametrize("attack", ["symlink", "hardlink"])
     def test_init_refuses_unsafe_gitignore_without_mutating_outside_file(
@@ -554,6 +640,202 @@ class TestInitCommand:
         assert content.splitlines().count(required_line) == 1
         assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
 
+    @pytest.mark.parametrize(
+        ("feature", "marker", "required_line"),
+        [
+            ("sofa", "# map:sofa", ".sofa/"),
+            (
+                "agent-memory",
+                "# map:agent-memory-local",
+                ".claude/agent-memory-local/",
+            ),
+            (
+                "settings-local",
+                "# map:settings-local",
+                ".claude/settings.local.json",
+            ),
+        ],
+    )
+    def test_feature_gitignore_mergers_repair_marker_only_state(
+        self,
+        tmp_path: Path,
+        feature: str,
+        marker: str,
+        required_line: str,
+    ) -> None:
+        if feature == "sofa":
+            from mapify_cli.delivery.file_copier import merge_sofa_gitignore as merge
+        elif feature == "agent-memory":
+            from mapify_cli.delivery.file_copier import (
+                merge_agent_memory_gitignore as merge,
+            )
+        else:
+            from mapify_cli.config.settings import (
+                ensure_settings_local_gitignored as merge,
+            )
+
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(f"{marker}\n", encoding="utf-8")
+        gitignore.chmod(0o640)
+
+        changed = merge(tmp_path)
+        content = gitignore.read_text(encoding="utf-8")
+
+        assert changed == 1
+        assert content.splitlines().count(marker) == 1
+        assert content.splitlines().count(required_line) == 1
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+
+    @pytest.mark.parametrize(
+        ("feature", "marker", "required_line", "wildcard_negation"),
+        [
+            ("sofa", "# map:sofa", ".sofa/", "!.sofa/**"),
+            (
+                "agent-memory",
+                "# map:agent-memory-local",
+                ".claude/agent-memory-local/",
+                "!.claude/agent-memory-local/**",
+            ),
+            (
+                "settings-local",
+                "# map:settings-local",
+                ".claude/settings.local.json",
+                "!.claude/settings.*",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("negation_kind", ["exact", "wildcard", "unrelated"])
+    def test_feature_gitignore_mergers_repair_paths_before_later_negations(
+        self,
+        tmp_path: Path,
+        feature: str,
+        marker: str,
+        required_line: str,
+        wildcard_negation: str,
+        negation_kind: str,
+    ) -> None:
+        if feature == "sofa":
+            from mapify_cli.delivery.file_copier import merge_sofa_gitignore as merge
+        elif feature == "agent-memory":
+            from mapify_cli.delivery.file_copier import (
+                merge_agent_memory_gitignore as merge,
+            )
+        else:
+            from mapify_cli.config.settings import (
+                ensure_settings_local_gitignored as merge,
+            )
+
+        negation = {
+            "exact": f"!{required_line}",
+            "wildcard": wildcard_negation,
+            "unrelated": "!unrelated/**",
+        }[negation_kind]
+        original = f"user-rule/\n{marker}\n{required_line}\n{negation}\n"
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(original, encoding="utf-8")
+        gitignore.chmod(0o640)
+
+        changed = merge(tmp_path)
+        repaired = gitignore.read_text(encoding="utf-8")
+        repaired_lines = repaired.splitlines()
+
+        assert changed == 1
+        assert repaired.startswith(original)
+        assert repaired_lines.count(marker) == 1
+        assert repaired_lines.count(required_line) == 2
+        assert repaired_lines[-1] == required_line
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+
+        assert merge(tmp_path) == 0
+        assert gitignore.read_text(encoding="utf-8") == repaired
+
+    def test_feature_gitignore_merger_does_not_accept_leading_space_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from mapify_cli.delivery.file_copier import merge_sofa_gitignore
+
+        original = "user-rule/\n  .sofa/\n"
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(original, encoding="utf-8")
+
+        assert merge_sofa_gitignore(tmp_path) == 1
+        repaired = gitignore.read_text(encoding="utf-8")
+        assert repaired.startswith(original)
+        assert repaired.splitlines().count(".sofa/") == 1
+
+    @pytest.mark.parametrize(
+        (
+            "provider",
+            "extra_args",
+            "marker",
+            "required_line",
+            "feature_path",
+            "feature_marker",
+        ),
+        [
+            (
+                "codex",
+                ["--sofa"],
+                "# map:sofa",
+                ".sofa/",
+                ".map/config.yaml",
+                "sofa.enabled: true",
+            ),
+            (
+                "claude",
+                ["--agent-memory", "local"],
+                "# map:agent-memory-local",
+                ".claude/agent-memory-local/",
+                ".map/config.yaml",
+                "claude_agents.persistent_memory: local",
+            ),
+            (
+                "claude",
+                ["--autonomy"],
+                "# map:settings-local",
+                ".claude/settings.local.json",
+                ".claude/settings.local.json",
+                '"autonomy": true',
+            ),
+        ],
+    )
+    def test_init_repairs_marker_only_privacy_block_before_feature_enablement(
+        self,
+        tmp_path: Path,
+        provider: str,
+        extra_args: list[str],
+        marker: str,
+        required_line: str,
+        feature_path: str,
+        feature_marker: str,
+    ) -> None:
+        os.chdir(tmp_path)
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text(f"{marker}\n", encoding="utf-8")
+
+        with mock.patch("mapify_cli.configure_global_permissions"):
+            result = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--mcp",
+                    "none",
+                    "--provider",
+                    provider,
+                    *extra_args,
+                ],
+            )
+
+        assert result.exit_code == 0, result.stdout
+        ignore_lines = gitignore.read_text(encoding="utf-8").splitlines()
+        assert ignore_lines.count(marker) == 1
+        assert ignore_lines.count(required_line) == 1
+        assert feature_marker in (tmp_path / feature_path).read_text(encoding="utf-8")
+
     def test_update_runtime_gitignore_replace_failure_preserves_file(
         self,
         tmp_path: Path,
@@ -589,7 +871,7 @@ class TestInitCommand:
         changed = file_copier.merge_update_runtime_gitignore(tmp_path)
 
         assert changed == 1
-        assert ".map/provider-refresh.lock" in (
+        assert ".map/installer.lock" in (
             tmp_path / ".gitignore"
         ).read_text(encoding="utf-8").splitlines()
 
@@ -2774,7 +3056,9 @@ class TestAutonomyPosture:
         assert ".claude/settings.local.json" in content.splitlines()
         assert "# map:settings-local" in content
 
-    def test_autonomy_none_leaves_no_sentinel(self, tmp_path):
+    def test_autonomy_none_leaves_no_sentinel_but_gitignores_local_settings(
+        self, tmp_path
+    ):
         from mapify_cli.config.settings import create_or_merge_project_settings_local
 
         create_or_merge_project_settings_local(tmp_path, autonomy=None)
@@ -2782,8 +3066,12 @@ class TestAutonomyPosture:
         data = self._read_local(tmp_path)
         assert "mapify" not in data
         assert "Bash(*)" not in data["permissions"]["allow"]
-        # Default: settings.local.json is not auto-gitignored without --autonomy.
-        assert not (tmp_path / ".gitignore").exists()
+        gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
+        assert ".claude/settings.local.json" in gitignore.splitlines()
+        assert any(
+            line.startswith("# map:settings-local")
+            for line in gitignore.splitlines()
+        )
 
     def test_autonomy_false_removes_posture(self, tmp_path):
         from mapify_cli.config.settings import create_or_merge_project_settings_local
