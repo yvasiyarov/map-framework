@@ -209,9 +209,6 @@ def _request(
 
 _SOFA_MARKER = "# map:sofa"
 _SOFA_BLOCK = "# map:sofa — SOFA credential dir (opt-in); never commit. See docs/USAGE.md\n.sofa/\n"
-_LOCK_MARKER = "# map:gitignore-lock"
-_LOCK_PATH = ".map-gitignore.lock"
-_LOCK_BLOCK = "# map:gitignore-lock — MAP root ignore synchronization; never commit.\n.map-gitignore.lock\n"
 
 
 class SofaGitignoreSecurityError(RuntimeError):
@@ -222,19 +219,117 @@ def _unsafe_gitignore(gitignore: Path, reason: str) -> NoReturn:
     raise SofaGitignoreSecurityError(f"unsafe project .gitignore: {reason}")
 
 
-def _gitignore_lock_path(project_root: Path) -> Path:
+def _validated_project_root_stat(project_root: Path) -> os.stat_result:
+    """Return the direct directory identity used to key and guard the lock."""
+    try:
+        current = os.stat(project_root, follow_symlinks=False)
+    except OSError as exc:
+        _unsafe_gitignore_lock(
+            project_root,
+            f"could not validate the project root ({exc})",
+        )
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        _unsafe_gitignore_lock(
+            project_root, "the project root must be a direct directory"
+        )
+    return current
+
+
+def _validate_project_root_unchanged(
+    project_root: Path,
+    original: os.stat_result,
+) -> None:
+    current = _validated_project_root_stat(project_root)
+    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+        _unsafe_gitignore_lock(project_root, "the project root changed")
+
+
+def _gitignore_lock_path_for_stat(
+    project_root: Path,
+    project_stat: os.stat_result,
+) -> Path:
     """Return the shared lock path used by every MAP .gitignore writer."""
-    if os.name == "nt":
-        return project_root / _LOCK_PATH
-    identity = os.path.normcase(str(project_root)).encode("utf-8", "surrogatepass")
+    del project_root
+    identity = f"{project_stat.st_dev}:{project_stat.st_ino}".encode("ascii")
     digest = hashlib.sha256(identity).hexdigest()
     return Path("/tmp") / f"mapify-gitignore-{digest}.lock"
+
+
+def _windows_gitignore_mutex_name(project_stat: os.stat_result) -> str:
+    identity = f"{project_stat.st_dev}:{project_stat.st_ino}".encode("ascii")
+    digest = hashlib.sha256(identity).hexdigest()
+    return f"Local\\MapifyGitignore-{digest}"
+
+
+@contextlib.contextmanager
+def _windows_project_gitignore_mutex(
+    project_stat: os.stat_result,
+) -> Iterator[None]:
+    """Acquire a process-shared Windows mutex without a filesystem artifact."""
+    ctypes: Any = importlib.import_module("ctypes")
+    wintypes: Any = importlib.import_module("ctypes.wintypes")
+    kernel32: Any = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    create_mutex.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    wait_for_single_object.restype = wintypes.DWORD
+    release_mutex = kernel32.ReleaseMutex
+    release_mutex.argtypes = [wintypes.HANDLE]
+    release_mutex.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_mutex(None, False, _windows_gitignore_mutex_name(project_stat))
+    if not handle:
+        _unsafe_gitignore_lock(
+            Path("<windows-mutex>"),
+            f"CreateMutexW failed ({ctypes.get_last_error()})",
+        )
+    acquired = False
+    try:
+        wait_result = wait_for_single_object(handle, 0xFFFFFFFF)
+        if wait_result not in {0x00000000, 0x00000080}:
+            _unsafe_gitignore_lock(
+                Path("<windows-mutex>"),
+                f"WaitForSingleObject failed ({ctypes.get_last_error()})",
+            )
+        acquired = True
+        yield
+    finally:
+        if acquired and not release_mutex(handle):
+            close_handle(handle)
+            _unsafe_gitignore_lock(
+                Path("<windows-mutex>"),
+                f"ReleaseMutex failed ({ctypes.get_last_error()})",
+            )
+        close_handle(handle)
+
+
+def _gitignore_lock_path(project_root: Path) -> Path:
+    """Resolve the shared lock from stable filesystem identity, not spelling."""
+    return _gitignore_lock_path_for_stat(
+        project_root,
+        _validated_project_root_stat(project_root),
+    )
 
 
 def _unsafe_gitignore_lock(lock_path: Path, reason: str) -> NoReturn:
     raise SofaGitignoreSecurityError(
         f"unsafe MAP .gitignore lock at {lock_path}: {reason}"
     )
+
+
+def _descriptor_mode_matches(descriptor: int, expected: int) -> bool:
+    """Compare only permission bits the current platform can represent."""
+    actual = stat.S_IMODE(os.fstat(descriptor).st_mode)
+    if os.name == "nt":
+        # Windows chmod/open modes expose only the read-only flag.  Continue
+        # validating through the descriptor without requiring POSIX-only bits.
+        return bool(actual & stat.S_IWRITE) == bool(expected & stat.S_IWRITE)
+    return actual == expected
 
 
 def _validate_lock_stat(lock_path: Path, current: os.stat_result) -> None:
@@ -284,8 +379,11 @@ def _open_private_lock(lock_path: Path) -> int:
             _unsafe_gitignore_lock(lock_path, "the path changed while being opened")
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
-        else:
-            os.chmod(lock_path, 0o600)
+        elif not _descriptor_mode_matches(descriptor, 0o600):
+            _unsafe_gitignore_lock(
+                lock_path,
+                "cannot enforce private mode without descriptor chmod support",
+            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -329,7 +427,14 @@ def _unlock_descriptor(descriptor: int) -> None:
 @contextlib.contextmanager
 def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
     """Serialize the complete root .gitignore read/merge/replace transaction."""
-    lock_path = _gitignore_lock_path(project_root)
+    project_original = _validated_project_root_stat(project_root)
+    if os.name == "nt":
+        with _windows_project_gitignore_mutex(project_original):
+            _validate_project_root_unchanged(project_root, project_original)
+            yield
+            _validate_project_root_unchanged(project_root, project_original)
+        return
+    lock_path = _gitignore_lock_path_for_stat(project_root, project_original)
     descriptor = _open_private_lock(lock_path)
     locked = False
     try:
@@ -340,7 +445,9 @@ def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
         current = _required_lock_stat(lock_path)
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
             _unsafe_gitignore_lock(lock_path, "the path changed while waiting")
+        _validate_project_root_unchanged(project_root, project_original)
         yield
+        _validate_project_root_unchanged(project_root, project_original)
     finally:
         if locked:
             _unlock_descriptor(descriptor)
@@ -422,7 +529,11 @@ def _atomic_replace_gitignore(
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, mode)
         else:
-            os.chmod(temporary, mode)
+            if original is not None and not _descriptor_mode_matches(descriptor, mode):
+                _unsafe_gitignore(
+                    gitignore,
+                    "cannot preserve its mode without descriptor chmod support",
+                )
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(content)
@@ -449,17 +560,6 @@ def _has_effective_sofa_ignore(lines: list[bytes]) -> bool:
     )
 
 
-def _has_effective_exact_ignore(lines: list[bytes], required: str) -> bool:
-    encoded = required.encode()
-    last_exact = max(
-        (index for index, line in enumerate(lines) if line == encoded),
-        default=-1,
-    )
-    return last_exact >= 0 and not any(
-        line.startswith(b"!") for line in lines[last_exact + 1 :]
-    )
-
-
 def _has_sofa_marker(lines: list[bytes]) -> bool:
     marker = _SOFA_MARKER.encode()
     return any(line == marker or line.startswith(marker + b" ") for line in lines)
@@ -470,33 +570,15 @@ def _ensure_sofa_gitignore_locked(project_root: Path) -> bool:
     gitignore = project_root / ".gitignore"
     existing, original = _read_safe_gitignore(gitignore)
     existing_lines = existing.splitlines()
-    sofa_present = _has_effective_sofa_ignore(existing_lines)
-    lock_present = os.name != "nt" or _has_effective_exact_ignore(
-        existing_lines, _LOCK_PATH
-    )
-    if sofa_present and lock_present:
+    if _has_effective_sofa_ignore(existing_lines):
         _validate_gitignore_unchanged(gitignore, original)
         return False
 
-    additions: list[bytes] = []
-    if not lock_present:
-        lock_marker = _LOCK_MARKER.encode()
-        additions.append(
-            f"{_LOCK_PATH}\n".encode()
-            if any(
-                line == lock_marker or line.startswith(lock_marker + b" ")
-                for line in existing_lines
-            )
-            else _LOCK_BLOCK.encode()
-        )
-    if not sofa_present:
-        additions.append(
-            b".sofa/\n" if _has_sofa_marker(existing_lines) else _SOFA_BLOCK.encode()
-        )
+    addition = b".sofa/\n" if _has_sofa_marker(existing_lines) else _SOFA_BLOCK.encode()
     separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
     _atomic_replace_gitignore(
         gitignore,
-        existing + separator + b"".join(additions),
+        existing + separator + addition,
         original,
     )
     return True
@@ -685,8 +767,10 @@ def _open_credentials_lock(
             _unsafe_credentials("credentials.lock must be owned by the current user")
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
-        else:
-            os.chmod(lock_file, 0o600)
+        elif not _descriptor_mode_matches(descriptor, 0o600):
+            _unsafe_credentials(
+                "cannot enforce private credentials.lock mode without descriptor chmod support"
+            )
         _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
         return descriptor
     except BaseException:
@@ -907,6 +991,10 @@ def _atomic_write_credentials(
                 raise FileExistsError("could not allocate a private temporary file")
             if hasattr(os, "fchmod"):
                 os.fchmod(descriptor, 0o600)
+            elif not _descriptor_mode_matches(descriptor, 0o600):
+                _unsafe_credentials(
+                    "cannot enforce private credential mode without descriptor chmod support"
+                )
             with os.fdopen(descriptor, "wb") as stream:
                 descriptor = -1
                 stream.write(content)
@@ -949,8 +1037,10 @@ def _atomic_write_credentials(
         _validate_sofa_directory_unchanged(sofa_dir, sofa_original)
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
-        else:
-            os.chmod(temporary, 0o600)
+        elif not _descriptor_mode_matches(descriptor, 0o600):
+            _unsafe_credentials(
+                "cannot enforce private credential mode without descriptor chmod support"
+            )
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             secret_written = True
             stream.write(content)

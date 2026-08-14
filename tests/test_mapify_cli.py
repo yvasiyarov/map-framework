@@ -114,7 +114,6 @@ def _snapshot_tree(root: Path) -> dict[str, bytes]:
         not in {
             ".map/update.lock",
             ".map/provider-refresh.lock",
-            ".map-gitignore.lock",
         }
     }
 
@@ -281,10 +280,6 @@ class TestInitCommand:
             ".map/installer.lock"
             in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
         )
-        assert (
-            ".map-gitignore.lock"
-            in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
-        )
         settings_local_line = ".claude/settings.local.json"
         gitignore_lines = (
             (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
@@ -338,7 +333,6 @@ class TestInitCommand:
             ".map/update.lock",
             ".map/provider-refresh.lock",
             ".map/installer.lock",
-            ".map-gitignore.lock",
         ):
             assert first_text.splitlines().count(path) == 1
 
@@ -349,7 +343,6 @@ class TestInitCommand:
             ".map/update.lock",
             ".map/provider-refresh.lock",
             ".map/installer.lock",
-            ".map-gitignore.lock",
         ],
     )
     @pytest.mark.parametrize("negation_kind", ["exact", "wildcard", "unrelated"])
@@ -399,8 +392,7 @@ class TestInitCommand:
             ".map/update-state.json\n"
             ".map/update.lock\n"
             ".map/provider-refresh.lock\n"
-            ".map/installer.lock\n"
-            ".map-gitignore.lock\n",
+            ".map/installer.lock\n",
             encoding="utf-8",
         )
         real_read = file_copier._read_safe_gitignore
@@ -912,15 +904,13 @@ class TestInitCommand:
 
         monkeypatch.delattr(file_copier.os, "fchmod", raising=False)
 
-        changed = file_copier.merge_update_runtime_gitignore(tmp_path)
+        with mock.patch.object(file_copier.os, "chmod") as path_chmod:
+            changed = file_copier.merge_update_runtime_gitignore(tmp_path)
 
         assert changed == 1
+        path_chmod.assert_not_called()
         assert (
             ".map/installer.lock"
-            in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
-        )
-        assert (
-            ".map-gitignore.lock"
             in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
         )
 

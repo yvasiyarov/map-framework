@@ -502,18 +502,11 @@ _SETTINGS_LOCAL_GITIGNORE_BLOCK = (
 _UPDATE_RUNTIME_GITIGNORE_MARKER = (
     "# map:update-runtime — local automatic-update state; never commit."
 )
-_GITIGNORE_LOCK_MARKER = "# map:gitignore-lock"
-_GITIGNORE_LOCK_PATH = ".map-gitignore.lock"
-_GITIGNORE_LOCK_BLOCK = (
-    "# map:gitignore-lock — MAP root ignore synchronization; never commit.\n"
-    ".map-gitignore.lock\n"
-)
 _UPDATE_RUNTIME_GITIGNORE_PATHS = (
     ".map/update-state.json",
     ".map/update.lock",
     ".map/provider-refresh.lock",
     ".map/installer.lock",
-    _GITIGNORE_LOCK_PATH,
 )
 
 
@@ -527,35 +520,130 @@ def _unsafe_project_gitignore(gitignore: Path, reason: str) -> NoReturn:
     )
 
 
-def _uses_project_gitignore_lock() -> bool:
-    """Return whether this platform needs the ignored project-local fallback."""
+def _uses_windows_gitignore_mutex() -> bool:
+    """Return whether this platform uses a no-file named mutex."""
     return os.name == "nt"
 
 
-def _gitignore_lock_path(project_root: Path) -> Path:
+def _validated_project_root_stat(project_root: Path) -> os.stat_result:
+    """Return the direct directory identity used to key and guard the lock."""
+    try:
+        current = os.stat(project_root, follow_symlinks=False)
+    except OSError as exc:
+        _unsafe_gitignore_lock(
+            project_root,
+            f"could not validate the project root ({exc})",
+        )
+    if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+        _unsafe_gitignore_lock(
+            project_root, "the project root must be a direct directory"
+        )
+    return current
+
+
+def _validate_project_root_unchanged(
+    project_root: Path,
+    original: os.stat_result,
+) -> None:
+    current = _validated_project_root_stat(project_root)
+    if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+        _unsafe_gitignore_lock(project_root, "the project root changed")
+
+
+def _gitignore_lock_path_for_stat(
+    project_root: Path,
+    project_stat: os.stat_result,
+) -> Path:
     """Return the shared lock path used by every MAP .gitignore writer.
 
     The lock is persistent by design: unlinking it after release would create
     an inode race between a waiter and a new caller. POSIX uses a fixed system
     temp root so differing TMPDIR environments cannot split the lock identity;
-    Windows uses the centrally ignored direct-project fallback.
+    Windows uses a named mutex and never calls this file-path helper.
     """
-    if _uses_project_gitignore_lock():
-        # Windows has no environment-independent system temp root. Keep the
-        # persistent direct-child lock in the project, where the central
-        # runtime ignore rule ensures it is never committed.
-        return project_root / _GITIGNORE_LOCK_PATH
-    identity = os.path.normcase(str(project_root)).encode("utf-8", "surrogatepass")
+    del project_root
+    identity = f"{project_stat.st_dev}:{project_stat.st_ino}".encode("ascii")
     digest = hashlib.sha256(identity).hexdigest()
     # A fixed POSIX root makes independent processes agree even when TMPDIR,
     # TMP, or TEMP differ. The lock file itself is private and identity-checked.
     return Path("/tmp") / f"mapify-gitignore-{digest}.lock"
 
 
+def _windows_gitignore_mutex_name(project_stat: os.stat_result) -> str:
+    identity = f"{project_stat.st_dev}:{project_stat.st_ino}".encode("ascii")
+    digest = hashlib.sha256(identity).hexdigest()
+    return f"Local\\MapifyGitignore-{digest}"
+
+
+@contextlib.contextmanager
+def _windows_project_gitignore_mutex(
+    project_stat: os.stat_result,
+) -> Iterator[None]:
+    """Acquire a process-shared Windows mutex without a filesystem artifact."""
+    ctypes: Any = importlib.import_module("ctypes")
+    wintypes: Any = importlib.import_module("ctypes.wintypes")
+    kernel32: Any = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    create_mutex.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    wait_for_single_object.restype = wintypes.DWORD
+    release_mutex = kernel32.ReleaseMutex
+    release_mutex.argtypes = [wintypes.HANDLE]
+    release_mutex.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_mutex(None, False, _windows_gitignore_mutex_name(project_stat))
+    if not handle:
+        _unsafe_gitignore_lock(
+            Path("<windows-mutex>"),
+            f"CreateMutexW failed ({ctypes.get_last_error()})",
+        )
+    acquired = False
+    try:
+        wait_result = wait_for_single_object(handle, 0xFFFFFFFF)
+        if wait_result not in {0x00000000, 0x00000080}:
+            _unsafe_gitignore_lock(
+                Path("<windows-mutex>"),
+                f"WaitForSingleObject failed ({ctypes.get_last_error()})",
+            )
+        acquired = True
+        yield
+    finally:
+        if acquired and not release_mutex(handle):
+            close_handle(handle)
+            _unsafe_gitignore_lock(
+                Path("<windows-mutex>"),
+                f"ReleaseMutex failed ({ctypes.get_last_error()})",
+            )
+        close_handle(handle)
+
+
+def _gitignore_lock_path(project_root: Path) -> Path:
+    """Resolve the shared lock from stable filesystem identity, not spelling."""
+    return _gitignore_lock_path_for_stat(
+        project_root,
+        _validated_project_root_stat(project_root),
+    )
+
+
 def _unsafe_gitignore_lock(lock_path: Path, reason: str) -> NoReturn:
     raise UpdateRuntimeGitignoreSecurityError(
         f"unsafe MAP .gitignore lock at {lock_path}: {reason}"
     )
+
+
+def _descriptor_mode_matches(descriptor: int, expected: int) -> bool:
+    """Compare only permission bits the current platform can represent."""
+    actual = stat.S_IMODE(os.fstat(descriptor).st_mode)
+    if os.name == "nt":
+        # Windows chmod/open modes expose only the read-only flag.  Continue
+        # validating through the descriptor without requiring POSIX-only bits.
+        return bool(actual & stat.S_IWRITE) == bool(expected & stat.S_IWRITE)
+    return actual == expected
 
 
 def _validate_lock_stat(lock_path: Path, current: os.stat_result) -> None:
@@ -605,8 +693,11 @@ def _open_gitignore_lock(lock_path: Path) -> int:
             _unsafe_gitignore_lock(lock_path, "the path changed while being opened")
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
-        else:
-            os.chmod(lock_path, 0o600)
+        elif not _descriptor_mode_matches(descriptor, 0o600):
+            _unsafe_gitignore_lock(
+                lock_path,
+                "cannot enforce private mode without descriptor chmod support",
+            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -650,7 +741,14 @@ def _unlock_descriptor(descriptor: int) -> None:
 @contextlib.contextmanager
 def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
     """Serialize a complete MAP-owned root .gitignore transaction."""
-    lock_path = _gitignore_lock_path(project_root)
+    project_original = _validated_project_root_stat(project_root)
+    if _uses_windows_gitignore_mutex():
+        with _windows_project_gitignore_mutex(project_original):
+            _validate_project_root_unchanged(project_root, project_original)
+            yield
+            _validate_project_root_unchanged(project_root, project_original)
+        return
+    lock_path = _gitignore_lock_path_for_stat(project_root, project_original)
     descriptor = _open_gitignore_lock(lock_path)
     locked = False
     try:
@@ -661,7 +759,9 @@ def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
         current = _required_lock_stat(lock_path)
         if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
             _unsafe_gitignore_lock(lock_path, "the path changed while waiting")
+        _validate_project_root_unchanged(project_root, project_original)
         yield
+        _validate_project_root_unchanged(project_root, project_original)
     finally:
         if locked:
             _unlock_descriptor(descriptor)
@@ -750,7 +850,11 @@ def _atomic_replace_gitignore(
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, mode)
         else:
-            os.chmod(temporary, mode)
+            if original is not None and not _descriptor_mode_matches(descriptor, mode):
+                _unsafe_project_gitignore(
+                    gitignore,
+                    "cannot preserve its mode without descriptor chmod support",
+                )
         with os.fdopen(descriptor, "wb") as stream:
             descriptor = -1
             stream.write(content)
@@ -805,19 +909,11 @@ def _merge_project_gitignore_locked(
     existing_lines = existing.splitlines()
 
     additions: list[bytes] = []
-    if _uses_project_gitignore_lock() and not _has_effective_gitignore_path(
-        existing_lines, _GITIGNORE_LOCK_PATH
-    ):
-        if _has_gitignore_marker(existing_lines, _GITIGNORE_LOCK_MARKER):
-            additions.append(f"{_GITIGNORE_LOCK_PATH}\n".encode())
-        else:
-            additions.append(_GITIGNORE_LOCK_BLOCK.encode())
     if include_runtime:
         missing_runtime_paths = [
             path
             for path in _UPDATE_RUNTIME_GITIGNORE_PATHS
-            if not (_uses_project_gitignore_lock() and path == _GITIGNORE_LOCK_PATH)
-            and not _has_effective_gitignore_path(existing_lines, path)
+            if not _has_effective_gitignore_path(existing_lines, path)
         ]
         if missing_runtime_paths:
             runtime_lines: list[bytes] = []

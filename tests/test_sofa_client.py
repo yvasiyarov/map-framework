@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -47,12 +48,7 @@ def _load_sofa_client():
 
 sofa = _load_sofa_client()
 
-_SAFE_SOFA_GITIGNORE = (
-    "# map:gitignore-lock — MAP root ignore synchronization; never commit.\n"
-    ".map-gitignore.lock\n"
-    "# map:sofa\n"
-    ".sofa/\n"
-)
+_SAFE_SOFA_GITIGNORE = "# map:sofa\n.sofa/\n"
 
 _CONCURRENCY_WORKER = r"""from __future__ import annotations
 
@@ -696,6 +692,8 @@ def test_vc3_secure_merge_rejects_nonregular_gitignore(tmp_path: Path) -> None:
 def test_vc3_cli_and_standalone_share_private_persistent_lock(tmp_path: Path) -> None:
     from mapify_cli.delivery import file_copier
 
+    if os.name == "nt":
+        pytest.skip("Windows uses a named mutex with no lock file")
     project_root = tmp_path.resolve(strict=True)
     assert sofa._gitignore_lock_path(project_root) == file_copier._gitignore_lock_path(
         project_root
@@ -711,24 +709,59 @@ def test_vc3_cli_and_standalone_share_private_persistent_lock(tmp_path: Path) ->
         assert stat.S_IMODE(lock_stat.st_mode) == 0o600
 
 
-def test_vc3_windows_runtime_merge_adds_project_lock_ignore_once(
+def test_vc3_cli_and_standalone_share_windows_mutex_identity(tmp_path: Path) -> None:
+    from mapify_cli.delivery import file_copier
+
+    project_stat = os.stat(tmp_path, follow_symlinks=False)
+    assert sofa._windows_gitignore_mutex_name(
+        project_stat
+    ) == file_copier._windows_gitignore_mutex_name(project_stat)
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected", "matches"),
+    [
+        (0o666, 0o600, True),
+        (0o444, 0o400, True),
+        (0o444, 0o600, False),
+    ],
+)
+def test_vc3_descriptor_mode_checks_preserve_windows_readonly_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    actual: int,
+    expected: int,
+    matches: bool,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    opened = os.stat_result((stat.S_IFREG | actual, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(file_copier.os, "name", "nt")
+    monkeypatch.setattr(file_copier.os, "fstat", lambda _descriptor: opened)
+
+    assert file_copier._descriptor_mode_matches(17, expected) is matches
+    assert sofa._descriptor_mode_matches(17, expected) is matches
+
+
+def test_vc3_windows_failure_never_leaves_unignored_project_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mapify_cli.delivery import file_copier
 
-    monkeypatch.setattr(file_copier, "_uses_project_gitignore_lock", lambda: True)
+    @contextmanager
+    def fake_mutex(_project_stat: os.stat_result):
+        yield
 
-    assert (
-        file_copier._merge_project_gitignore_locked(
-            tmp_path,
-            include_runtime=True,
-        )
-        == 1
-    )
+    monkeypatch.setattr(file_copier, "_uses_windows_gitignore_mutex", lambda: True)
+    monkeypatch.setattr(file_copier, "_windows_project_gitignore_mutex", fake_mutex)
 
-    lines = (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
-    assert lines.count(".map-gitignore.lock") == 1
+    with (
+        patch.object(file_copier.os, "replace", side_effect=OSError("replace failed")),
+        pytest.raises(OSError, match="replace failed"),
+    ):
+        file_copier.merge_update_runtime_gitignore(tmp_path)
+
+    assert not (tmp_path / ".map-gitignore.lock").exists()
 
 
 @pytest.mark.parametrize("writer", ["cli", "standalone"])
@@ -741,8 +774,8 @@ def test_vc3_gitignore_writer_rejects_unsafe_shared_lock(
 ) -> None:
     from mapify_cli.delivery import file_copier
 
-    if attack == "hardlink" and os.name == "nt":
-        pytest.skip("POSIX hardlink security contract")
+    if os.name == "nt":
+        pytest.skip("Windows uses a named mutex with no lock file")
     lock_path = tmp_path / "shared-gitignore.lock"
     outside = tmp_path / "outside-lock"
     outside.write_bytes(b"outside-sentinel")
@@ -758,12 +791,18 @@ def test_vc3_gitignore_writer_rejects_unsafe_shared_lock(
 
     if writer == "cli":
         monkeypatch.setattr(
-            file_copier, "_gitignore_lock_path", lambda _root: lock_path
+            file_copier,
+            "_gitignore_lock_path_for_stat",
+            lambda _root, _stat: lock_path,
         )
         operation = lambda: file_copier.merge_update_runtime_gitignore(tmp_path)
         error = file_copier.UpdateRuntimeGitignoreSecurityError
     else:
-        monkeypatch.setattr(sofa, "_gitignore_lock_path", lambda _root: lock_path)
+        monkeypatch.setattr(
+            sofa,
+            "_gitignore_lock_path_for_stat",
+            lambda _root, _stat: lock_path,
+        )
         operation = lambda: sofa.ensure_sofa_gitignore(tmp_path)
         error = sofa.SofaGitignoreSecurityError
 
@@ -796,11 +835,119 @@ def test_vc3_secure_merge_supports_platform_without_fchmod(
 ) -> None:
     monkeypatch.delattr(sofa.os, "fchmod", raising=False)
 
-    assert sofa.ensure_sofa_gitignore(tmp_path) is True
+    with patch.object(sofa.os, "chmod") as path_chmod:
+        assert sofa.ensure_sofa_gitignore(tmp_path) is True
 
+    path_chmod.assert_not_called()
     assert (
         ".sofa/" in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
     )
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_no_fchmod_lock_swap_cannot_chmod_outside_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    lock_path = tmp_path / "controlled.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o644)
+    outside = tmp_path / "outside-mode"
+    outside.write_bytes(b"outside")
+    outside.chmod(0o644)
+    real_chmod = os.chmod
+
+    def swap_then_chmod(path: str | Path, mode: int) -> None:
+        target = Path(path)
+        if target == lock_path:
+            target.unlink()
+            target.symlink_to(outside)
+        real_chmod(target, mode)
+
+    if writer == "cli":
+        monkeypatch.delattr(file_copier.os, "fchmod", raising=False)
+        monkeypatch.setattr(
+            file_copier,
+            "_gitignore_lock_path_for_stat",
+            lambda _root, _stat: lock_path,
+        )
+        monkeypatch.setattr(file_copier.os, "chmod", swap_then_chmod)
+        operation = lambda: file_copier.merge_update_runtime_gitignore(tmp_path)
+        error = file_copier.UpdateRuntimeGitignoreSecurityError
+    else:
+        monkeypatch.delattr(sofa.os, "fchmod", raising=False)
+        monkeypatch.setattr(
+            sofa,
+            "_gitignore_lock_path_for_stat",
+            lambda _root, _stat: lock_path,
+        )
+        monkeypatch.setattr(sofa.os, "chmod", swap_then_chmod)
+        operation = lambda: sofa.ensure_sofa_gitignore(tmp_path)
+        error = sofa.SofaGitignoreSecurityError
+
+    with pytest.raises(error):
+        operation()
+
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_no_fchmod_gitignore_temp_swap_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    lock_path = tmp_path / "controlled.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+    gitignore = tmp_path / ".gitignore"
+    original = b"user-rule/\n"
+    gitignore.write_bytes(original)
+    gitignore.chmod(0o640)
+    outside = tmp_path / "outside-mode"
+    outside.write_bytes(b"outside")
+    outside.chmod(0o644)
+    real_chmod = os.chmod
+
+    def swap_temp_then_chmod(path: str | Path, mode: int) -> None:
+        target = Path(path)
+        if target.name.startswith(".gitignore."):
+            target.unlink()
+            target.symlink_to(outside)
+        real_chmod(target, mode)
+
+    if writer == "cli":
+        monkeypatch.delattr(file_copier.os, "fchmod", raising=False)
+        monkeypatch.setattr(
+            file_copier,
+            "_gitignore_lock_path_for_stat",
+            lambda _root, _stat: lock_path,
+        )
+        monkeypatch.setattr(file_copier.os, "chmod", swap_temp_then_chmod)
+        operation = lambda: file_copier.merge_update_runtime_gitignore(tmp_path)
+        error = file_copier.UpdateRuntimeGitignoreSecurityError
+    else:
+        monkeypatch.delattr(sofa.os, "fchmod", raising=False)
+        monkeypatch.setattr(
+            sofa,
+            "_gitignore_lock_path_for_stat",
+            lambda _root, _stat: lock_path,
+        )
+        monkeypatch.setattr(sofa.os, "chmod", swap_temp_then_chmod)
+        operation = lambda: sofa.ensure_sofa_gitignore(tmp_path)
+        error = sofa.SofaGitignoreSecurityError
+
+    with pytest.raises(error):
+        operation()
+
+    assert gitignore.read_bytes() == original
+    assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
 
 
 def test_vc3_secure_merge_closes_temp_before_replace(
@@ -924,7 +1071,63 @@ def test_vc3_cli_and_standalone_gitignore_merges_serialize_across_processes(
         ".map/update.lock",
         ".map/provider-refresh.lock",
         ".map/installer.lock",
-        ".map-gitignore.lock",
+        ".sofa/",
+    ):
+        assert lines.count(required) >= 1
+
+
+@pytest.mark.parametrize(
+    ("first_operation", "second_operation"),
+    [
+        ("gitignore-cli", "gitignore-sofa"),
+        ("gitignore-sofa", "gitignore-cli"),
+    ],
+)
+def test_vc3_gitignore_lock_identity_uses_samefile_across_case_aliases(
+    tmp_path: Path,
+    first_operation: str,
+    second_operation: str,
+) -> None:
+    project = tmp_path / "MapProject"
+    project.mkdir()
+    alias = tmp_path / "mAPpROJECT"
+    if not alias.exists() or not os.path.samefile(project, alias):
+        pytest.skip("case-insensitive filesystem required for samefile alias coverage")
+    (project / ".gitignore").write_text(
+        "user-rule/\n!.map/**\n!.sofa/**\n", encoding="utf-8"
+    )
+
+    first, _, first_ready, first_release, first_done = _start_concurrency_worker(
+        tmp_path,
+        name="first-case-alias",
+        operation=first_operation,
+        project=project,
+        pause=True,
+    )
+    assert _wait_for_path(first_ready), "first alias writer never reached its read"
+
+    second, second_attempted, _, _, second_done = _start_concurrency_worker(
+        tmp_path,
+        name="second-case-alias",
+        operation=second_operation,
+        project=alias,
+        pause=False,
+    )
+    assert _wait_for_path(second_attempted), "second alias writer never attempted"
+    second_returned_while_first_was_paused = _wait_for_path(second_done, timeout=0.75)
+
+    first_release.write_text("release", encoding="utf-8")
+    _finish_worker(first)
+    _finish_worker(second)
+
+    assert not second_returned_while_first_was_paused
+    assert first_done.is_file()
+    lines = (project / ".gitignore").read_text(encoding="utf-8").splitlines()
+    for required in (
+        ".map/update-state.json",
+        ".map/update.lock",
+        ".map/provider-refresh.lock",
+        ".map/installer.lock",
         ".sofa/",
     ):
         assert lines.count(required) >= 1
@@ -1418,6 +1621,56 @@ def test_vc4_safe_atomic_store_and_resolve_preserve_entries(tmp_path: Path) -> N
     assert stat.S_IMODE(sofa_dir.stat().st_mode) == 0o700
     if os.name != "nt":
         assert stat.S_IMODE((sofa_dir / "credentials.lock").stat().st_mode) == 0o600
+
+
+def test_vc4_no_fchmod_credentials_flow_never_uses_path_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    monkeypatch.delattr(sofa.os, "fchmod", raising=False)
+    monkeypatch.setattr(sofa, "_CAN_USE_DIRECTORY_FD", False)
+
+    with patch.object(sofa.os, "chmod") as path_chmod:
+        result = _store_test_credentials(tmp_path)
+
+    assert result["ok"] is True
+    path_chmod.assert_not_called()
+    credentials_file = tmp_path / ".sofa" / "credentials.json"
+    assert stat.S_IMODE(credentials_file.stat().st_mode) == 0o600
+
+
+def test_vc4_no_fchmod_credentials_lock_swap_cannot_chmod_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / ".gitignore").write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
+    sofa_dir = tmp_path / ".sofa"
+    sofa_dir.mkdir()
+    lock_file = sofa_dir / "credentials.lock"
+    lock_file.write_bytes(b"")
+    lock_file.chmod(0o644)
+    outside = tmp_path / "outside-mode"
+    outside.write_bytes(b"outside")
+    outside.chmod(0o644)
+    real_chmod = os.chmod
+
+    def swap_then_chmod(path: str | Path, mode: int) -> None:
+        target = Path(path)
+        if target == lock_file:
+            target.unlink()
+            target.symlink_to(outside)
+        real_chmod(target, mode)
+
+    monkeypatch.delattr(sofa.os, "fchmod", raising=False)
+    monkeypatch.setattr(sofa.os, "chmod", swap_then_chmod)
+
+    result = _store_test_credentials(tmp_path)
+
+    assert result["ok"] is False
+    assert result["kind"] == "credential_storage_error"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
+    assert not (sofa_dir / "credentials.json").exists()
 
 
 @pytest.mark.parametrize("attack", ["symlink", "hardlink", "nonregular"])
