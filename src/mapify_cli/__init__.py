@@ -173,6 +173,10 @@ INDIVIDUAL_MCP_SERVERS = {
     "sequential-thinking": "Chain-of-thought reasoning",
 }
 
+# Hidden update responses include bounded release notes and must remain small enough
+# for reliable agent-tool transport. The limit includes the trailing newline.
+INTERNAL_UPDATE_MAX_JSON_BYTES = 16 * 1024
+
 
 app = typer.Typer(
     name="mapify",
@@ -1906,6 +1910,90 @@ def minimality_report(
     _render_minimality_report(report)
 
 
+def _truncate_internal_update_strings(
+    value: object,
+    max_string_bytes: int,
+    *,
+    preserve_status: bool = False,
+) -> object:
+    """Copy JSON-like data while UTF-8-safely bounding every string value."""
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        if len(encoded) <= max_string_bytes:
+            return value
+        return encoded[:max_string_bytes].decode("utf-8", errors="ignore")
+    if isinstance(value, dict):
+        return {
+            key: (
+                item
+                if preserve_status and key == "status"
+                else _truncate_internal_update_strings(item, max_string_bytes)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _truncate_internal_update_strings(item, max_string_bytes) for item in value
+        ]
+    return value
+
+
+def _internal_update_json_line(payload: object) -> str:
+    """Serialize one UTF-8 JSON line within the internal protocol byte bound."""
+
+    def serialize(candidate: object) -> tuple[str, int]:
+        line = json.dumps(candidate, ensure_ascii=False) + "\n"
+        return line, len(line.encode("utf-8"))
+
+    line, encoded_size = serialize(payload)
+    if encoded_size <= INTERNAL_UPDATE_MAX_JSON_BYTES:
+        return line
+
+    smallest = _truncate_internal_update_strings(payload, 0, preserve_status=True)
+    best_line, smallest_size = serialize(smallest)
+    if smallest_size > INTERNAL_UPDATE_MAX_JSON_BYTES:
+        raise ValueError("MAP update result structure exceeds the JSON response bound")
+
+    low = 1
+    high = INTERNAL_UPDATE_MAX_JSON_BYTES
+    while low <= high:
+        candidate_cap = (low + high) // 2
+        candidate = _truncate_internal_update_strings(
+            payload,
+            candidate_cap,
+            preserve_status=True,
+        )
+        candidate_line, candidate_size = serialize(candidate)
+        if candidate_size <= INTERNAL_UPDATE_MAX_JSON_BYTES:
+            best_line = candidate_line
+            low = candidate_cap + 1
+        else:
+            high = candidate_cap - 1
+    return best_line
+
+
+def _write_internal_update_json(payload: object) -> None:
+    """Serialize and write one bounded internal update response."""
+    sys.stdout.write(_internal_update_json_line(payload))
+
+
+def _write_internal_update_failure(exc: Exception) -> None:
+    """Best-effort manual failure presentation that never leaks an exception."""
+    try:
+        try:
+            details = str(exc)
+        except Exception:  # noqa: BLE001 -- hostile exception presentation boundary
+            details = type(exc).__name__
+        _write_internal_update_json(
+            {
+                "status": "error",
+                "message": f"MAP update failed: {details}"[:2_000],
+            }
+        )
+    except Exception:  # noqa: BLE001, S110 -- stdout may itself be unavailable
+        pass
+
+
 @app.command("_update", hidden=True)
 def internal_update(
     mode: str = typer.Option(..., "--mode"),
@@ -1918,15 +2006,15 @@ def internal_update(
     try:
         parsed_mode = UpdateMode(mode)
     except ValueError:
-        sys.stdout.write(
-            json.dumps(
+        try:
+            _write_internal_update_json(
                 {
                     "status": "error",
                     "message": "--mode must be automatic or manual",
                 }
             )
-            + "\n"
-        )
+        except Exception:  # noqa: BLE001, S110 -- final presentation boundary
+            pass
         raise typer.Exit(1) from None
 
     try:
@@ -1942,18 +2030,17 @@ def internal_update(
                 mode=parsed_mode,
                 approved_major=approve_major,
             )
+        is_error = result.status is UpdateStatus.ERROR
+        if parsed_mode is UpdateMode.AUTOMATIC and is_error:
+            return
+        _write_internal_update_json(result.to_dict())
     except Exception as exc:  # noqa: BLE001 -- final presentation boundary
         if parsed_mode is UpdateMode.AUTOMATIC:
             return
-        message = f"MAP update failed: {exc}"[:2_000]
-        sys.stdout.write(json.dumps({"status": "error", "message": message}) + "\n")
+        _write_internal_update_failure(exc)
         raise typer.Exit(1) from None
 
-    if parsed_mode is UpdateMode.AUTOMATIC and result.status is UpdateStatus.ERROR:
-        return
-
-    sys.stdout.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
-    if result.status is UpdateStatus.ERROR:
+    if is_error:
         raise typer.Exit(1)
 
 

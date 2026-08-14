@@ -36,6 +36,7 @@ from mapify_cli import (
 from mapify_cli.auto_update import UpdateMode, UpdateResult, UpdateStatus
 from mapify_cli.delivery import create_map_tools
 from mapify_cli.install_manifest import read_manifest
+from mapify_cli.update_versions import ReleaseHighlights, StableVersion
 
 runner = CliRunner()
 
@@ -1622,6 +1623,48 @@ class TestInternalUpdateCommand:
         assert result.output == ""
 
     @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_automatic_to_dict_failure_is_silent_success(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        broken_result = mock.Mock(status=UpdateStatus.CURRENT)
+        broken_result.to_dict.side_effect = TypeError("cannot serialize result")
+        mock_update.return_value = broken_result
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout == ""
+        assert result.stderr == ""
+        assert result.output == ""
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    @mock.patch(
+        "mapify_cli._write_internal_update_json",
+        side_effect=OSError("stdout closed"),
+    )
+    def test_internal_update_automatic_write_failure_is_silent_success(
+        self,
+        mock_write: mock.Mock,
+        mock_update: mock.Mock,
+        tmp_path: Path,
+    ) -> None:
+        mock_update.return_value = UpdateResult(UpdateStatus.CURRENT, "3.25.0")
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout == ""
+        assert result.stderr == ""
+        assert result.output == ""
+        assert mock_write.call_count == 1
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
     def test_internal_update_automatic_success_emits_one_clean_unicode_json_object(
         self, mock_update: mock.Mock, tmp_path: Path
     ) -> None:
@@ -1683,7 +1726,7 @@ class TestInternalUpdateCommand:
         def raise_noisily(*_args: object, **_kwargs: object) -> UpdateResult:
             print("incidental stdout")
             print("incidental stderr", file=sys.stderr)
-            raise OSError("unexpected" + "x" * 3_000)
+            raise OSError("unexpected" + "🎉" * 3_000)
 
         mock_update.side_effect = raise_noisily
 
@@ -1698,7 +1741,124 @@ class TestInternalUpdateCommand:
         payload = json.loads(result.stdout)
         assert payload["status"] == "error"
         assert payload["message"].startswith("MAP update failed: unexpected")
-        assert len(payload["message"]) == 2_000
+        assert len(payload["message"]) <= 2_000
+        assert len(result.stdout_bytes) <= 16 * 1_024
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_service_error_is_bounded_valid_json(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        original_message = "offline " + "🎉" * 20_000
+        mock_update.return_value = UpdateResult(
+            UpdateStatus.ERROR,
+            "3.25.0",
+            message=original_message,
+        )
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "manual", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        assert len(result.stdout_bytes) <= 16 * 1_024
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "error"
+        assert payload["current_version"] == "3.25.0"
+        assert payload["message"].startswith("offline ")
+        assert len(payload["message"]) < len(original_message)
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_to_dict_failure_is_one_json_failure(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        broken_result = mock.Mock(status=UpdateStatus.CURRENT)
+        broken_result.to_dict.side_effect = TypeError("cannot serialize result")
+        mock_update.return_value = broken_result
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "manual", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 1
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        assert len(result.stdout_bytes) <= 16 * 1_024
+        payload = json.loads(result.stdout)
+        assert payload == {
+            "status": "error",
+            "message": "MAP update failed: cannot serialize result",
+        }
+        assert "Traceback" not in result.output
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_manual_write_failure_emits_one_fallback_json(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        mock_update.return_value = UpdateResult(UpdateStatus.CURRENT, "3.25.0")
+        real_write = mapify_cli._write_internal_update_json
+        call_count = 0
+
+        def fail_first_write(payload: object) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise OSError("stdout closed")
+            real_write(payload)
+
+        with mock.patch(
+            "mapify_cli._write_internal_update_json",
+            side_effect=fail_first_write,
+        ):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", "manual", "--project", str(tmp_path)],
+            )
+
+        assert result.exit_code == 1
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        assert json.loads(result.stdout) == {
+            "status": "error",
+            "message": "MAP update failed: stdout closed",
+        }
+        assert "Traceback" not in result.output
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_major_metadata_is_bounded_with_required_fields(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        original_body = "🎉" * 20_000
+        mock_update.return_value = UpdateResult(
+            UpdateStatus.MAJOR_AVAILABLE,
+            "3.25.0",
+            major=ReleaseHighlights(
+                version=StableVersion(4, 0, 0),
+                title="MAP 4",
+                body=original_body,
+                url="https://github.com/azalio/map-framework/releases/tag/v4.0.0",
+            ),
+        )
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "manual", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        assert result.stdout.count("\n") == 1
+        assert len(result.stdout_bytes) <= 16 * 1_024
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "major_available"
+        assert payload["current_version"] == "3.25.0"
+        assert payload["major"]["version"] == "4.0.0"
+        assert payload["major"]["title"] == "MAP 4"
+        assert payload["major"]["url"].endswith("/v4.0.0")
+        assert len(payload["major"]["body"]) < len(original_body)
 
     @mock.patch("mapify_cli.auto_update.check_and_update")
     def test_internal_update_manual_success_emits_one_clean_unicode_json_object(
