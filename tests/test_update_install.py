@@ -13,7 +13,6 @@ from unittest.mock import Mock
 
 import pytest
 
-import mapify_cli.update_install as update_install_module
 import mapify_cli.update_state as update_state_module
 from mapify_cli.update_install import (
     InstallKind,
@@ -26,9 +25,11 @@ from mapify_cli.update_install import (
     refresh_installed_providers,
     resolve_mapify_executable,
     run_command,
+    run_installer_controller,
 )
 from mapify_cli.update_state import (
     UpdateLockBusy,
+    installer_process_lock,
     project_update_lock,
 )
 from mapify_cli.update_versions import StableVersion
@@ -92,6 +93,7 @@ def test_pip_exact_command() -> None:
 
     assert command == [
         "/venv/bin/python",
+        "-I",
         "-m",
         "pip",
         "install",
@@ -130,6 +132,7 @@ def test_install_exact_command_uses_project_and_300_second_timeout(
         (
             [
                 sys.executable,
+                "-I",
                 "-m",
                 "pip",
                 "install",
@@ -194,6 +197,110 @@ def test_install_authorizer_failure_prevents_package_start(
         )
 
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("shadow_location", ["cwd", "pythonpath"])
+def test_controller_launch_ignores_untrusted_mapify_shadow(
+    tmp_path: Path, shadow_location: str
+) -> None:
+    shadow_marker = tmp_path / "shadow-imported"
+    package_marker = tmp_path / "trusted-package-started"
+    authorized_marker = tmp_path / "intent-authorized"
+    shadow_root = tmp_path if shadow_location == "cwd" else tmp_path / "injected"
+    shadow_package = shadow_root / "mapify_cli"
+    shadow_package.mkdir(parents=True)
+    (shadow_package / "__init__.py").write_text("", encoding="utf-8")
+    (shadow_package / "update_install.py").write_text(
+        """
+import json
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["MAP_TEST_SHADOW_MARKER"]).write_text(
+    "shadowed\\n", encoding="utf-8"
+)
+Path(os.environ["MAP_UPDATE_INSTALL_READY"]).write_text(
+    "fake-ready\\n", encoding="utf-8"
+)
+if sys.stdin.readline() == "GO\\n":
+    print(json.dumps({
+        "status": "completed",
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+    }))
+""",
+        encoding="utf-8",
+    )
+    child_code = """
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text("trusted\\n", encoding="utf-8")
+"""
+    environment = os.environ.copy()
+    environment["MAP_TEST_SHADOW_MARKER"] = str(shadow_marker)
+    if shadow_location == "pythonpath":
+        environment["PYTHONPATH"] = str(shadow_root)
+
+    result = run_installer_controller(
+        [sys.executable, "-c", child_code, str(package_marker)],
+        tmp_path,
+        5.0,
+        environment,
+        authorize_start=lambda: authorized_marker.touch(),
+    )
+
+    assert result.returncode == 0
+    assert authorized_marker.is_file()
+    assert package_marker.is_file()
+    assert not shadow_marker.exists()
+
+
+@pytest.mark.parametrize("shadow_location", ["cwd", "pythonpath"])
+def test_pip_launch_ignores_untrusted_module_shadow(
+    tmp_path: Path, shadow_location: str
+) -> None:
+    shadow_marker = tmp_path / "shadow-pip-imported"
+    shadow_root = tmp_path if shadow_location == "cwd" else tmp_path / "injected"
+    shadow_package = shadow_root / "pip"
+    shadow_package.mkdir(parents=True)
+    (shadow_package / "__init__.py").write_text("", encoding="utf-8")
+    (shadow_package / "__main__.py").write_text(
+        """
+import os
+from pathlib import Path
+
+Path(os.environ["MAP_TEST_PIP_SHADOW_MARKER"]).write_text(
+    "shadowed\\n", encoding="utf-8"
+)
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["MAP_TEST_PIP_SHADOW_MARKER"] = str(shadow_marker)
+    if shadow_location == "pythonpath":
+        environment["PYTHONPATH"] = str(shadow_root)
+    install_command = build_package_install_command(
+        InstallKind.PIP,
+        StableVersion(3, 26, 0),
+        python_executable=str(getattr(sys, "_base_executable", sys.executable)),
+    )
+    assert install_command is not None
+    probe_command = [*install_command[: install_command.index("install")], "--version"]
+
+    result = run_installer_controller(
+        probe_command,
+        tmp_path,
+        5.0,
+        environment,
+        authorize_start=lambda: None,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("pip ")
+    assert not shadow_marker.exists()
 
 
 def _wait_for_path(path: Path, timeout_s: float = 5.0) -> None:
@@ -288,8 +395,6 @@ run_installer_controller(
 def test_parent_death_before_go_releases_barrier_without_starting_package(
     tmp_path: Path,
 ) -> None:
-    installer_lock = getattr(update_state_module, "installer_process_lock", None)
-    assert callable(installer_lock)
     authorized = tmp_path / "authorize-entered"
     package_started = tmp_path / "package-started"
     parent = subprocess.Popen(
@@ -309,7 +414,7 @@ def test_parent_death_before_go_releases_barrier_without_starting_package(
         _wait_for_path(authorized)
         with (
             pytest.raises(UpdateLockBusy),
-            installer_lock(tmp_path, timeout_s=0.0),
+            installer_process_lock(tmp_path, timeout_s=0.0),
         ):
             raise AssertionError("READY must mean the controller owns the barrier")
 
@@ -319,7 +424,7 @@ def test_parent_death_before_go_releases_barrier_without_starting_package(
         deadline = time.monotonic() + 5.0
         while True:
             try:
-                with installer_lock(tmp_path, timeout_s=0.0):
+                with installer_process_lock(tmp_path, timeout_s=0.0):
                     break
             except UpdateLockBusy:
                 if time.monotonic() >= deadline:
@@ -343,10 +448,6 @@ def test_orphan_installer_holds_project_barrier_until_package_exits(
     from mapify_cli import auto_update
     from mapify_cli.auto_update import UpdateMode, UpdateStatus, check_and_update
 
-    controller = getattr(update_install_module, "run_installer_controller", None)
-    installer_lock = getattr(update_state_module, "installer_process_lock", None)
-    assert callable(controller), "package installs need a child-owned controller"
-    assert callable(installer_lock), "orphan installers need their own barrier lock"
     started = tmp_path / "installer-started"
     release = tmp_path / "release-installer"
     finished = tmp_path / "installer-finished"
@@ -372,7 +473,7 @@ def test_orphan_installer_holds_project_barrier_until_package_exits(
 
         with (
             pytest.raises(UpdateLockBusy),
-            installer_lock(tmp_path, timeout_s=0.0),
+            installer_process_lock(tmp_path, timeout_s=0.0),
         ):
             raise AssertionError("orphan package manager must retain its barrier")
 
@@ -408,7 +509,7 @@ def test_orphan_installer_holds_project_barrier_until_package_exits(
         deadline = time.monotonic() + 5.0
         while True:
             try:
-                with installer_lock(tmp_path, timeout_s=0.0):
+                with installer_process_lock(tmp_path, timeout_s=0.0):
                     break
             except UpdateLockBusy:
                 if time.monotonic() >= deadline:

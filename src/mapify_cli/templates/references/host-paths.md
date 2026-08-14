@@ -35,14 +35,19 @@ These four variables are reserved by MAP runtime layers. Do not repurpose or sha
 
 ## (e) Host-Path Layout
 
-MAP uses two root directories:
+MAP uses the following host and project paths:
 
-- **`.map/`** — project-local MAP state. `.map/<branch>/` holds per-branch workflow artifacts. The automatic updater owns the gitignored `.map/update-state.json`, `.map/update.lock`, and `.map/provider-refresh.lock` files.
+- **`.map/`** — project-local MAP state. `.map/<branch>/` holds per-branch workflow artifacts. The automatic updater owns the gitignored `.map/update-state.json`, `.map/update.lock`, `.map/installer.lock`, and `.map/provider-refresh.lock` files.
+- **`.sofa/`** — opt-in SOFA credentials. `.sofa/credentials.lock` serializes private credential-file reads and writes and is ignored with the rest of `.sofa/`.
 - **`~/.map/`** — host-scoped shared state. Two subdirectories matter:
   - `~/.map/locks/` — advisory lock files acquired by the orchestrator to prevent concurrent MAP sessions on the same branch.
   - `~/.map/hooks/` — host-level hook scripts invoked by the MAP hook harness before/after workflow phases.
 
-These are the only two MAP roots. No other directories are created by the MAP runtime.
+Root `.gitignore` mutation uses one persistent cross-process lock keyed by the
+SHA-256 of the resolved project root. POSIX hosts place it at the fixed path
+`/tmp/mapify-gitignore-<digest>.lock`, independently of `TMPDIR`; Windows uses the
+centrally ignored project-root fallback `.map-gitignore.lock`. These lock files do
+not introduce another MAP state directory.
 
 ### Update Refresh Lease
 
@@ -58,10 +63,23 @@ It is an ephemeral credential, not a configurable runtime option:
 - it cannot be reused without active update-lock contention plus matching direct
   parent PID, project, provider, running version, and pending update phase.
 
+Package mutation is serialized by `.map/installer.lock`, which is acquired by an
+isolated installer controller before it signals `READY`. The updater writes durable
+install intent only after `READY`, then sends `GO`. Parent death before `GO` closes
+the control pipe without starting pip/uv; parent death after `GO` leaves the child
+holding the installer barrier until pip/uv exits. The controller uses the current
+interpreter's isolated mode plus the resolved trusted MAP package root, so project
+files and `PYTHONPATH` cannot shadow its `mapify_cli` import. No lease or handshake
+secret is placed in argv. Pip also runs in interpreter isolated mode while keeping
+the project as its working directory, so neither the project nor `PYTHONPATH` can
+shadow pip's module entry point.
+
 Provider mutation is separately serialized by `.map/provider-refresh.lock` so a
-child that outlives its updater parent cannot race a replacement update. The global
-order is `.map/update.lock` then `.map/provider-refresh.lock`; a validated borrowed
-child already covered by its parent's update lock acquires only the provider lock.
+child that outlives its updater parent cannot race a replacement update. The
+enforced global order is `.map/update.lock`, then `.map/installer.lock`, then
+`.map/provider-refresh.lock`. The updater's installer child owns only the installer
+barrier; a validated provider child already covered by its parent's update lock
+acquires only the provider barrier after installation completes.
 
 ## (f) State Markers (Closed Enum)
 

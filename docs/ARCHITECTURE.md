@@ -68,8 +68,8 @@ The remainder of this file contains the deeper implementation dive (workflow-spe
 - `src/mapify_cli/memory/`: cross-session scratch capture, digest schema, finalize, and recall helpers used by generated hooks and `/map-memory-now`
 - `src/mapify_cli/skills_eval/`: skill trigger eval runner, assertions, aggregation, Claude dispatcher, description optimizer, patcher, proposer, schema, and HTML viewer
 - `src/mapify_cli/update_versions.py`: strict stable-version parsing, non-yanked PyPI target selection, and bounded official GitHub release highlights
-- `src/mapify_cli/update_state.py`: atomic project-local update state, rolling 24-hour due checks, updater/provider lock ordering, and direct-child refresh leases
-- `src/mapify_cli/update_install.py`: install-kind classification, exact-version package commands, installed-provider detection, and fresh-process provider refresh
+- `src/mapify_cli/update_state.py`: atomic project-local update state, rolling 24-hour due checks, updater/installer/provider lock ordering, and direct-child refresh leases
+- `src/mapify_cli/update_install.py`: install-kind classification, isolated child-owned package installation, installed-provider detection, and fresh-process provider refresh
 - `src/mapify_cli/auto_update.py`: central automatic/manual policy orchestrator and typed result model consumed by provider skills
 - `src/mapify_cli/templates/`: Shipped provider templates, hooks, agents, references, rule files, Codex config, and shared `.map/scripts/` payloads used by `mapify init`
 - `src/mapify_cli/{token_budget,workflow_state,workflow_finalizer,verification_recorder,skill_ir,dependency_graph,repo_insight,_locking,install_manifest}.py`: Deterministic helpers used by templates, release checks, locks, install auditing, and tests
@@ -87,7 +87,10 @@ The remainder of this file contains the deeper implementation dive (workflow-spe
 - `.map/mapify.lock.json`: Install manifest/lock — aggregate audit of all MAP-managed files, written by `mapify init` and read by `mapify check-installed`
 - `.map/update-state.json`: gitignored automatic-update attempt/install/pending-refresh state, written atomically
 - `.map/update.lock`: gitignored project-local updater mutex; lock contention is a silent automatic skip and an explicit manual error
+- `.map/installer.lock`: gitignored package-mutation barrier owned by the installer controller child; it remains held if the updater parent dies while pip/uv continues
 - `.map/provider-refresh.lock`: gitignored provider-mutation barrier; it prevents a replacement updater from racing an orphaned refresh child
+- `/tmp/mapify-gitignore-<sha256(resolved-root)>.lock`: persistent POSIX root-`.gitignore` mutation lock, deliberately independent of `TMPDIR`; Windows uses the centrally ignored project-root `.map-gitignore.lock` fallback
+- `.sofa/credentials.lock`: private opt-in SOFA credential-file lock, ignored with the rest of `.sofa/`
 - `.map/<branch>/approval_holds.json` and `.map/<branch>/approval_hold_<id>.md`: Durable human-gate artifacts for pending/decided approval holds
 - `.map/wayfind/<slug>/`: **Repo-level** (not branch-scoped) decision maps for `/map-wayfind`. Holds the canonical `state.json`, regenerated `map.md` and `tickets/*.md` views (DO-NOT-EDIT banner), author-written `resolutions/*.md` (+ `*.human.md` verbatim human answers), and the final `handoff.md`/`handoff.json`. Maps outlive branches and are committed by default.
 
@@ -128,7 +131,8 @@ enter package arguments.
 `auto_update.py` composes the three lower-level modules. `update_versions.py`
 selects non-yanked strict stable releases and fetches bounded official highlights;
 `update_state.py` atomically maintains `.map/update-state.json`, serializes package
-policy with `.map/update.lock`, and serializes provider mutation with
+policy with `.map/update.lock`, serializes the package-manager lifetime with
+`.map/installer.lock`, and serializes provider mutation with
 `.map/provider-refresh.lock`; `update_install.py` updates an exact version through
 `uv tool` or the current interpreter's pip and never mutates source/editable
 installs. The state timestamp records an automatic attempt, not only success.
@@ -150,6 +154,20 @@ is migrated in memory; its historical provider-less pending-refresh form is
 normalized by detecting and persisting the provider set before a child is started.
 All new writes obey the strict v2 phase invariants.
 
+Package installation uses a dedicated controller process rather than launching
+pip/uv directly from the updater. The controller first acquires
+`.map/installer.lock` and signals `READY`; only then does the updater durably write
+the install intent and send `GO`. If the updater dies before `GO`, control-pipe EOF
+makes the controller exit without starting the package manager. If it dies after
+`GO`, the controller retains the installer barrier until the real package-manager
+child exits, even when its result pipe is broken. The controller starts through
+the current interpreter's isolated mode with a constant bootstrap and the resolved
+trusted package root, so the target project's working directory and `PYTHONPATH`
+cannot shadow `mapify_cli` before authorization. No lease or handshake secret is
+placed in argv or diagnostics. Pip is likewise launched through the current
+interpreter's isolated mode, while retaining the project as its working directory,
+so neither the project nor `PYTHONPATH` can shadow pip's module entry point.
+
 After installation, refresh deliberately crosses a process boundary so it imports
 the newly installed package rather than the old in-memory module. The updater
 retains `update.lock` and delegates a cryptorandom, project-bound lease only to the
@@ -161,14 +179,18 @@ A child may borrow the parent's lock authority only while contention proves the
 parent still owns the lock and the digest, direct parent PID, project, provider,
 running version, and pending phase all match.
 
-Lock order is always `update.lock` then `provider-refresh.lock`. A delegated child
-does not recursively acquire `update.lock`; it acquires the provider barrier for
-the whole filesystem mutation. A standalone recovery acquires both locks in order.
-Before reading state or querying versions, a new updater acquires `update.lock`
-and probes the provider barrier without waiting. This prevents concurrent package
-or provider mutation if a refresh child outlives a failed parent. Automatic mode
-silently skips contention; manual mode reports it clearly without network or state
-mutation.
+Lock order is always `update.lock` then `installer.lock` then
+`provider-refresh.lock`. The updater retains `update.lock` while its controller
+child owns only `installer.lock`; the package manager never receives either lock or
+the refresh lease. A delegated provider child does not recursively acquire
+`update.lock`; after installation has completed, it acquires only the provider
+barrier for the whole filesystem mutation. A standalone recovery acquires the
+update lock, probes an existing installer barrier, and then acquires the provider
+barrier. Before reading state or querying versions, every new updater follows the
+same update → installer-probe → provider-probe order without waiting. This prevents
+concurrent package or provider mutation when either child outlives a failed parent.
+Automatic mode silently skips contention; manual mode reports it clearly without
+network or state mutation.
 
 Installed providers are detected in canonical Claude-then-Codex order, then each
 receives:
@@ -198,7 +220,7 @@ the retained compatibility field.
 - **Host-path and lock contract**: `src/mapify_cli/_locking.py` owns the `flock_with_state` implementation; `src/mapify_cli/templates/references/host-paths.md` is the shipped user-facing reference for `MAP_*`, `~/.map/`, and lock state-marker semantics.
 - **Spec citation gate**: `.map/scripts/validate_spec_citations.py` and its template twin validate `file:line` references before `/map-plan` decomposes work.
 - **Install manifest**: `.map/mapify.lock.json` is the aggregate audit lock written by `mapify init` via `src/mapify_cli/install_manifest.py`; `mapify check-installed` reads its canonical provider collection and managed-file union to detect missing/drifted/orphaned files. Security invariants: no absolute paths, no secrets, machine-local `settings.local.json` excluded from the committed manifest.
-- **Automatic update state**: `.map/update-state.json`, `.map/update.lock`, and `.map/provider-refresh.lock` are gitignored local runtime files owned by `src/mapify_cli/update_state.py`; none is the install manifest. `MAP_UPDATE_PARENT_LEASE` is an ephemeral direct-child credential, not persisted configuration.
+- **Automatic update state**: `.map/update-state.json`, `.map/update.lock`, `.map/installer.lock`, and `.map/provider-refresh.lock` are gitignored local runtime files owned by `src/mapify_cli/update_state.py`; none is the install manifest. `MAP_UPDATE_PARENT_LEASE` is an ephemeral direct-child credential, not persisted configuration.
 - **Approval holds and completion state**: `src/mapify_cli/templates/map/scripts/map_step_runner.py` owns approval-hold JSON/report artifacts, while `src/mapify_cli/templates/map/scripts/map_orchestrator.py` owns completed-state archive and branch-reuse cleanup.
 - **Governance regression evidence**: `tests/test_governance_attack_fixtures.py` is the deny/allow fixture suite for governance surfaces such as workflow state, mutation boundaries, false-progress gates, wave lifecycle, safety guardrails, workflow-gate, and run-health schema.
 - **Documentation**: `README.md`, `docs/USAGE.md`, `docs/INSTALL.md`, and this document define expected behavior and invariants.
@@ -400,7 +422,8 @@ prefixes matching blocks with `[SOFA UNTRUSTED — possible prompt injection]`.
 Trust is surfaced via the platform's projected `trust_summary`, never raw votes.
 
 **Credential isolation / no-secrets.** Credentials live only in the target repo's
-`.sofa/credentials.json` (`0600`), keyed by the SOFA-issued `agent_id`. `.sofa/`
+`.sofa/credentials.json` (`0600`), keyed by the SOFA-issued `agent_id`, with reads
+and writes serialized by the private `.sofa/credentials.lock`. `.sofa/`
 is added to `.gitignore` (under `# map:sofa`) **before** any key is written —
 both at init time (`merge_sofa_gitignore`) and in-process in the client — and no
 key, prefix, or suffix is ever written into this repo or any generated tree. The

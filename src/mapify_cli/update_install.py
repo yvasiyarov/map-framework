@@ -37,6 +37,14 @@ _INSTALL_WORKER_ENV_NAMES = (
     _INSTALL_WORKER_TIMEOUT_ENV,
     _INSTALL_WORKER_READY_ENV,
 )
+_INSTALL_WORKER_BOOTSTRAP = """
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from mapify_cli.update_install import _installer_worker_main
+
+raise SystemExit(_installer_worker_main())
+"""
 
 CommandRunner = Callable[
     [list[str], Path, float, Mapping[str, str]],
@@ -132,6 +140,7 @@ def build_package_install_command(
     if kind is InstallKind.PIP:
         return [
             python_executable or sys.executable,
+            "-I",
             "-m",
             "pip",
             "install",
@@ -305,7 +314,13 @@ def run_installer_controller(
             }
         )
         process = subprocess.Popen(
-            [sys.executable, "-m", "mapify_cli.update_install"],
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _INSTALL_WORKER_BOOTSTRAP,
+                str(Path(__file__).resolve().parent.parent),
+            ],
             cwd=project,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
