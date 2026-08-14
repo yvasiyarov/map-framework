@@ -5,11 +5,11 @@ import contextlib
 import json
 import os
 import shlex
-import signal
 import stat
 import subprocess
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from unittest import mock
 
@@ -69,6 +69,39 @@ from mapify_cli.update_versions import (
 )
 
 runner = CliRunner()
+
+
+LOCKED_PROVIDER_REFRESH_PARENT = r"""
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from mapify_cli.update_state import MAP_UPDATE_PARENT_LEASE_ENV, project_update_lock
+
+project = Path(sys.argv[1])
+lock_held = Path(sys.argv[2])
+release = Path(sys.argv[3])
+command = sys.argv[4:]
+with project_update_lock(project, timeout_s=0.0) as lease:
+    lock_held.write_text("held\n", encoding="utf-8")
+    while not release.exists():
+        time.sleep(0.01)
+    environment = os.environ.copy()
+    environment[MAP_UPDATE_PARENT_LEASE_ENV] = lease.token
+    result = subprocess.run(
+        command,
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+raise SystemExit(result.returncode)
+"""
 
 
 def _snapshot_tree(root: Path) -> dict[str, bytes]:
@@ -887,8 +920,18 @@ class TestInitCommand:
         real_replace = file_copier.os.replace
         captured_descriptor: dict[str, int] = {}
 
-        def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
-            descriptor, temporary_name = real_mkstemp(*args, **kwargs)
+        def tracking_mkstemp(
+            suffix: str | None = None,
+            prefix: str | None = None,
+            dir: str | os.PathLike[str] | None = None,
+            text: bool = False,
+        ) -> tuple[int, str]:
+            descriptor, temporary_name = real_mkstemp(
+                suffix=suffix,
+                prefix=prefix,
+                dir=dir,
+                text=text,
+            )
             captured_descriptor["value"] = descriptor
             return descriptor, temporary_name
 
@@ -1851,6 +1894,8 @@ class TestRefreshExistingInit:
             ),
         )
         executable = tmp_path / "mapify-child"
+        child_holds_lock = tmp_path / "provider-child-holds-update-lock"
+        release_child = tmp_path / "release-provider-child"
         executable.write_text(
             f"#!{sys.executable}\nfrom mapify_cli import app\napp()\n",
             encoding="utf-8",
@@ -1867,29 +1912,37 @@ class TestRefreshExistingInit:
         environment = os.environ.copy()
         environment.pop(MAP_UPDATE_PARENT_LEASE_ENV, None)
         first = subprocess.Popen(
-            [*base, "claude", "--refresh-existing"],
+            [
+                sys.executable,
+                "-c",
+                LOCKED_PROVIDER_REFRESH_PARENT,
+                str(tmp_path),
+                str(child_holds_lock),
+                str(release_child),
+                *base,
+                "claude",
+                "--refresh-existing",
+            ],
             cwd=tmp_path,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        first_stopped = False
         try:
             deadline = time.monotonic() + 5.0
-            while True:
-                try:
-                    with project_update_lock(tmp_path, timeout_s=0.0):
-                        pass
-                except UpdateLockBusy:
-                    os.kill(first.pid, signal.SIGSTOP)
-                    first_stopped = True
-                    break
+            while not child_holds_lock.exists():
                 if first.poll() is not None or time.monotonic() >= deadline:
                     raise AssertionError(
-                        "first standalone refresh never held update.lock"
+                        "provider child never started while update.lock was held"
                     )
                 time.sleep(0.01)
+
+            with (
+                pytest.raises(UpdateLockBusy),
+                project_update_lock(tmp_path, timeout_s=0.0),
+            ):
+                raise AssertionError("provider child must still hold update.lock")
 
             contender = subprocess.run(
                 [*base, "codex", "--refresh-existing"],
@@ -1900,12 +1953,10 @@ class TestRefreshExistingInit:
                 capture_output=True,
                 text=True,
             )
-            os.kill(first.pid, signal.SIGCONT)
-            first_stopped = False
+            release_child.write_text("release\n", encoding="utf-8")
             first_stdout, first_stderr = first.communicate(timeout=10.0)
         finally:
-            if first_stopped and first.poll() is None:
-                os.kill(first.pid, signal.SIGCONT)
+            release_child.write_text("release\n", encoding="utf-8")
             if first.poll() is None:
                 first.kill()
                 first.wait(timeout=5.0)
@@ -2485,10 +2536,14 @@ class TestRefreshExistingInit:
         write_update_state(tmp_path, pending_state)
         original_read_text = Path.read_text
 
-        def deny_manifest_read(path: Path, *args: object, **kwargs: object) -> str:
+        def deny_manifest_read(
+            path: Path,
+            encoding: str | None = None,
+            errors: str | None = None,
+        ) -> str:
             if path == manifest_path:
                 raise PermissionError("manifest unreadable")
-            return original_read_text(path, *args, **kwargs)
+            return original_read_text(path, encoding=encoding, errors=errors)
 
         monkeypatch.setattr(Path, "read_text", deny_manifest_read)
 
@@ -2753,10 +2808,14 @@ class TestRefreshExistingInit:
         before = _snapshot_tree(tmp_path)
         original_read_text = Path.read_text
 
-        def deny_manifest_read(path: Path, *args: object, **kwargs: object) -> str:
+        def deny_manifest_read(
+            path: Path,
+            encoding: str | None = None,
+            errors: str | None = None,
+        ) -> str:
             if path == manifest_path:
                 raise PermissionError("manifest unreadable")
-            return original_read_text(path, *args, **kwargs)
+            return original_read_text(path, encoding=encoding, errors=errors)
 
         monkeypatch.setattr(Path, "read_text", deny_manifest_read)
         refresh = runner.invoke(
@@ -2856,10 +2915,14 @@ class TestRefreshExistingInit:
         before = _snapshot_tree(tmp_path)
         original_read_text = Path.read_text
 
-        def deny_mcp_read(path: Path, *args: object, **kwargs: object) -> str:
+        def deny_mcp_read(
+            path: Path,
+            encoding: str | None = None,
+            errors: str | None = None,
+        ) -> str:
             if path == mcp_path:
                 raise PermissionError("MCP config unreadable")
-            return original_read_text(path, *args, **kwargs)
+            return original_read_text(path, encoding=encoding, errors=errors)
 
         monkeypatch.setattr(Path, "read_text", deny_mcp_read)
         refresh = runner.invoke(
@@ -3294,9 +3357,9 @@ class TestInternalUpdateCommand:
 
         def fail_updater_import(
             name: str,
-            globals: object = None,
-            locals: object = None,
-            fromlist: object = (),
+            globals: Mapping[str, object] | None = None,
+            locals: Mapping[str, object] | None = None,
+            fromlist: Sequence[str] | None = (),
             level: int = 0,
         ) -> object:
             if name == "mapify_cli.auto_update":
@@ -3329,9 +3392,9 @@ class TestInternalUpdateCommand:
 
         def reject_updater_import(
             name: str,
-            globals: object = None,
-            locals: object = None,
-            fromlist: object = (),
+            globals: Mapping[str, object] | None = None,
+            locals: Mapping[str, object] | None = None,
+            fromlist: Sequence[str] | None = (),
             level: int = 0,
         ) -> object:
             if name == "mapify_cli.auto_update":
