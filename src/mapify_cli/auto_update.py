@@ -22,6 +22,7 @@ from mapify_cli.update_install import (
 )
 from mapify_cli.update_state import (
     UpdateLockBusy,
+    UpdateLockSecurityError,
     UpdateState,
     automatic_check_due,
     project_update_lock,
@@ -246,6 +247,12 @@ def _actionable_error_message(
     if mode is not UpdateMode.MANUAL:
         return message
 
+    if isinstance(exc, UpdateLockSecurityError):
+        return (
+            "MAP update failed: unsafe MAP update lock path was rejected: "
+            f"{exc}. Remove the unsafe path so MAP can create a regular, "
+            "project-local lock file, then retry map-upgrade."
+        )
     if state.pending_install_version is not None:
         return (
             f"{message}. The package installation outcome is uncertain and the "

@@ -139,6 +139,7 @@ def _state_from_payload(payload: Any) -> UpdateState | None:
         and state.pending_refresh
         and state.last_installed_version is not None
         and not state.pending_providers
+        and _valid_state(replace(state, pending_providers=("claude",)))
     ):
         # Intent: v1 allowed provider-less refresh recovery. Keep it only as an
         # in-memory migration phase so the updater can discover and persist v2
@@ -315,30 +316,86 @@ else:
             return
 
 
-def _open_lock_file(lock_path: Path, *, create: bool) -> int:
+def _lock_security_error(lock_path: Path) -> UpdateLockSecurityError:
+    return UpdateLockSecurityError(str(lock_path))
+
+
+def _prepare_lock_directory(lock_path: Path, *, create: bool) -> os.stat_result:
+    map_dir = lock_path.parent
     if create:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            map_dir.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    try:
+        map_stat = os.lstat(map_dir)
+        resolved_map_dir = map_dir.resolve(strict=True)
+    except OSError as exc:
+        raise _lock_security_error(lock_path) from exc
+    if (
+        stat.S_ISLNK(map_stat.st_mode)
+        or not stat.S_ISDIR(map_stat.st_mode)
+        or resolved_map_dir != map_dir
+    ):
+        raise _lock_security_error(lock_path)
+    return map_stat
+
+
+def _validate_lock_file_identity(
+    fd: int,
+    lock_path: Path,
+    map_identity: tuple[int, int],
+) -> None:
+    try:
+        fd_stat = os.fstat(fd)
+        path_stat = os.lstat(lock_path)
+        map_stat = os.lstat(lock_path.parent)
+        resolved_map_dir = lock_path.parent.resolve(strict=True)
+    except OSError as exc:
+        raise _lock_security_error(lock_path) from exc
+    if (
+        not stat.S_ISREG(fd_stat.st_mode)
+        or fd_stat.st_nlink != 1
+        or stat.S_ISLNK(path_stat.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or path_stat.st_nlink != 1
+        or (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino)
+        or stat.S_ISLNK(map_stat.st_mode)
+        or not stat.S_ISDIR(map_stat.st_mode)
+        or (map_stat.st_dev, map_stat.st_ino) != map_identity
+        or resolved_map_dir != lock_path.parent
+    ):
+        raise _lock_security_error(lock_path)
+
+
+def _open_lock_file(lock_path: Path, *, create: bool) -> int:
+    map_stat = _prepare_lock_directory(lock_path, create=create)
+    map_identity = (map_stat.st_dev, map_stat.st_ino)
+    try:
+        existing_stat = os.lstat(lock_path)
+    except FileNotFoundError:
+        existing_stat = None
+    except OSError as exc:
+        raise _lock_security_error(lock_path) from exc
+    if existing_stat is not None and (
+        stat.S_ISLNK(existing_stat.st_mode)
+        or not stat.S_ISREG(existing_stat.st_mode)
+        or existing_stat.st_nlink != 1
+    ):
+        raise _lock_security_error(lock_path)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if nofollow == 0 and lock_path.is_symlink():
-        raise UpdateLockSecurityError(str(lock_path))
     flags = os.O_RDWR | (os.O_CREAT if create else 0) | nofollow
     try:
         fd = os.open(lock_path, flags, 0o600)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.EMLINK):
-            raise UpdateLockSecurityError(str(lock_path)) from exc
+            raise _lock_security_error(lock_path) from exc
         raise
 
     try:
-        if nofollow == 0:
-            # Intent: Match path and descriptor identities to detect path swaps.
-            path_stat = os.lstat(lock_path)
-            fd_stat = os.fstat(fd)
-            if stat.S_ISLNK(path_stat.st_mode) or (
-                path_stat.st_dev,
-                path_stat.st_ino,
-            ) != (fd_stat.st_dev, fd_stat.st_ino):
-                raise UpdateLockSecurityError(str(lock_path))
+        # Intent: Match path, descriptor, and parent identities after opening;
+        # reject non-regular or multiply-linked files before chmod or writes.
+        _validate_lock_file_identity(fd, lock_path, map_identity)
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
         return fd
@@ -359,7 +416,13 @@ def _acquire_fd(fd: int, lock_path: Path, timeout_s: float) -> None:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _write_fd(fd: int, data: bytes) -> None:
+def _write_fd(fd: int, lock_path: Path, data: bytes) -> None:
+    map_stat = _prepare_lock_directory(lock_path, create=False)
+    _validate_lock_file_identity(
+        fd,
+        lock_path,
+        (map_stat.st_dev, map_stat.st_ino),
+    )
     os.lseek(fd, 0, os.SEEK_SET)
     os.ftruncate(fd, 0)
     remaining = memoryview(data)
@@ -371,14 +434,22 @@ def _write_fd(fd: int, data: bytes) -> None:
     os.fsync(fd)
 
 
-def _write_lock_record(fd: int, lease: ProjectUpdateLease) -> None:
+def _write_lock_record(
+    fd: int,
+    lock_path: Path,
+    lease: ProjectUpdateLease,
+) -> None:
     payload = {
         "schema_version": 1,
         "lease_digest": hashlib.sha256(lease.token.encode()).hexdigest(),
         "owner_pid": lease.owner_pid,
         "project": str(lease.project),
     }
-    _write_fd(fd, (json.dumps(payload, sort_keys=True) + "\n").encode())
+    _write_fd(
+        fd,
+        lock_path,
+        (json.dumps(payload, sort_keys=True) + "\n").encode(),
+    )
 
 
 def _read_lock_record(fd: int) -> dict[str, Any] | None:
@@ -531,6 +602,7 @@ def provider_refresh_session(
     running_version: str,
     raw_parent_lease: str | None,
     timeout_s: float,
+    detected_providers: tuple[str, ...] = (),
 ) -> Generator[None, None, None]:
     """Serialize one complete ``init --refresh-existing`` mutation."""
     project = project_path.resolve()
@@ -561,6 +633,24 @@ def provider_refresh_session(
     ):
         state = read_update_state(project)
         _validate_refresh_phase_for_running_version(state, running_version)
+        if state.pending_refresh and not state.pending_providers:
+            if (
+                not detected_providers
+                or provider not in detected_providers
+                or any(
+                    detected_provider not in _PROVIDERS
+                    for detected_provider in detected_providers
+                )
+                or len(set(detected_providers)) != len(detected_providers)
+            ):
+                raise UpdateLeaseRejected(
+                    "legacy pending MAP refresh has no canonical installed provider set"
+                )
+            # Intent: v1 allowed a provider-less pending refresh. Persist full
+            # provider authority under both locks before any standalone mutation,
+            # so each successful init can narrow and eventually clear the state.
+            state = replace(state, pending_providers=detected_providers)
+            write_update_state(project, state)
         _promote_matching_install_intent(project, state, running_version)
         yield
 
@@ -584,7 +674,7 @@ def project_update_lock(
             owner_pid=os.getpid(),
             project=project,
         )
-        _write_lock_record(fd, lease)
+        _write_lock_record(fd, lock_path, lease)
         context_token = _CURRENT_UPDATE_LEASE.set(lease)
         yield lease
     finally:
@@ -592,8 +682,10 @@ def project_update_lock(
             if context_token is not None:
                 _CURRENT_UPDATE_LEASE.reset(context_token)
             if acquired:
-                with contextlib.suppress(OSError):
-                    _write_fd(fd, b"")
-                _unlock(fd)
+                try:
+                    with contextlib.suppress(OSError):
+                        _write_fd(fd, lock_path, b"")
+                finally:
+                    _unlock(fd)
         finally:
             os.close(fd)

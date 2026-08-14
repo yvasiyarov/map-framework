@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from mapify_cli.update_versions import StableVersion
 
 COMMAND_TIMEOUT_SECONDS = 300.0
 MAX_ERROR_OUTPUT_CHARS = 4_096
+_LEASE_ASSIGNMENT_RE = re.compile(rf"{re.escape(MAP_UPDATE_PARENT_LEASE_ENV)}=[^\s,;]+")
 
 CommandRunner = Callable[
     [list[str], Path, float, Mapping[str, str]],
@@ -113,14 +115,35 @@ def build_package_install_command(
     return None
 
 
-def _bounded_stderr(stderr: str | bytes | None) -> str:
-    """Return bounded subprocess diagnostics suitable for an exception message."""
-    if isinstance(stderr, bytes):
-        value = stderr.decode(errors="replace").strip()
+def _redacted_diagnostic(
+    output: str | bytes | None,
+    sensitive_values: Sequence[str],
+) -> str:
+    if isinstance(output, bytes):
+        value = output.decode(errors="replace")
     else:
-        value = (stderr or "").strip()
+        value = output or ""
+    for sensitive in sensitive_values:
+        if sensitive:
+            value = value.replace(sensitive, "<redacted>")
+    return _LEASE_ASSIGNMENT_RE.sub(
+        f"{MAP_UPDATE_PARENT_LEASE_ENV}=<redacted>",
+        value,
+    ).strip()
+
+
+def _bounded_subprocess_diagnostic(
+    stderr: str | bytes | None,
+    stdout: str | bytes | None = None,
+    *,
+    sensitive_values: Sequence[str] = (),
+) -> str:
+    """Return bounded, stderr-first subprocess diagnostics with secrets removed."""
+    value = _redacted_diagnostic(stderr, sensitive_values)
     if not value:
-        return "no stderr output"
+        value = _redacted_diagnostic(stdout, sensitive_values)
+    if not value:
+        return "no stdout/stderr output"
     return value[:MAX_ERROR_OUTPUT_CHARS]
 
 
@@ -157,7 +180,8 @@ def install_exact_version(
     except subprocess.TimeoutExpired as exc:
         raise PackageUpdateError(
             f"Exact mapify-cli {version} installation timed out after "
-            f"{COMMAND_TIMEOUT_SECONDS:g} seconds: {_bounded_stderr(exc.stderr)}"
+            f"{COMMAND_TIMEOUT_SECONDS:g} seconds: "
+            f"{_bounded_subprocess_diagnostic(exc.stderr, exc.stdout)}"
         ) from exc
     except OSError as exc:
         raise PackageUpdateError(
@@ -166,7 +190,8 @@ def install_exact_version(
     if result.returncode != 0:
         raise PackageUpdateError(
             f"Exact mapify-cli {version} installation failed with exit "
-            f"{result.returncode}: {_bounded_stderr(result.stderr)}"
+            f"{result.returncode}: "
+            f"{_bounded_subprocess_diagnostic(result.stderr, result.stdout)}"
         )
 
 
@@ -217,6 +242,7 @@ def refresh_installed_providers(
             raise ProjectRefreshError(str(exc), pending_providers=pending) from exc
     refreshed: list[str] = []
     parent_lease = current_project_update_lease(project_path)
+    sensitive_values = (parent_lease.token,) if parent_lease is not None else ()
     child_environment = _child_environment(
         parent_lease.token if parent_lease is not None else None
     )
@@ -244,13 +270,15 @@ def refresh_installed_providers(
             raise ProjectRefreshError(
                 f"Refreshing the {provider} provider timed out after "
                 f"{COMMAND_TIMEOUT_SECONDS:g} seconds: "
-                f"{_bounded_stderr(exc.stderr)}",
+                f"{_bounded_subprocess_diagnostic(exc.stderr, exc.stdout, sensitive_values=sensitive_values)}",
                 refreshed_providers=tuple(refreshed),
                 pending_providers=remaining,
             ) from exc
         except OSError as exc:
+            diagnostic = _redacted_diagnostic(str(exc), sensitive_values)
             raise ProjectRefreshError(
-                f"Refreshing the {provider} provider could not be started: {exc}",
+                f"Refreshing the {provider} provider could not be started: "
+                f"{diagnostic[:MAX_ERROR_OUTPUT_CHARS]}",
                 refreshed_providers=tuple(refreshed),
                 pending_providers=remaining,
             ) from exc
@@ -258,7 +286,8 @@ def refresh_installed_providers(
         if result.returncode != 0:
             raise ProjectRefreshError(
                 f"Refreshing the {provider} provider failed with exit "
-                f"{result.returncode}: {_bounded_stderr(result.stderr)}",
+                f"{result.returncode}: "
+                f"{_bounded_subprocess_diagnostic(result.stderr, result.stdout, sensitive_values=sensitive_values)}",
                 refreshed_providers=tuple(refreshed),
                 pending_providers=remaining,
             )

@@ -162,6 +162,29 @@ def test_install_exact_command_failure_has_bounded_actionable_stderr(
     assert len(message) < 5_000
 
 
+def test_install_exact_command_failure_falls_back_to_stdout(tmp_path: Path) -> None:
+    def runner(
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout, env
+        return subprocess.CompletedProcess(
+            command,
+            23,
+            "installer explained failure on stdout",
+            "",
+        )
+
+    with pytest.raises(PackageUpdateError) as exc_info:
+        install_exact_version(
+            tmp_path,
+            StableVersion(3, 26, 0),
+            module_file="/venv/lib/python3.11/site-packages/mapify_cli/__init__.py",
+            runner=runner,
+        )
+
+    assert "installer explained failure on stdout" in str(exc_info.value)
+
+
 def test_source_install_exact_command_explains_manual_update(tmp_path: Path) -> None:
     with pytest.raises(PackageUpdateError, match="source checkout"):
         install_exact_version(
@@ -403,6 +426,38 @@ def test_refresh_failure_reports_completed_and_pending_providers(
     assert "refresh failed:" in str(error)
     assert "END-OF-STDERR" not in str(error)
     assert len(str(error)) < 5_000
+
+
+def test_refresh_failure_falls_back_to_stdout_and_redacts_parent_lease(
+    tmp_path: Path,
+) -> None:
+    env_name = update_state_module.MAP_UPDATE_PARENT_LEASE_ENV
+
+    def runner(
+        command: list[str], cwd: Path, timeout: float, env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
+        lease = env[env_name]
+        stdout = (
+            f"provider explained failure on stdout; bare={lease}; {env_name}={lease}"
+        )
+        return subprocess.CompletedProcess(command, 19, stdout, "")
+
+    with (
+        project_update_lock(tmp_path, timeout_s=0.0) as lease,
+        pytest.raises(ProjectRefreshError) as exc_info,
+    ):
+        refresh_installed_providers(
+            tmp_path,
+            ("claude",),
+            mapify_executable="/bin/mapify",
+            runner=runner,
+        )
+
+    message = str(exc_info.value)
+    assert "provider explained failure on stdout" in message
+    assert lease.token not in message
+    assert f"{env_name}=<redacted>" in message
 
 
 def test_refresh_timeout_preserves_full_pending_state(tmp_path: Path) -> None:

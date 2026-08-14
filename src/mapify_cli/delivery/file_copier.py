@@ -6,8 +6,11 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from mapify_cli.delivery.agent_generator import (
     create_actor_content,
@@ -40,9 +43,7 @@ _IGNORED_TEMPLATE_SUFFIXES = {".pyc", ".pyo"}
 # not just documented. (A bare ``assert`` would be stripped under ``python -O``,
 # silently turning the guarantee into a no-op, so we raise explicitly.)
 # requires-skills is warn-only (not a skip), handled separately.
-_BLOCKING_REQUIRES_KEYS = {
-    k for k in SKILL_REQUIREMENTS_KEYS if k != "requires-skills"
-}
+_BLOCKING_REQUIRES_KEYS = {k for k in SKILL_REQUIREMENTS_KEYS if k != "requires-skills"}
 
 
 def _check_requires_cmd(name: str) -> bool:
@@ -94,7 +95,9 @@ if _BLOCKING_REQUIRES_KEYS != set(_REQUIRES_CHECKER):
     )
 
 
-def _skill_missing_dependency(requires_block: dict[str, list[str]]) -> tuple[str, str] | None:
+def _skill_missing_dependency(
+    requires_block: dict[str, list[str]],
+) -> tuple[str, str] | None:
     """Return (kind, name) of the first missing blocking dependency, or None.
 
     Checks requires-cmd, requires-pip, requires-env in that order (dict
@@ -309,7 +312,9 @@ def create_command_files(
     return 0
 
 
-def _load_template_skill_catalog(skills_template_dir: Path) -> dict[str, dict[str, object]]:
+def _load_template_skill_catalog(
+    skills_template_dir: Path,
+) -> dict[str, dict[str, object]]:
     """Parse the template skill-rules.json and return the skills dict.
 
     Returns an empty dict on any error (missing file, invalid JSON) so the
@@ -371,7 +376,9 @@ def create_skill_files(project_path: Path) -> int:
             requires_block = _extract_requires_block(skill_name, entry)
 
             # Emit WARNING for requires-skills (read-only; never a skip).
-            req_skills = entry.get("requires-skills") if isinstance(entry, dict) else None
+            req_skills = (
+                entry.get("requires-skills") if isinstance(entry, dict) else None
+            )
             if isinstance(req_skills, list) and req_skills:
                 _warn_requires_skills(skill_name, req_skills)
 
@@ -406,7 +413,10 @@ def _install_managed_tree(src_dir: Path, dest_dir: Path, version: str) -> None:
     for src in sorted(src_dir.rglob("*")):
         if not src.is_file():
             continue
-        if src.name in _IGNORED_TEMPLATE_NAMES or src.suffix in _IGNORED_TEMPLATE_SUFFIXES:
+        if (
+            src.name in _IGNORED_TEMPLATE_NAMES
+            or src.suffix in _IGNORED_TEMPLATE_SUFFIXES
+        ):
             continue
         rel = src.relative_to(src_dir)
         _install_managed_file(src, dest_dir / rel, version)
@@ -424,7 +434,10 @@ def _copy_map_path(src: Path, dest: Path, version: str) -> int:
         for child in sorted(src.rglob("*")):
             if not child.is_file():
                 continue
-            if child.name in _IGNORED_TEMPLATE_NAMES or child.suffix in _IGNORED_TEMPLATE_SUFFIXES:
+            if (
+                child.name in _IGNORED_TEMPLATE_NAMES
+                or child.suffix in _IGNORED_TEMPLATE_SUFFIXES
+            ):
                 continue
             rel = child.relative_to(src)
             count += _install_map_file(child, dest / rel, version)
@@ -465,6 +478,147 @@ _SOFA_GITIGNORE_BLOCK = (
     "# map:sofa — SOFA credential dir (opt-in); never commit. See docs/USAGE.md\n"
     ".sofa/\n"
 )
+
+
+_UPDATE_RUNTIME_GITIGNORE_MARKER = (
+    "# map:update-runtime — local automatic-update state; never commit."
+)
+_UPDATE_RUNTIME_GITIGNORE_PATHS = (
+    ".map/update-state.json",
+    ".map/update.lock",
+    ".map/provider-refresh.lock",
+)
+
+
+class UpdateRuntimeGitignoreSecurityError(RuntimeError):
+    """Raised when the project .gitignore is unsafe to read or replace."""
+
+
+def _unsafe_project_gitignore(gitignore: Path, reason: str) -> NoReturn:
+    raise UpdateRuntimeGitignoreSecurityError(
+        f"unsafe project .gitignore at {gitignore}: {reason}"
+    )
+
+
+def _validated_gitignore_stat(gitignore: Path) -> os.stat_result | None:
+    """Return a safe direct-child .gitignore stat, or None when absent."""
+    try:
+        current = os.lstat(gitignore)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(current.st_mode):
+        _unsafe_project_gitignore(gitignore, "symbolic links are not allowed")
+    if not stat.S_ISREG(current.st_mode):
+        _unsafe_project_gitignore(gitignore, "the path must be a regular file")
+    if current.st_nlink != 1:
+        _unsafe_project_gitignore(gitignore, "hard-linked files are not allowed")
+    return current
+
+
+def _read_safe_gitignore(
+    gitignore: Path,
+) -> tuple[bytes, os.stat_result | None]:
+    """Read .gitignore without following links and retain its identity."""
+    initial = _validated_gitignore_stat(gitignore)
+    if initial is None:
+        return b"", None
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(gitignore, flags)
+    except OSError as exc:
+        _unsafe_project_gitignore(gitignore, f"could not open it safely ({exc})")
+
+    try:
+        opened = os.fstat(descriptor)
+        current = _validated_gitignore_stat(gitignore)
+        if current is None or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            current.st_dev,
+            current.st_ino,
+        ):
+            _unsafe_project_gitignore(gitignore, "the path changed while being read")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            _unsafe_project_gitignore(gitignore, "the opened file is not private")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read(), opened
+    finally:
+        os.close(descriptor)
+
+
+def _validate_gitignore_unchanged(
+    gitignore: Path,
+    original: os.stat_result | None,
+) -> None:
+    """Reject a target created or swapped after the initial safe read."""
+    current = _validated_gitignore_stat(gitignore)
+    if original is None:
+        if current is not None:
+            _unsafe_project_gitignore(gitignore, "the path appeared during the update")
+        return
+    if current is None or (current.st_dev, current.st_ino) != (
+        original.st_dev,
+        original.st_ino,
+    ):
+        _unsafe_project_gitignore(gitignore, "the path changed during the update")
+
+
+def _atomic_replace_gitignore(
+    gitignore: Path,
+    content: bytes,
+    original: os.stat_result | None,
+) -> None:
+    """Durably prepare a replacement, then atomically install it."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=gitignore.parent,
+        prefix=".gitignore.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        mode = stat.S_IMODE(original.st_mode) if original is not None else 0o644
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(descriptor)
+        _validate_gitignore_unchanged(gitignore, original)
+        os.replace(temporary, gitignore)
+    finally:
+        os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def merge_update_runtime_gitignore(project_path: Path) -> int:
+    """Atomically ignore project-local update files without following links."""
+    project_root = project_path.resolve(strict=True)
+    if not project_root.is_dir():
+        raise NotADirectoryError(f"MAP project root is not a directory: {project_root}")
+    gitignore = project_root / ".gitignore"
+    existing, original = _read_safe_gitignore(gitignore)
+    ignored_lines = {line.strip() for line in existing.splitlines()}
+    missing = [
+        path.encode()
+        for path in _UPDATE_RUNTIME_GITIGNORE_PATHS
+        if path.encode() not in ignored_lines
+    ]
+    if not missing:
+        return 0
+
+    additions: list[bytes] = []
+    marker = _UPDATE_RUNTIME_GITIGNORE_MARKER.encode()
+    if marker not in ignored_lines:
+        additions.append(marker)
+    additions.extend(missing)
+    separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
+    replacement = existing + separator + b"\n".join(additions) + b"\n"
+    _atomic_replace_gitignore(gitignore, replacement, original)
+    return 1
 
 
 def merge_sofa_gitignore(project_path: Path) -> int:
@@ -802,12 +956,8 @@ def ensure_map_statusline(
     settings["statusLine"] = {"type": "command", "command": command}
 
     claude_dir.mkdir(parents=True, exist_ok=True)
-    local_settings.write_text(
-        json.dumps(settings, indent=2) + "\n", encoding="utf-8"
-    )
-    return StatuslineResult(
-        wired=True, reason="wired", settings_path=local_settings
-    )
+    local_settings.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return StatuslineResult(wired=True, reason="wired", settings_path=local_settings)
 
 
 def create_rules_dir(

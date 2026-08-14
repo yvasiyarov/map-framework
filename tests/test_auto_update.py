@@ -263,6 +263,31 @@ def test_lock_contention_skips_automatic_and_errors_manual(
     assert manual.message is not None and "already running" in manual.message
 
 
+@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+def test_manual_unsafe_lock_path_is_actionable_before_state_or_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lock_name: str,
+) -> None:
+    map_dir = tmp_path / ".map"
+    map_dir.mkdir()
+    target = map_dir / f"{lock_name}.target"
+    target.write_text("not a MAP lock\n", encoding="utf-8")
+    (map_dir / lock_name).symlink_to(target)
+    fetch = Mock(side_effect=AssertionError("unsafe lock must precede network"))
+    monkeypatch.setattr(auto_update, "fetch_version_targets", fetch)
+
+    result = check_and_update(tmp_path, "3.25.0", UpdateMode.MANUAL, now=NOW)
+
+    assert result.status is UpdateStatus.ERROR
+    assert result.message is not None
+    assert "unsafe MAP update lock path" in result.message
+    assert lock_name in result.message
+    assert "Remove the unsafe path" in result.message
+    assert not (tmp_path / ".map" / "update-state.json").exists()
+    fetch.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_status"),
     [

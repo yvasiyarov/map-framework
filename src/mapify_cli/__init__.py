@@ -1007,6 +1007,7 @@ def _serialized_refresh_existing(command: Any) -> Any:
 
     @functools.wraps(command)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        from mapify_cli.update_install import installed_providers
         from mapify_cli.update_state import (
             MAP_UPDATE_PARENT_LEASE_ENV,
             UpdateLeaseRejected,
@@ -1035,6 +1036,7 @@ def _serialized_refresh_existing(command: Any) -> Any:
                 running_version=__version__,
                 raw_parent_lease=raw_parent_lease,
                 timeout_s=0.0,
+                detected_providers=installed_providers(project_path),
             ):
                 return command(*args, **kwargs)
         except UpdateLockBusy as exc:
@@ -1049,7 +1051,7 @@ def _serialized_refresh_existing(command: Any) -> Any:
         except UpdateLockSecurityError as exc:
             console.print(
                 "[red]Error:[/red] An unsafe MAP update lock path was rejected: "
-                f"{exc}. Replace the symlink and retry."
+                f"{exc}. Remove the unsafe path and retry."
             )
             raise typer.Exit(1) from exc
 
@@ -1401,6 +1403,7 @@ def init(
         # policy is honoured by the orchestrator on Codex sessions too.
         tracker.add("map-config", "Create .map/config.yaml")
         tracker.start("map-config")
+        auto_update_persisted = auto_update is None
         try:
             from mapify_cli.config.project_config import (
                 apply_agent_memory_overrides,
@@ -1419,15 +1422,8 @@ def init(
                     config_path, compression, compression_threshold
                 )
             if auto_update is not None:
-                try:
-                    _apply_verified_auto_update_override(config_path, auto_update)
-                except Exception as _auto_update_exc:
-                    tracker.error("map-config", f"skipped: {_auto_update_exc}")
-                    console.print(
-                        "[red]Error:[/red] Failed to persist requested "
-                        f"automatic-update setting: {_auto_update_exc}"
-                    )
-                    raise typer.Exit(1) from _auto_update_exc
+                _apply_verified_auto_update_override(config_path, auto_update)
+                auto_update_persisted = True
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1445,6 +1441,12 @@ def init(
             if refresh_existing:
                 console.print(
                     f"[red]Error:[/red] Failed to refresh project configuration: {e}"
+                )
+                raise typer.Exit(1) from e
+            if not auto_update_persisted:
+                console.print(
+                    "[red]Error:[/red] Failed to persist requested "
+                    f"automatic-update setting: {e}"
                 )
                 raise typer.Exit(1) from e
     else:
@@ -1475,6 +1477,7 @@ def init(
         # Create default .map/config.yaml (project-level settings)
         tracker.add("map-config", "Create .map/config.yaml")
         tracker.start("map-config")
+        auto_update_persisted = auto_update is None
         try:
             from mapify_cli.config.project_config import (
                 apply_agent_memory_overrides,
@@ -1493,15 +1496,8 @@ def init(
                     config_path, compression, compression_threshold
                 )
             if auto_update is not None:
-                try:
-                    _apply_verified_auto_update_override(config_path, auto_update)
-                except Exception as _auto_update_exc:
-                    tracker.error("map-config", f"skipped: {_auto_update_exc}")
-                    console.print(
-                        "[red]Error:[/red] Failed to persist requested "
-                        f"automatic-update setting: {_auto_update_exc}"
-                    )
-                    raise typer.Exit(1) from _auto_update_exc
+                _apply_verified_auto_update_override(config_path, auto_update)
+                auto_update_persisted = True
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1529,6 +1525,12 @@ def init(
                     f"[red]Error:[/red] Failed to refresh project configuration: {e}"
                 )
                 raise typer.Exit(1) from e
+            if not auto_update_persisted:
+                console.print(
+                    "[red]Error:[/red] Failed to persist requested "
+                    f"automatic-update setting: {e}"
+                )
+                raise typer.Exit(1) from e
 
         if selected_mcp_servers:
             # Create internal MCP config (for MAP Framework agent mappings)
@@ -1547,6 +1549,29 @@ def init(
         tracker.start("project-permissions")
         create_or_merge_project_settings_local(project_path, autonomy=autonomy)
         tracker.complete("project-permissions", ".claude/settings.local.json")
+
+    # Automatic-update state and both serialization locks are persistent local
+    # runtime files. Keep them out of Git for new and refreshed projects without
+    # replacing user-managed ignore rules.
+    from mapify_cli.delivery.file_copier import (
+        UpdateRuntimeGitignoreSecurityError,
+        merge_update_runtime_gitignore,
+    )
+
+    try:
+        merge_update_runtime_gitignore(project_path)
+    except UpdateRuntimeGitignoreSecurityError as exc:
+        console.print(
+            "[red]Error:[/red] unsafe project .gitignore was rejected. "
+            f"Remove the unsafe path and retry mapify init. Details: {exc}"
+        )
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(
+            "[red]Error:[/red] Failed to update the project .gitignore for "
+            f"automatic-update runtime files: {exc}"
+        )
+        raise typer.Exit(1) from exc
 
     # Initialize git (shared, provider-agnostic)
     if not no_git and git_available:

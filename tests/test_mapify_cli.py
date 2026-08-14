@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -235,6 +236,10 @@ class TestInitCommand:
         assert "updates.auto: true" in (tmp_path / ".map" / "config.yaml").read_text(
             encoding="utf-8"
         )
+        assert (
+            ".map/provider-refresh.lock"
+            in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+        )
         skill_root = tmp_path / (
             ".claude/skills" if provider == "claude" else ".agents/skills"
         )
@@ -256,6 +261,104 @@ class TestInitCommand:
         )
         assert result.exit_code == 0, result.stdout
         assert "updates.auto: false" in (tmp_path / ".map" / "config.yaml").read_text()
+
+    def test_init_merges_update_runtime_ignores_idempotently(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_text("custom-cache/\n.map/update.lock\n", encoding="utf-8")
+        gitignore.chmod(0o640)
+        args = ["init", ".", "--force", "--no-git", "--mcp", "none"]
+
+        first = runner.invoke(app, args)
+        first_text = gitignore.read_text(encoding="utf-8")
+        second = runner.invoke(app, args)
+        second_text = gitignore.read_text(encoding="utf-8")
+
+        assert first.exit_code == second.exit_code == 0
+        assert first_text == second_text
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+        assert "custom-cache/" in first_text.splitlines()
+        for path in (
+            ".map/update-state.json",
+            ".map/update.lock",
+            ".map/provider-refresh.lock",
+        ):
+            assert first_text.splitlines().count(path) == 1
+
+    @pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+    def test_init_refuses_unsafe_gitignore_without_mutating_outside_file(
+        self,
+        tmp_path: Path,
+        attack: str,
+    ) -> None:
+        if attack == "hardlink" and os.name == "nt":
+            pytest.skip("POSIX hardlink security contract")
+        os.chdir(tmp_path)
+        outside = tmp_path / "outside-gitignore"
+        outside.write_bytes(b"outside-gitignore-sentinel\n")
+        outside.chmod(0o640)
+        gitignore = tmp_path / ".gitignore"
+        if attack == "symlink":
+            gitignore.symlink_to(outside)
+        else:
+            try:
+                os.link(outside, gitignore)
+            except (NotImplementedError, OSError) as exc:
+                pytest.skip(f"hardlinks unavailable: {exc}")
+
+        result = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--mcp", "none"],
+        )
+
+        assert result.exit_code == 1
+        assert "unsafe project .gitignore" in result.stdout
+        assert outside.read_bytes() == b"outside-gitignore-sentinel\n"
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+        if attack == "symlink":
+            assert gitignore.is_symlink()
+        else:
+            assert os.path.samefile(gitignore, outside)
+            assert outside.stat().st_nlink == 2
+
+    def test_init_refuses_nonregular_gitignore(self, tmp_path: Path) -> None:
+        os.chdir(tmp_path)
+        gitignore = tmp_path / ".gitignore"
+        gitignore.mkdir()
+
+        result = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--mcp", "none"],
+        )
+
+        assert result.exit_code == 1
+        assert "unsafe project .gitignore" in result.stdout
+        assert gitignore.is_dir()
+
+    def test_update_runtime_gitignore_replace_failure_preserves_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from mapify_cli.delivery.file_copier import merge_update_runtime_gitignore
+
+        gitignore = tmp_path / ".gitignore"
+        gitignore.write_bytes(b"user-rule/\n")
+        gitignore.chmod(0o640)
+
+        with (
+            mock.patch(
+                "mapify_cli.delivery.file_copier.os.replace",
+                side_effect=OSError("replace failed"),
+            ),
+            pytest.raises(OSError, match="replace failed"),
+        ):
+            merge_update_runtime_gitignore(tmp_path)
+
+        assert gitignore.read_bytes() == b"user-rule/\n"
+        assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
+        assert list(tmp_path.glob(".gitignore.*.tmp")) == []
 
     def test_init_auto_update_reenables_existing_project(self, tmp_path: Path) -> None:
         os.chdir(tmp_path)
@@ -395,6 +498,57 @@ class TestInitCommand:
         assert result.exit_code == 1
         assert "Failed to persist requested automatic-update setting" in result.stdout
         assert "config is read-only" in result.stdout
+        assert "Project ready" not in result.stdout
+
+    @pytest.mark.parametrize("provider", ["claude", "codex"])
+    @pytest.mark.parametrize(
+        ("failure_boundary", "patch_target", "extra_args"),
+        [
+            (
+                "default config",
+                "mapify_cli.config.project_config.write_default_config",
+                [],
+            ),
+            (
+                "compression override",
+                "mapify_cli.config.project_config.apply_compression_overrides",
+                ["--compression", "auto"],
+            ),
+        ],
+    )
+    def test_explicit_auto_update_pre_persistence_failure_is_fatal(
+        self,
+        tmp_path: Path,
+        provider: str,
+        failure_boundary: str,
+        patch_target: str,
+        extra_args: list[str],
+    ) -> None:
+        os.chdir(tmp_path)
+
+        with mock.patch(
+            patch_target,
+            side_effect=OSError(f"{failure_boundary} failed"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--mcp",
+                    "none",
+                    "--provider",
+                    provider,
+                    "--auto-update",
+                    *extra_args,
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "Failed to persist requested automatic-update setting" in result.stdout
+        assert f"{failure_boundary} failed" in " ".join(result.stdout.split())
         assert "Project ready" not in result.stdout
 
     def test_init_explicit_auto_update_rejects_malformed_persisted_config(
@@ -1910,6 +2064,81 @@ class TestRefreshExistingInit:
         assert completed_manifest is not None
         assert completed_manifest.providers == ["claude", "codex"]
 
+    def test_standalone_dual_provider_refresh_migrates_providerless_v1_state(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        claude = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                "claude",
+            ],
+        )
+        codex = runner.invoke(
+            app,
+            ["init", ".", "--force", "--no-git", "--provider", "codex"],
+        )
+        assert claude.exit_code == 0, claude.stdout
+        assert codex.exit_code == 0, codex.stdout
+        state_path = tmp_path / ".map" / "update-state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "last_attempt_at": None,
+                    "last_observed_version": mapify_cli.__version__,
+                    "last_installed_version": mapify_cli.__version__,
+                    "pending_refresh": True,
+                    "pending_providers": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        first_refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "claude",
+                "--refresh-existing",
+            ],
+        )
+
+        assert first_refresh.exit_code == 0, first_refresh.stdout
+        first_state = read_update_state(tmp_path)
+        assert first_state.schema_version == 2
+        assert first_state.pending_refresh is True
+        assert first_state.pending_providers == ("codex",)
+
+        second_refresh = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--provider",
+                "codex",
+                "--refresh-existing",
+            ],
+        )
+
+        assert second_refresh.exit_code == 0, second_refresh.stdout
+        completed_state = read_update_state(tmp_path)
+        assert completed_state.pending_refresh is False
+        assert completed_state.pending_providers == ()
+
     def test_manual_recovery_action_rebuilds_corrupt_manifest_and_is_terminal(
         self, tmp_path: Path
     ) -> None:
@@ -2187,13 +2416,13 @@ class TestSofaGitignoreMerge:
         assert content.count("# map:sofa") == 1
         assert content.count(".sofa/") == 1
 
-    def test_vc4_no_gitignore_mutation_without_sofa_flag(self, tmp_path):
+    def test_vc4_no_sofa_gitignore_entry_without_sofa_flag(self, tmp_path):
         """VC4 [AC-2][INV-SOFA-1]: init without --sofa must NOT write sofa entries.
 
         Non-vacuous: a repo-root .gitignore is pre-created so the negative
-        assertions exercise a file that actually exists (init without --sofa
-        does not create one on its own), and its prior content must survive
-        byte-for-byte.
+        assertions exercise a file that actually exists. Automatic-update
+        runtime ignores are independently required, while prior user entries
+        must remain byte-for-byte at the start of the file.
         """
         os.chdir(tmp_path)
         gitignore = tmp_path / ".gitignore"
@@ -2208,8 +2437,13 @@ class TestSofaGitignoreMerge:
         content = gitignore.read_text()
         assert "# map:sofa" not in content
         assert ".sofa/" not in content.splitlines()
-        # Existing user content untouched when SOFA is off.
-        assert content == original
+        assert content.startswith(original)
+        for path in (
+            ".map/update-state.json",
+            ".map/update.lock",
+            ".map/provider-refresh.lock",
+        ):
+            assert content.splitlines().count(path) == 1
 
     def test_vc4_init_with_sofa_flag_writes_marker(self, tmp_path):
         """VC4 [AC-2]: init WITH --sofa must write the sofa marker to root .gitignore."""
@@ -2566,6 +2800,86 @@ class TestInternalUpdateCommand:
             "status": "error",
             "message": "--mode must be automatic or manual",
         }
+
+    @pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+    @pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+    @pytest.mark.parametrize("mode", ["automatic", "manual"])
+    def test_internal_update_unsafe_lock_path_obeys_mode_boundary(
+        self,
+        tmp_path: Path,
+        lock_name: str,
+        mode: str,
+        attack: str,
+    ) -> None:
+        if attack == "hardlink" and os.name == "nt":
+            pytest.skip("POSIX hardlink security contract")
+        map_dir = tmp_path / ".map"
+        map_dir.mkdir()
+        target = map_dir / f"{lock_name}.target"
+        target.write_text("not a MAP lock\n", encoding="utf-8")
+        if attack == "symlink":
+            (map_dir / lock_name).symlink_to(target)
+        else:
+            try:
+                os.link(target, map_dir / lock_name)
+            except (NotImplementedError, OSError) as exc:
+                pytest.skip(f"hardlinks unavailable: {exc}")
+
+        with mock.patch(
+            "mapify_cli.auto_update.detect_install_kind",
+            return_value=InstallKind.PIP,
+        ):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", mode, "--project", str(tmp_path)],
+            )
+
+        assert result.stderr == ""
+        if mode == "automatic":
+            assert result.exit_code == 0
+            assert result.stdout == ""
+        else:
+            assert result.exit_code == 1
+            payload = json.loads(result.stdout)
+            assert payload["status"] == "error"
+            assert "unsafe MAP update lock path" in payload["message"]
+            assert lock_name in payload["message"]
+            assert "Remove the unsafe path" in payload["message"]
+        assert target.read_text(encoding="utf-8") == "not a MAP lock\n"
+
+    @pytest.mark.parametrize("mode", ["automatic", "manual"])
+    def test_internal_update_symlinked_map_ancestor_obeys_mode_boundary(
+        self,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        outside = tmp_path / "outside-map"
+        outside.mkdir()
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"outside-bytes")
+        (tmp_path / ".map").symlink_to(outside, target_is_directory=True)
+
+        with mock.patch(
+            "mapify_cli.auto_update.detect_install_kind",
+            return_value=InstallKind.PIP,
+        ):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", mode, "--project", str(tmp_path)],
+            )
+
+        if mode == "automatic":
+            assert result.exit_code == 0
+            assert result.stdout == ""
+        else:
+            assert result.exit_code == 1
+            payload = json.loads(result.stdout)
+            assert payload["status"] == "error"
+            assert "unsafe MAP update lock path" in payload["message"]
+            assert "update.lock" in payload["message"]
+        assert sentinel.read_bytes() == b"outside-bytes"
+        assert not (outside / "update.lock").exists()
+        assert not (outside / "provider-refresh.lock").exists()
 
     @mock.patch("mapify_cli.auto_update.check_and_update")
     def test_internal_update_automatic_error_is_silent_success(

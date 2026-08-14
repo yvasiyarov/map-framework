@@ -166,6 +166,34 @@ def test_schema_v1_refresh_without_providers_remains_transitional_for_discovery(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("last_observed_version", "3.26.0rc1"),
+        ("last_installed_version", "3.26.0rc1"),
+    ],
+)
+def test_schema_v1_providerless_transition_still_rejects_unstable_versions(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "last_attempt_at": "2026-08-13T11:00:00Z",
+        "last_observed_version": "3.26.0",
+        "last_installed_version": "3.26.0",
+        "pending_refresh": True,
+        "pending_providers": [],
+    }
+    payload[field] = value
+    state_path = tmp_path / ".map" / "update-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert read_update_state(tmp_path) == UpdateState()
+
+
+@pytest.mark.parametrize(
     "state",
     [
         UpdateState(
@@ -390,6 +418,75 @@ def test_lock_refuses_symlink(tmp_path: Path) -> None:
         project_update_lock(tmp_path, timeout_s=0.0),
     ):
         raise AssertionError("symlink lock must not open")
+
+
+@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+def test_lock_refuses_symlinked_map_ancestor_without_outside_creation(
+    tmp_path: Path,
+    lock_name: str,
+) -> None:
+    outside = tmp_path / "outside-map"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"outside-bytes")
+    (tmp_path / ".map").symlink_to(outside, target_is_directory=True)
+    lock = (
+        project_update_lock
+        if lock_name == "update.lock"
+        else update_state_module.provider_refresh_lock
+    )
+
+    with pytest.raises(UpdateLockSecurityError), lock(tmp_path, timeout_s=0.0):
+        raise AssertionError("a symlinked .map ancestor must not be used")
+
+    assert sentinel.read_bytes() == b"outside-bytes"
+    assert not (outside / lock_name).exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hardlink security contract")
+@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+def test_lock_refuses_hardlinked_sentinel_without_mutating_outside_file(
+    tmp_path: Path,
+    lock_name: str,
+) -> None:
+    map_dir = tmp_path / ".map"
+    map_dir.mkdir()
+    outside = tmp_path / f"outside-{lock_name}"
+    outside.write_bytes(b"outside-lock-sentinel")
+    outside.chmod(0o644)
+    try:
+        os.link(outside, map_dir / lock_name)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+    lock = (
+        project_update_lock
+        if lock_name == "update.lock"
+        else update_state_module.provider_refresh_lock
+    )
+
+    with pytest.raises(UpdateLockSecurityError), lock(tmp_path, timeout_s=0.0):
+        raise AssertionError("a hardlinked lock must not open")
+
+    assert outside.read_bytes() == b"outside-lock-sentinel"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("lock_name", ["update.lock", "provider-refresh.lock"])
+def test_lock_refuses_nonregular_path(tmp_path: Path, lock_name: str) -> None:
+    map_dir = tmp_path / ".map"
+    map_dir.mkdir()
+    lock_path = map_dir / lock_name
+    lock_path.mkdir()
+    lock = (
+        project_update_lock
+        if lock_name == "update.lock"
+        else update_state_module.provider_refresh_lock
+    )
+
+    with pytest.raises(UpdateLockSecurityError), lock(tmp_path, timeout_s=0.0):
+        raise AssertionError("a non-regular lock must not open")
+
+    assert lock_path.is_dir()
 
 
 def test_lock_file_persists_with_owner_only_permissions(tmp_path: Path) -> None:
