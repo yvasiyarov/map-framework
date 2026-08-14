@@ -19,7 +19,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK_PATH = REPO_ROOT / ".claude" / "hooks" / "map-statusline.py"
-SHIPPED_HOOK = REPO_ROOT / "src" / "mapify_cli" / "templates" / "hooks" / "map-statusline.py"
+SHIPPED_HOOK = (
+    REPO_ROOT / "src" / "mapify_cli" / "templates" / "hooks" / "map-statusline.py"
+)
 
 
 def _run_statusline(payload: dict | str, cwd: Path | None = None) -> tuple[int, str]:
@@ -221,7 +223,12 @@ def test_hook_is_executable_in_both_claude_trees() -> None:
 def test_statusline_not_rendered_into_codex_trees() -> None:
     assert not (REPO_ROOT / ".codex" / "hooks" / "map-statusline.py").exists()
     assert not (
-        REPO_ROOT / "src" / "mapify_cli" / "templates" / "codex" / "hooks"
+        REPO_ROOT
+        / "src"
+        / "mapify_cli"
+        / "templates"
+        / "codex"
+        / "hooks"
         / "map-statusline.py"
     ).exists()
 

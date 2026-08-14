@@ -150,7 +150,7 @@ def create_ssl_context():
             context.check_hostname = True
             context.verify_mode = ssl.CERT_REQUIRED
             return context
-    except Exception:  # noqa: BLE001, S110 -- deliberate fallback/resilience boundary, must not propagate
+    except Exception:  # noqa: BLE001, S110
         pass
 
     # Fallback to standard SSL context
@@ -718,7 +718,7 @@ def get_latest_release(owner: str, repo: str) -> dict[str, Any] | None:
             response = client.get(url)
             if response.status_code == 200:
                 return response.json()
-    except Exception:  # noqa: BLE001, S110 -- deliberate fallback/resilience boundary, must not propagate
+    except Exception:  # noqa: BLE001, S110
         pass
     return None
 
@@ -1271,9 +1271,9 @@ def init(
     else:
         # Type assertion: flow guarantees project_name is not None here
         # (checked at line 1931, and not in use_current_dir branch)
-        assert project_name is not None, (
-            "project_name must be set in non-current-dir mode"
-        )
+        assert (
+            project_name is not None
+        ), "project_name must be set in non-current-dir mode"
         project_path = Path(project_name).resolve()
         if project_path.exists() and not refresh_existing:
             console.print(
@@ -2836,7 +2836,7 @@ def preset_resolve(
         core_path = get_templates_dir() / template_name
         if core_path.is_file():
             layers.append({"tier": "core", "path": str(core_path), "enabled": True})
-    except Exception:  # noqa: BLE001, S110 -- deliberate fallback/resilience boundary, must not propagate
+    except Exception:  # noqa: BLE001, S110
         pass
 
     if output_json:
@@ -2958,7 +2958,7 @@ def preset_render(
             else:
                 composed = ""
                 source = "core:(not found)"
-        except Exception:  # noqa: BLE001 -- deliberate fallback/resilience boundary, must not propagate
+        except Exception:  # noqa: BLE001 -- deliberate fallback boundary
             composed = ""
             source = "core:(error)"
 

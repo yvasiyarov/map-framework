@@ -34,6 +34,7 @@ _AUTONOMY_DENY = [
     "Bash(git push:*)",
 ]
 
+
 def ensure_settings_local_gitignored(project_path: Path) -> int:
     """Idempotently add ``.claude/settings.local.json`` to the repo-root .gitignore.
 

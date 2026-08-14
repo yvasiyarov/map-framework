@@ -245,9 +245,9 @@ class TestInitCommand:
             in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
         )
         settings_local_line = ".claude/settings.local.json"
-        gitignore_lines = (tmp_path / ".gitignore").read_text(
-            encoding="utf-8"
-        ).splitlines()
+        gitignore_lines = (
+            (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+        )
         if provider == "claude":
             assert settings_local_line in gitignore_lines
         else:
@@ -871,9 +871,10 @@ class TestInitCommand:
         changed = file_copier.merge_update_runtime_gitignore(tmp_path)
 
         assert changed == 1
-        assert ".map/installer.lock" in (
-            tmp_path / ".gitignore"
-        ).read_text(encoding="utf-8").splitlines()
+        assert (
+            ".map/installer.lock"
+            in (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+        )
 
     def test_update_runtime_gitignore_closes_temp_before_replace(
         self,
@@ -1396,14 +1397,14 @@ class TestInitCommand:
 
         assert "mcp_servers" in mcp_config, "mcp_config missing 'mcp_servers' key"
         for server in expected_servers:
-            assert server in mcp_config["mcp_servers"], (
-                f"MCP server '{server}' not found in config"
-            )
+            assert (
+                server in mcp_config["mcp_servers"]
+            ), f"MCP server '{server}' not found in config"
 
         # Verify exactly the expected default set (no extras)
-        assert sorted(mcp_config["mcp_servers"]) == sorted(expected_servers), (
-            f"Expected default MCP servers {expected_servers}, found {mcp_config['mcp_servers']}"
-        )
+        assert sorted(mcp_config["mcp_servers"]) == sorted(
+            expected_servers
+        ), f"Expected default MCP servers {expected_servers}, found {mcp_config['mcp_servers']}"
 
     def test_init_force_no_prompts(self, tmp_path):
         """Test that init --force completes without interactive confirmation prompts.
@@ -1451,9 +1452,9 @@ class TestInitCommand:
         # This confirms --force actually re-initialized the files
         assert actor_file.exists()
         restored_content = actor_file.read_text()
-        assert restored_content != "# Modified by user", (
-            "--force did not restore template files"
-        )
+        assert (
+            restored_content != "# Modified by user"
+        ), "--force did not restore template files"
         # Should contain some template markers (not exact match due to potential updates)
         assert len(restored_content) > 100, "Restored actor.md seems too short"
 
@@ -1470,9 +1471,9 @@ class TestInitCommand:
         config_file = tmp_path / ".map" / "config.yaml"
         assert config_file.exists(), ".map/config.yaml was not created"
         content_after_sofa = config_file.read_text()
-        assert "sofa.enabled: true" in content_after_sofa, (
-            "sofa.enabled: true not written after --sofa"
-        )
+        assert (
+            "sofa.enabled: true" in content_after_sofa
+        ), "sofa.enabled: true not written after --sofa"
 
         # Second bare init (no --sofa) with --force to allow re-run in non-empty dir
         result2 = runner.invoke(
@@ -1483,9 +1484,9 @@ class TestInitCommand:
         # write_default_config is skip-if-exists, so the config is unchanged;
         # and no apply_sofa_overrides call was made — value must still be true.
         content_after_bare = config_file.read_text()
-        assert "sofa.enabled: true" in content_after_bare, (
-            "bare re-run clobbered sofa.enabled: true"
-        )
+        assert (
+            "sofa.enabled: true" in content_after_bare
+        ), "bare re-run clobbered sofa.enabled: true"
 
     def test_vc1_init_sofa_flag_writes_config(self, tmp_path):
         """VC1 [AC-1]: mapify init --sofa writes sofa.enabled: true to .map/config.yaml."""
@@ -3019,9 +3020,9 @@ class TestSofaGitignoreMerge:
             for line in config_text.splitlines()
             if line.strip().startswith("sofa.enabled:")
         ]
-        assert active_sofa == [], (
-            f"default config must not activate sofa.enabled: {active_sofa}"
-        )
+        assert (
+            active_sofa == []
+        ), f"default config must not activate sofa.enabled: {active_sofa}"
 
 
 class TestAutonomyPosture:
@@ -3069,8 +3070,7 @@ class TestAutonomyPosture:
         gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
         assert ".claude/settings.local.json" in gitignore.splitlines()
         assert any(
-            line.startswith("# map:settings-local")
-            for line in gitignore.splitlines()
+            line.startswith("# map:settings-local") for line in gitignore.splitlines()
         )
 
     def test_autonomy_false_removes_posture(self, tmp_path):
@@ -4288,9 +4288,9 @@ class TestAgentCreation:
                 name in agent_file
                 for name in ["task-decomposer", "actor", "monitor", "predictor"]
             ):
-                assert "mcp" in content.lower() or "tool" in content.lower(), (
-                    f"Agent {agent_file} missing MCP integration section"
-                )
+                assert (
+                    "mcp" in content.lower() or "tool" in content.lower()
+                ), f"Agent {agent_file} missing MCP integration section"
 
 
 class TestCommandCreation:
@@ -4551,9 +4551,9 @@ class TestMcpJsonConfig:
 
         # Allow exit code 0 or initialization messages
         mcp_file = tmp_path / ".mcp.json"
-        assert mcp_file.exists(), (
-            f"Expected .mcp.json to be created. Output: {result.output}"
-        )
+        assert (
+            mcp_file.exists()
+        ), f"Expected .mcp.json to be created. Output: {result.output}"
 
         config = json.loads(mcp_file.read_text())
         assert "mcpServers" in config
@@ -4728,9 +4728,9 @@ class TestCodexProvider:
         result = local_runner.invoke(
             app, ["init", ".", "--provider", "codex", "--no-git", "--force"]
         )
-        assert result.exit_code == 0, (
-            f"init --provider codex failed (exit {result.exit_code}):\n{result.output}"
-        )
+        assert (
+            result.exit_code == 0
+        ), f"init --provider codex failed (exit {result.exit_code}):\n{result.output}"
         return tmp_path
 
     # ------------------------------------------------------------------ #
@@ -4750,13 +4750,13 @@ class TestCodexProvider:
         """AC-2: SKILL.md must start with '---' and contain name/description fields."""
         skill_file = codex_project / ".agents" / "skills" / "map-plan" / "SKILL.md"
         content = skill_file.read_text(encoding="utf-8")
-        assert content.startswith("---"), (
-            "SKILL.md must start with YAML frontmatter '---'"
-        )
+        assert content.startswith(
+            "---"
+        ), "SKILL.md must start with YAML frontmatter '---'"
         assert "name:" in content, "SKILL.md frontmatter must contain 'name:'"
-        assert "description:" in content, (
-            "SKILL.md frontmatter must contain 'description:'"
-        )
+        assert (
+            "description:" in content
+        ), "SKILL.md frontmatter must contain 'description:'"
 
     # ------------------------------------------------------------------ #
     # AC-3: SKILL.md contains no Claude-specific tool references          #
@@ -4777,9 +4777,9 @@ class TestCodexProvider:
             "Grep(",
         ]
         for pattern in forbidden_patterns:
-            assert pattern not in content, (
-                f"SKILL.md must not contain Claude tool reference '{pattern}'"
-            )
+            assert (
+                pattern not in content
+            ), f"SKILL.md must not contain Claude tool reference '{pattern}'"
 
     # ------------------------------------------------------------------ #
     # AC-4: AGENTS.md exists at project root                              #
@@ -4795,15 +4795,15 @@ class TestCodexProvider:
         # Either a real file with content or a symlink to CLAUDE.md
         assert agents_md.is_symlink() or len(content) > 0, "AGENTS.md must be non-empty"
         if not agents_md.is_symlink():
-            assert "$map-plan" in content, (
-                "Codex AGENTS.md must document skill invocation with $"
-            )
-            assert "$map-efficient" in content, (
-                "Codex AGENTS.md must document the execution skill"
-            )
-            assert "codex_hooks" not in content, (
-                "Codex AGENTS.md must not document deprecated codex_hooks"
-            )
+            assert (
+                "$map-plan" in content
+            ), "Codex AGENTS.md must document skill invocation with $"
+            assert (
+                "$map-efficient" in content
+            ), "Codex AGENTS.md must document the execution skill"
+            assert (
+                "codex_hooks" not in content
+            ), "Codex AGENTS.md must not document deprecated codex_hooks"
 
     # ------------------------------------------------------------------ #
     # AC-5: config.toml, agents/*.toml, hooks/workflow-gate.py exist      #
@@ -4814,19 +4814,19 @@ class TestCodexProvider:
         codex_dir = codex_project / ".codex"
         assert (codex_dir / "config.toml").exists(), ".codex/config.toml must exist"
         config_text = (codex_dir / "config.toml").read_text(encoding="utf-8")
-        assert "hooks = true" in config_text, (
-            "Codex config must enable canonical hooks feature"
-        )
-        assert "codex_hooks" not in config_text, (
-            "Codex config must not use deprecated codex_hooks feature alias"
-        )
+        assert (
+            "hooks = true" in config_text
+        ), "Codex config must enable canonical hooks feature"
+        assert (
+            "codex_hooks" not in config_text
+        ), "Codex config must not use deprecated codex_hooks feature alias"
         toml_files = list((codex_dir / "agents").glob("*.toml"))
-        assert len(toml_files) > 0, (
-            ".codex/agents/ must contain at least one *.toml file"
-        )
-        assert (codex_dir / "hooks" / "workflow-gate.py").exists(), (
-            ".codex/hooks/workflow-gate.py must exist"
-        )
+        assert (
+            len(toml_files) > 0
+        ), ".codex/agents/ must contain at least one *.toml file"
+        assert (
+            codex_dir / "hooks" / "workflow-gate.py"
+        ).exists(), ".codex/hooks/workflow-gate.py must exist"
 
     # ------------------------------------------------------------------ #
     # AC-6: .map/scripts/ installed (or skipped if already present)       #
@@ -4837,9 +4837,9 @@ class TestCodexProvider:
         map_scripts = codex_project / ".map" / "scripts"
         templates_scripts = get_templates_dir() / "map" / "scripts"
         if templates_scripts.exists() and any(templates_scripts.iterdir()):
-            assert map_scripts.exists(), (
-                ".map/scripts/ must exist when template provides scripts"
-            )
+            assert (
+                map_scripts.exists()
+            ), ".map/scripts/ must exist when template provides scripts"
 
         # Verify skip-if-exists: pre-existing custom scripts survive codex init
         project2 = tmp_path / "skip_test"
@@ -4855,9 +4855,9 @@ class TestCodexProvider:
             app, ["init", ".", "--provider", "codex", "--no-git", "--force"]
         )
         assert result.exit_code == 0, f"init failed: {result.output}"
-        assert custom_script.exists(), (
-            ".map/scripts/custom.py must survive codex init (skip-if-exists)"
-        )
+        assert (
+            custom_script.exists()
+        ), ".map/scripts/custom.py must survive codex init (skip-if-exists)"
         assert custom_script.read_text() == "# user custom script\n"
 
     # ------------------------------------------------------------------ #
@@ -4872,12 +4872,12 @@ class TestCodexProvider:
             app, ["init", ".", "--no-git", "--mcp", "none", "--force"]
         )
         assert result.exit_code == 0, f"Default init failed:\n{result.output}"
-        assert (tmp_path / ".claude").exists(), (
-            ".claude/ must exist for default provider"
-        )
-        assert not (tmp_path / ".codex").exists(), (
-            ".codex/ must NOT be created by the default claude provider"
-        )
+        assert (
+            tmp_path / ".claude"
+        ).exists(), ".claude/ must exist for default provider"
+        assert not (
+            tmp_path / ".codex"
+        ).exists(), ".codex/ must NOT be created by the default claude provider"
 
     # ------------------------------------------------------------------ #
     # AC-8: Template sync enforced (reference to ST-008 coverage)         #
@@ -4890,14 +4890,14 @@ class TestCodexProvider:
         This test is a quick smoke check that the directory exists and is non-empty.
         """
         codex_templates = get_templates_dir() / "codex"
-        assert codex_templates.exists(), (
-            "templates/codex/ must exist (render enforced by test_template_render.py)"
-        )
+        assert (
+            codex_templates.exists()
+        ), "templates/codex/ must exist (render enforced by test_template_render.py)"
         all_files = list(codex_templates.rglob("*"))
         template_files = [f for f in all_files if f.is_file()]
-        assert len(template_files) > 0, (
-            "templates/codex/ must contain at least one file"
-        )
+        assert (
+            len(template_files) > 0
+        ), "templates/codex/ must contain at least one file"
 
     # ------------------------------------------------------------------ #
     # AC-9: SKILL.md has all 9 step section headers                       #
@@ -4957,18 +4957,18 @@ class TestCodexProvider:
     def test_ac11_stub_skills_exist(self, codex_project):
         """AC-11: Codex skills must exist under the official .agents/skills root."""
         skills_dir = codex_project / ".agents" / "skills"
-        assert (skills_dir / "map-fast" / "SKILL.md").exists(), (
-            ".agents/skills/map-fast/SKILL.md must exist"
-        )
-        assert (skills_dir / "map-check" / "SKILL.md").exists(), (
-            ".agents/skills/map-check/SKILL.md must exist"
-        )
-        assert (skills_dir / "map-efficient" / "SKILL.md").exists(), (
-            ".agents/skills/map-efficient/SKILL.md must exist"
-        )
-        assert (skills_dir / "map-efficient" / "efficient-reference.md").exists(), (
-            ".agents/skills/map-efficient/efficient-reference.md must exist"
-        )
+        assert (
+            skills_dir / "map-fast" / "SKILL.md"
+        ).exists(), ".agents/skills/map-fast/SKILL.md must exist"
+        assert (
+            skills_dir / "map-check" / "SKILL.md"
+        ).exists(), ".agents/skills/map-check/SKILL.md must exist"
+        assert (
+            skills_dir / "map-efficient" / "SKILL.md"
+        ).exists(), ".agents/skills/map-efficient/SKILL.md must exist"
+        assert (
+            skills_dir / "map-efficient" / "efficient-reference.md"
+        ).exists(), ".agents/skills/map-efficient/efficient-reference.md must exist"
 
     # ------------------------------------------------------------------ #
     # AC-9 (map-review port spec): Codex map-review skill + refs exist    #
@@ -5011,15 +5011,15 @@ class TestCodexProvider:
             / "map-review"
         )
         for filename in ("SKILL.md", "review-reference.md", "adversarial-reference.md"):
-            assert (templates_dir / filename).exists(), (
-                f"templates/codex/skills/map-review/{filename} must exist"
-            )
+            assert (
+                templates_dir / filename
+            ).exists(), f"templates/codex/skills/map-review/{filename} must exist"
 
         agents_skills_dir = codex_project / ".agents" / "skills" / "map-review"
         for filename in ("SKILL.md", "review-reference.md", "adversarial-reference.md"):
-            assert (agents_skills_dir / filename).exists(), (
-                f".agents/skills/map-review/{filename} must exist"
-            )
+            assert (
+                agents_skills_dir / filename
+            ).exists(), f".agents/skills/map-review/{filename} must exist"
 
     # ------------------------------------------------------------------ #
     # AC-12: hooks.json and workflow-gate.py both created                 #
@@ -5032,23 +5032,23 @@ class TestCodexProvider:
         codex_dir = codex_project / ".codex"
         hooks_json_path = codex_dir / "hooks.json"
         assert hooks_json_path.exists(), ".codex/hooks.json must exist"
-        assert (codex_dir / "hooks" / "workflow-gate.py").exists(), (
-            ".codex/hooks/workflow-gate.py must exist"
-        )
+        assert (
+            codex_dir / "hooks" / "workflow-gate.py"
+        ).exists(), ".codex/hooks/workflow-gate.py must exist"
 
         # Verify hook command uses quoted git-root-resolved path
         hooks_data = _json.loads(hooks_json_path.read_text())
-        assert set(hooks_data) == {"hooks"}, (
-            ".codex/hooks.json must not include MAP-only top-level metadata"
-        )
+        assert set(hooks_data) == {
+            "hooks"
+        }, ".codex/hooks.json must not include MAP-only top-level metadata"
         command = hooks_data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        assert "$(git rev-parse --show-toplevel)" in command, (
-            "Hook command must use $(git rev-parse --show-toplevel) for path resolution"
-        )
+        assert (
+            "$(git rev-parse --show-toplevel)" in command
+        ), "Hook command must use $(git rev-parse --show-toplevel) for path resolution"
         # Path must be quoted to handle spaces in directory names
-        assert '"$(git rev-parse --show-toplevel)' in command, (
-            "Hook command path must be quoted for spaces in paths"
-        )
+        assert (
+            '"$(git rev-parse --show-toplevel)' in command
+        ), "Hook command path must be quoted for spaces in paths"
 
     # ------------------------------------------------------------------ #
     # AC-13: CodexProvider is a subclass of BaseProvider                  #
@@ -5059,9 +5059,9 @@ class TestCodexProvider:
         from mapify_cli.delivery.providers import BaseProvider, CodexProvider
 
         provider = CodexProvider()
-        assert isinstance(provider, BaseProvider), (
-            "CodexProvider must inherit from BaseProvider"
-        )
+        assert isinstance(
+            provider, BaseProvider
+        ), "CodexProvider must inherit from BaseProvider"
 
     # ------------------------------------------------------------------ #
     # AC-14: --provider codex does NOT create .claude/                    #
@@ -5069,9 +5069,9 @@ class TestCodexProvider:
 
     def test_ac14_codex_init_no_claude_dir(self, codex_project):
         """AC-14: init --provider codex must not create the .claude/ directory."""
-        assert not (codex_project / ".claude").exists(), (
-            ".claude/ must NOT be created when using --provider codex"
-        )
+        assert not (
+            codex_project / ".claude"
+        ).exists(), ".claude/ must NOT be created when using --provider codex"
 
     # ------------------------------------------------------------------ #
     # AC-15: SKILL.md includes spawn_agent with monitor in SPEC_REVIEW    #
@@ -5083,9 +5083,9 @@ class TestCodexProvider:
         content = skill_file.read_text(encoding="utf-8")
         # The SPEC_REVIEW step uses spawn_agent with agent_type="monitor"
         assert "spawn_agent(" in content, "SKILL.md must contain spawn_agent("
-        assert 'agent_type="monitor"' in content, (
-            'SKILL.md must contain agent_type="monitor" for SPEC_REVIEW step'
-        )
+        assert (
+            'agent_type="monitor"' in content
+        ), 'SKILL.md must contain agent_type="monitor" for SPEC_REVIEW step'
 
     # ------------------------------------------------------------------ #
     # AC-16: --provider foo exits 1 with helpful message                  #
@@ -5098,12 +5098,12 @@ class TestCodexProvider:
         result = local_runner.invoke(
             app, ["init", ".", "--provider", "foo", "--no-git", "--force"]
         )
-        assert result.exit_code == 1, (
-            f"Expected exit code 1 for invalid provider, got {result.exit_code}"
-        )
-        assert "Valid providers" in result.output, (
-            "Error message must mention 'Valid providers'"
-        )
+        assert (
+            result.exit_code == 1
+        ), f"Expected exit code 1 for invalid provider, got {result.exit_code}"
+        assert (
+            "Valid providers" in result.output
+        ), "Error message must mention 'Valid providers'"
         assert "claude" in result.output, "Valid providers list must include 'claude'"
         assert "codex" in result.output, "Valid providers list must include 'codex'"
 
@@ -5119,12 +5119,12 @@ class TestCodexProvider:
         for toml_file in toml_files:
             content = toml_file.read_text(encoding="utf-8")
             assert "name" in content, f"{toml_file.name} must contain 'name' field"
-            assert "description" in content, (
-                f"{toml_file.name} must contain 'description' field"
-            )
-            assert "developer_instructions" in content, (
-                f"{toml_file.name} must contain 'developer_instructions' field"
-            )
+            assert (
+                "description" in content
+            ), f"{toml_file.name} must contain 'description' field"
+            assert (
+                "developer_instructions" in content
+            ), f"{toml_file.name} must contain 'developer_instructions' field"
 
     # ------------------------------------------------------------------ #
     # AC-18: hooks.json matcher value is "Bash"                           #
@@ -5135,13 +5135,13 @@ class TestCodexProvider:
         hooks_json_path = codex_project / ".codex" / "hooks.json"
         hooks_data = json.loads(hooks_json_path.read_text(encoding="utf-8"))
         pre_tool_use = hooks_data.get("hooks", {}).get("PreToolUse", [])
-        assert len(pre_tool_use) > 0, (
-            "hooks.json must define at least one PreToolUse entry"
-        )
+        assert (
+            len(pre_tool_use) > 0
+        ), "hooks.json must define at least one PreToolUse entry"
         matchers = [entry.get("matcher") for entry in pre_tool_use]
-        assert "Bash" in matchers, (
-            f"hooks.json PreToolUse must have a 'Bash' matcher, got: {matchers}"
-        )
+        assert (
+            "Bash" in matchers
+        ), f"hooks.json PreToolUse must have a 'Bash' matcher, got: {matchers}"
 
     def test_ac18b_hooks_json_merges_existing_project_hooks(self, tmp_path):
         """AC-18b: Codex init preserves project hooks and removes legacy MAP metadata."""
@@ -5272,15 +5272,17 @@ class TestCodexProvider:
             codex_dir / "config.toml",
         ]
         for path in expected_paths:
-            assert path.exists(), (
-                f"Expected discovery path does not exist: {path.relative_to(codex_project)}"
-            )
+            assert (
+                path.exists()
+            ), f"Expected discovery path does not exist: {path.relative_to(codex_project)}"
         # Agents directory must have TOML files for agent discovery
         toml_count = len(list((codex_dir / "agents").glob("*.toml")))
-        assert toml_count >= 1, (
-            f".codex/agents/ must have at least 1 *.toml for agent discovery, found {toml_count}"
-        )
-        assert not (codex_dir / "skills").exists(), (
+        assert (
+            toml_count >= 1
+        ), f".codex/agents/ must have at least 1 *.toml for agent discovery, found {toml_count}"
+        assert not (
+            codex_dir / "skills"
+        ).exists(), (
             "Codex skills must be installed under .agents/skills, not .codex/skills"
         )
 
@@ -5300,9 +5302,9 @@ class TestCodexProvider:
         gate_ns: dict = {}
         exec(compile(gate_source, str(gate_script), "exec"), gate_ns)  # noqa: S102
         editing_phases = gate_ns["EDITING_PHASES"]
-        assert "RESEARCH" not in editing_phases, (
-            "RESEARCH must NOT be in EDITING_PHASES"
-        )
+        assert (
+            "RESEARCH" not in editing_phases
+        ), "RESEARCH must NOT be in EDITING_PHASES"
         assert "ACTOR" in editing_phases, "ACTOR must be in EDITING_PHASES"
 
         # Simulate gate invocation: Edit tool during RESEARCH phase → should block.
@@ -5326,14 +5328,14 @@ class TestCodexProvider:
             cwd=str(codex_project),
             check=False,
         )
-        assert proc.returncode == 0, (
-            f"workflow-gate.py must exit 0 always, got {proc.returncode}"
-        )
+        assert (
+            proc.returncode == 0
+        ), f"workflow-gate.py must exit 0 always, got {proc.returncode}"
         gate_output = _json.loads(proc.stdout.strip())
         hook_output = gate_output.get("hookSpecificOutput", {})
-        assert hook_output.get("permissionDecision") == "deny", (
-            f"Expected 'deny' for Edit in RESEARCH phase, got: {gate_output}"
-        )
+        assert (
+            hook_output.get("permissionDecision") == "deny"
+        ), f"Expected 'deny' for Edit in RESEARCH phase, got: {gate_output}"
 
     # ------------------------------------------------------------------ #
     # AC-21: upgrade on codex project must not create .claude/             #
@@ -5351,9 +5353,9 @@ class TestCodexProvider:
         os.chdir(codex_project)
         result = local_runner.invoke(app, ["upgrade"])
         assert result.exit_code == 0, f"upgrade failed: {result.output}"
-        assert not (codex_project / ".claude").exists(), (
-            ".claude/ must NOT be created by upgrade on a codex project"
-        )
+        assert not (
+            codex_project / ".claude"
+        ).exists(), ".claude/ must NOT be created by upgrade on a codex project"
 
     def test_ac22_map_efficient_state_machine_markers(self, codex_project):
         """AC-22: $map-efficient documents the required state-machine commands."""
@@ -5370,9 +5372,9 @@ class TestCodexProvider:
 
         mutation_index = content.index("## Mutation Boundary Constraints")
         implement_index = content.index("Implement exactly")
-        assert mutation_index < implement_index, (
-            "Mutation boundary constraints must appear before implementation directives"
-        )
+        assert (
+            mutation_index < implement_index
+        ), "Mutation boundary constraints must appear before implementation directives"
 
 
 class TestDetectProviderEdgeCases:
@@ -5424,12 +5426,12 @@ class TestDoctorCodexProject:
         assert result.exit_code == 0
         # Run doctor
         result = local_runner.invoke(app, ["doctor"])
-        assert ".claude/agents" not in result.output, (
-            "doctor must not report .claude/agents as missing for codex project"
-        )
-        assert ".claude/commands" not in result.output, (
-            "doctor must not report .claude/commands as missing for codex project"
-        )
+        assert (
+            ".claude/agents" not in result.output
+        ), "doctor must not report .claude/agents as missing for codex project"
+        assert (
+            ".claude/commands" not in result.output
+        ), "doctor must not report .claude/commands as missing for codex project"
         assert "all core paths present" in result.output or "codex" in result.output
 
 
@@ -5453,9 +5455,9 @@ class TestClaudeProviderInstall:
             "rules",
             "statusline",
         }
-        assert set(counts.keys()) == expected_keys, (
-            f"ClaudeProvider.install() must return all category keys, got: {set(counts.keys())}"
-        )
+        assert (
+            set(counts.keys()) == expected_keys
+        ), f"ClaudeProvider.install() must return all category keys, got: {set(counts.keys())}"
         # Each category must have created at least one file
         for key, value in counts.items():
             assert value >= 0, f"counts['{key}'] must be non-negative"
@@ -5470,6 +5472,6 @@ class TestClaudeProviderInstall:
         provider.install(tmp_path, mcp_servers=[])
         assert (tmp_path / ".claude" / "agents").exists()
         assert (tmp_path / ".claude" / "commands").exists()
-        assert not (tmp_path / ".codex").exists(), (
-            "ClaudeProvider must not create .codex/"
-        )
+        assert not (
+            tmp_path / ".codex"
+        ).exists(), "ClaudeProvider must not create .codex/"

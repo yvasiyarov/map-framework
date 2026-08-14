@@ -47,6 +47,7 @@ def _err(kind: str, error: str, **fields: Any) -> _ResultDict:
 # NEVER a hardcoded fallback — stop and ask the human if env is unset.
 # ---------------------------------------------------------------------------
 
+
 def resolve_base_url() -> _ResultDict:
     """Return the SOFA base URL from SOFA_BASE_URL env var.
 
@@ -70,7 +71,10 @@ def resolve_base_url() -> _ResultDict:
 # Key resolution (D5)
 # ---------------------------------------------------------------------------
 
-def resolve_key(agent_id: str | None = None, credentials_path: Path | None = None) -> _ResultDict:
+
+def resolve_key(
+    agent_id: str | None = None, credentials_path: Path | None = None
+) -> _ResultDict:
     """Resolve the SOFA API key.
 
     Order: SOFA_API_KEY env → .sofa/credentials.json keyed by agent_id.
@@ -98,7 +102,9 @@ def resolve_key(agent_id: str | None = None, credentials_path: Path | None = Non
     if agent_id:
         entry = data.get(agent_id)
         if not entry:
-            return _err("no_key", f"No entry for agent_id={agent_id!r} in credentials file.")
+            return _err(
+                "no_key", f"No entry for agent_id={agent_id!r} in credentials file."
+            )
         key = entry.get("api_key", "")
         if not key:
             return _err("no_key", f"Empty api_key for agent_id={agent_id!r}.")
@@ -150,7 +156,7 @@ def _request(
         try:
             raw = exc.read()
             status = exc.code
-        except Exception:  # noqa: BLE001 -- deliberate fallback/resilience boundary, must not propagate
+        except Exception:  # noqa: BLE001 -- deliberate fallback boundary
             raw = b""
             status = exc.code
         try:
@@ -176,7 +182,12 @@ def _request(
     try:
         parsed = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
-        return _err("bad_json", f"Non-JSON response (status={status})", status=status, raw=raw[:200].decode("utf-8", errors="replace"))
+        return _err(
+            "bad_json",
+            f"Non-JSON response (status={status})",
+            status=status,
+            raw=raw[:200].decode("utf-8", errors="replace"),
+        )
     if not isinstance(parsed, dict):
         return _err(
             "bad_json",
@@ -327,11 +338,7 @@ def ensure_sofa_gitignore(repo_root: Path) -> bool:
         _validate_gitignore_unchanged(gitignore, original)
         return False
 
-    addition = (
-        b".sofa/\n"
-        if _has_sofa_marker(existing_lines)
-        else _SOFA_BLOCK.encode()
-    )
+    addition = b".sofa/\n" if _has_sofa_marker(existing_lines) else _SOFA_BLOCK.encode()
     separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
     _atomic_replace_gitignore(gitignore, existing + separator + addition, original)
     return True
@@ -340,6 +347,7 @@ def ensure_sofa_gitignore(repo_root: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Credential storage (VC3 / VC4)
 # ---------------------------------------------------------------------------
+
 
 class SofaCredentialsSecurityError(RuntimeError):
     """Raised when the local credential path is unsafe."""
@@ -417,9 +425,9 @@ def _open_sofa_directory(
     except OSError as exc:
         _unsafe_credentials(f"could not open .sofa safely ({exc})")
     opened = os.fstat(descriptor)
-    if (
-        not stat.S_ISDIR(opened.st_mode)
-        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+        current.st_dev,
+        current.st_ino,
     ):
         os.close(descriptor)
         _unsafe_credentials(".sofa changed while being opened")
@@ -533,9 +541,7 @@ def _parse_credentials(content: bytes) -> dict[str, Any]:
             "credentials.json must contain valid UTF-8 JSON."
         ) from exc
     if not isinstance(parsed, dict):
-        raise SofaCredentialsFormatError(
-            "credentials.json must contain a JSON object."
-        )
+        raise SofaCredentialsFormatError("credentials.json must contain a JSON object.")
     for agent, entry in parsed.items():
         if not isinstance(agent, str) or not isinstance(entry, dict):
             raise SofaCredentialsFormatError(
@@ -609,9 +615,7 @@ def _atomic_write_credentials(
                 | getattr(os, "O_NOFOLLOW", 0)
             )
             for _ in range(32):
-                temporary_name = (
-                    f".credentials.json.{secrets.token_hex(12)}.tmp"
-                )
+                temporary_name = f".credentials.json.{secrets.token_hex(12)}.tmp"
                 try:
                     descriptor = os.open(
                         temporary_name,
@@ -696,6 +700,7 @@ def _atomic_write_credentials(
         except FileNotFoundError:
             pass
 
+
 def store_credentials(
     *,
     repo_root: Path,
@@ -779,6 +784,7 @@ def store_credentials(
 # Onboarding (7 steps, human-gated) — VC5
 # ---------------------------------------------------------------------------
 
+
 def onboarding_start(base_url: str) -> _ResultDict:
     """Step 1: GET /api/onboarding — fetch contract + next_step."""
     return _request("GET", f"{base_url}/api/onboarding")
@@ -852,7 +858,10 @@ def onboarding_poll_status(
                 auth_code=d.get("auth_code"),
                 auth_code_expires_at=d.get("auth_code_expires_at"),
             )
-    return _err("timeout", "Onboarding poll timed out — human did not complete the flow in time.")
+    return _err(
+        "timeout",
+        "Onboarding poll timed out — human did not complete the flow in time.",
+    )
 
 
 def onboarding_register(
@@ -907,6 +916,7 @@ def onboarding_register(
 # ---------------------------------------------------------------------------
 # Session management (VC2)
 # ---------------------------------------------------------------------------
+
 
 def create_session(
     base_url: str,
@@ -973,27 +983,36 @@ def _authed_request_with_retry(
 
     Returns (result, session_id) — the session_id may be a new one after retry.
     """
-    result = _authed_request(method, url, api_key=api_key, session_id=session_id, body=body)
+    result = _authed_request(
+        method, url, api_key=api_key, session_id=session_id, body=body
+    )
 
     if result["ok"] or result.get("status") != 401:
         return result, session_id
 
     # 401 → single retry after new session
     time.sleep(1)
-    new_sess = create_session(base_url, api_key, client_name=client_name, model_name=model_name)
+    new_sess = create_session(
+        base_url, api_key, client_name=client_name, model_name=model_name
+    )
     if not new_sess["ok"]:
         return new_sess, session_id
 
     new_session_id: str = new_sess["session_id"]
-    retry = _authed_request(method, url, api_key=api_key, session_id=new_session_id, body=body)
+    retry = _authed_request(
+        method, url, api_key=api_key, session_id=new_session_id, body=body
+    )
 
     if not retry["ok"] and retry.get("status") == 401:
         # Second 401 — do NOT loop; degrade
-        return _err(
-            "auth_failed",
-            "401 invalid_session persists after session refresh. Check API key validity.",
-            status=401,
-        ), new_session_id
+        return (
+            _err(
+                "auth_failed",
+                "401 invalid_session persists after session refresh. Check API key validity.",
+                status=401,
+            ),
+            new_session_id,
+        )
 
     return retry, new_session_id
 
@@ -1001,6 +1020,7 @@ def _authed_request_with_retry(
 # ---------------------------------------------------------------------------
 # Read endpoints — typed result dicts (VC2 / spike §6)
 # ---------------------------------------------------------------------------
+
 
 def search_posts(
     base_url: str,
@@ -1020,9 +1040,13 @@ def search_posts(
     params = f"search={urllib.parse.quote(search)}&per_page={per_page}"
     url = f"{base_url}/api/posts?{params}"
     result, new_sid = _authed_request_with_retry(
-        "GET", url,
-        base_url=base_url, api_key=api_key, session_id=session_id,
-        client_name=client_name, model_name=model_name,
+        "GET",
+        url,
+        base_url=base_url,
+        api_key=api_key,
+        session_id=session_id,
+        client_name=client_name,
+        model_name=model_name,
     )
     if not result["ok"]:
         return result, new_sid
@@ -1030,15 +1054,18 @@ def search_posts(
     d = result["data"]
     items = d.get("items", [])
     parsed_items = [_parse_post(p) for p in items]
-    return _ok(
-        items=parsed_items,
-        total=d.get("total"),
-        page=d.get("page"),
-        per_page=d.get("per_page"),
-        has_next=d.get("has_next"),
-        pagination_mode=d.get("pagination_mode"),
-        steering=d.get("steering"),
-    ), new_sid
+    return (
+        _ok(
+            items=parsed_items,
+            total=d.get("total"),
+            page=d.get("page"),
+            per_page=d.get("per_page"),
+            has_next=d.get("has_next"),
+            pagination_mode=d.get("pagination_mode"),
+            steering=d.get("steering"),
+        ),
+        new_sid,
+    )
 
 
 def get_post(
@@ -1056,9 +1083,13 @@ def get_post(
     """
     url = f"{base_url}/api/posts/{post_id}"
     result, new_sid = _authed_request_with_retry(
-        "GET", url,
-        base_url=base_url, api_key=api_key, session_id=session_id,
-        client_name=client_name, model_name=model_name,
+        "GET",
+        url,
+        base_url=base_url,
+        api_key=api_key,
+        session_id=session_id,
+        client_name=client_name,
+        model_name=model_name,
     )
     if not result["ok"]:
         return result, new_sid
@@ -1071,6 +1102,7 @@ def get_post(
 # Post parsing — typed dicts tolerating all-null trust_summary (spike §6)
 # ---------------------------------------------------------------------------
 
+
 def _parse_trust_summary(ts: Any) -> dict[str, Any] | None:
     """Parse trust_summary tolerating all-null fields and not_enough_evidence status."""
     if ts is None:
@@ -1079,11 +1111,11 @@ def _parse_trust_summary(ts: Any) -> dict[str, Any] | None:
         return None
     return {
         "subject": ts.get("subject"),
-        "status": ts.get("status"),           # nullable enum
-        "score": ts.get("score"),             # nullable number — never treat null as 0
+        "status": ts.get("status"),  # nullable enum
+        "score": ts.get("score"),  # nullable number — never treat null as 0
         "latest_verified_at": ts.get("latest_verified_at"),  # nullable
         "computed_at": ts.get("computed_at"),
-        "best_reply_id": ts.get("best_reply_id"),            # nullable
+        "best_reply_id": ts.get("best_reply_id"),  # nullable
     }
 
 
@@ -1099,7 +1131,7 @@ def _parse_post(raw: Any) -> dict[str, Any]:
         "content_type": raw.get("content_type"),
         "title": raw.get("title"),
         "body_excerpt": raw.get("body_excerpt"),
-        "body": raw.get("body"),              # present on GET /api/posts/{id}
+        "body": raw.get("body"),  # present on GET /api/posts/{id}
         "agent_id": raw.get("agent_id"),
         "agent_name": raw.get("agent_name"),
         "agent_is_top_contributor": raw.get("agent_is_top_contributor"),
@@ -1107,7 +1139,7 @@ def _parse_post(raw: Any) -> dict[str, Any]:
         "trust_summary": _parse_trust_summary(raw.get("trust_summary")),
         "view_count": raw.get("view_count"),
         "reply_count": raw.get("reply_count"),
-        "replies": raw.get("replies"),        # present on GET /api/posts/{id}
+        "replies": raw.get("replies"),  # present on GET /api/posts/{id}
         "created_at": raw.get("created_at"),
         "updated_at": raw.get("updated_at"),
     }
