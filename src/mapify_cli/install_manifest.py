@@ -26,7 +26,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from mapify_cli.delivery.managed_file_copier import compute_hash, extract_metadata
 
@@ -45,14 +45,11 @@ def normalize_providers(provider: str | Sequence[str]) -> list[str]:
     requested = set(raw)
     return [name for name in _PROVIDER_ORDER if name in requested]
 
-
 # Relative paths (from project root) that are machine-local and should
 # NOT appear in the committed manifest.
-_LOCAL_ONLY_RELPATHS: frozenset[str] = frozenset(
-    {
-        ".claude/settings.local.json",
-    }
-)
+_LOCAL_ONLY_RELPATHS: frozenset[str] = frozenset({
+    ".claude/settings.local.json",
+})
 
 # Fence start tokens by extension (mirrors managed_file_copier._FENCE_TOKENS)
 _FENCE_START_BY_EXT: dict[str, str] = {
@@ -67,11 +64,9 @@ _FENCE_START_BY_EXT: dict[str, str] = {
 
 # Files installed WITHOUT MAP-MANAGED metadata (Codex hooks.json uses its own
 # merge strategy that is incompatible with the _map_managed root key).
-_HOOKS_MERGE_RELPATHS: frozenset[str] = frozenset(
-    {
-        ".codex/hooks.json",
-    }
-)
+_HOOKS_MERGE_RELPATHS: frozenset[str] = frozenset({
+    ".codex/hooks.json",
+})
 
 # Directories to scan per provider (relative to project root).
 # Only the directories that each provider's install functions write to.
@@ -116,13 +111,13 @@ _IGNORED_SUFFIXES: frozenset[str] = frozenset({".pyc", ".pyo"})
 class ManifestEntry:
     """One MAP-managed file in the install manifest."""
 
-    dest: str  # relative path from project root (POSIX separators)
-    content_hash: str  # SHA-256 of file content with metadata stripped
-    template_hash: str  # SHA-256 of the template source at install time
+    dest: str             # relative path from project root (POSIX separators)
+    content_hash: str     # SHA-256 of file content with metadata stripped
+    template_hash: str    # SHA-256 of the template source at install time
     management_mode: str  # "fenced" | "full" | "hooks-merge"
-    committed: bool  # True when this file should be committed to VCS
-    mapify_version: str  # mapify-cli version that installed this file
-    installed_at: str  # ISO 8601 UTC timestamp from the MAP-MANAGED header
+    committed: bool       # True when this file should be committed to VCS
+    mapify_version: str   # mapify-cli version that installed this file
+    installed_at: str     # ISO 8601 UTC timestamp from the MAP-MANAGED header
 
 
 @dataclass
@@ -135,11 +130,11 @@ class ConfigEntry:
     No absolute paths or secrets are stored.
     """
 
-    file: str  # relative POSIX path of the config file (e.g. ".mcp.json")
-    key_path: str  # dot-notation path to the owned key
-    #   e.g. "mcpServers.sequential-thinking" or "statusLine"
-    installed_at: str  # ISO 8601 UTC timestamp (manifest write time)
-    mapify_version: str  # mapify-cli version that wrote this entry
+    file: str             # relative POSIX path of the config file (e.g. ".mcp.json")
+    key_path: str         # dot-notation path to the owned key
+                          #   e.g. "mcpServers.sequential-thinking" or "statusLine"
+    installed_at: str     # ISO 8601 UTC timestamp (manifest write time)
+    mapify_version: str   # mapify-cli version that wrote this entry
 
 
 @dataclass
@@ -148,7 +143,7 @@ class InstallManifest:
 
     mapify_version: str
     provider: str
-    installed_at: str  # manifest write timestamp
+    installed_at: str       # manifest write timestamp
     entries: list[ManifestEntry] = field(default_factory=list)
     config_entries: list[ConfigEntry] = field(default_factory=list)
     providers: list[str] = field(default_factory=list)
@@ -158,23 +153,19 @@ class InstallManifest:
 class CheckResult:
     """Outcome of check_installed()."""
 
-    missing: list[str] = field(default_factory=list)  # in manifest, absent from disk
-    orphaned: list[str] = field(
-        default_factory=list
-    )  # MAP-managed on disk, not in manifest
-    drifted: list[str] = field(
-        default_factory=list
-    )  # template_hash differs vs manifest
-    ok: list[str] = field(default_factory=list)  # present and matching
+    missing: list[str] = field(default_factory=list)   # in manifest, absent from disk
+    orphaned: list[str] = field(default_factory=list)  # MAP-managed on disk, not in manifest
+    drifted: list[str] = field(default_factory=list)   # template_hash differs vs manifest
+    ok: list[str] = field(default_factory=list)        # present and matching
 
 
 @dataclass
 class ReconcileResult:
     """Outcome of reconcile_config()."""
 
-    removed: list[str] = field(default_factory=list)  # MAP-owned entries removed
-    skipped: list[str] = field(default_factory=list)  # user-modified, preserved
-    missing: list[str] = field(default_factory=list)  # already absent from disk
+    removed: list[str] = field(default_factory=list)   # MAP-owned entries removed
+    skipped: list[str] = field(default_factory=list)   # user-modified, preserved
+    missing: list[str] = field(default_factory=list)   # already absent from disk
 
 
 # ---------------------------------------------------------------------------
@@ -316,14 +307,12 @@ def _scan_mcp_config_entries(
     entries: list[ConfigEntry] = []
     for name, expected_config in map_servers.items():
         if existing_servers.get(name) == expected_config:
-            entries.append(
-                ConfigEntry(
-                    file=".mcp.json",
-                    key_path=f"mcpServers.{name}",
-                    installed_at=timestamp,
-                    mapify_version=version,
-                )
-            )
+            entries.append(ConfigEntry(
+                file=".mcp.json",
+                key_path=f"mcpServers.{name}",
+                installed_at=timestamp,
+                mapify_version=version,
+            ))
     return entries
 
 
@@ -449,13 +438,12 @@ def reconcile_config(project_path: Path) -> ReconcileResult:
         label = f"{entry.file}:{entry.key_path}"
 
         if entry.file == ".mcp.json" and entry.key_path.startswith("mcpServers."):
-            server_name = entry.key_path[len("mcpServers.") :]
+            server_name = entry.key_path[len("mcpServers."):]
             try:
                 from mapify_cli.config.mcp import (
                     build_standard_mcp_servers,
                     read_project_mcp_json,
                 )
-
                 mcp_data = read_project_mcp_json(project_path / ".mcp.json")
             except ImportError:
                 result.missing.append(label)
@@ -463,9 +451,7 @@ def reconcile_config(project_path: Path) -> ReconcileResult:
 
             if not mcp_data or server_name not in mcp_data.get("mcpServers", {}):
                 result.missing.append(label)
-            elif mcp_data["mcpServers"][
-                server_name
-            ] != build_standard_mcp_servers().get(server_name):
+            elif mcp_data["mcpServers"][server_name] != build_standard_mcp_servers().get(server_name):
                 result.skipped.append(label)
             else:
                 _remove_mcp_server(project_path, server_name)
@@ -537,9 +523,7 @@ def build_manifest(
     # Config-entry ownership (only for providers that do config merges)
     config_entries: list[ConfigEntry] = []
     if "claude" in providers:
-        config_entries.extend(
-            _scan_mcp_config_entries(project_path, version, timestamp)
-        )
+        config_entries.extend(_scan_mcp_config_entries(project_path, version, timestamp))
         ce = _scan_statusline_config_entry(project_path, version, timestamp)
         if ce is not None:
             config_entries.append(ce)
@@ -559,6 +543,59 @@ def build_manifest(
 # ---------------------------------------------------------------------------
 # Persist / load
 # ---------------------------------------------------------------------------
+
+
+def _is_canonical_project_relative_path(value: str) -> bool:
+    """Return whether *value* is a canonical POSIX path below a project root."""
+    if not value or "\\" in value or "\x00" in value:
+        return False
+    if len(value) >= 2 and value[0].isalpha() and value[1] == ":":
+        return False
+    path = PurePosixPath(value)
+    return (
+        bool(path.parts)
+        and not path.is_absolute()
+        and path.as_posix() == value
+        and all(part not in {".", ".."} for part in path.parts)
+    )
+
+
+def _is_managed_destination(dest: str, providers: Sequence[str]) -> bool:
+    """Return whether *dest* is emitted by one of the manifest's providers."""
+    if not _is_canonical_project_relative_path(dest):
+        return False
+
+    scan_roots: list[str] = []
+    single_files: set[str] = set()
+    if "claude" in providers:
+        scan_roots.extend(_CLAUDE_SCAN_ROOTS)
+        single_files.update(_CLAUDE_SINGLE_FILES)
+    if "codex" in providers:
+        scan_roots.extend(_CODEX_SCAN_ROOTS)
+        single_files.update(_CODEX_SINGLE_FILES)
+
+    return dest in single_files or any(
+        dest.startswith(f"{scan_root}/") for scan_root in scan_roots
+    )
+
+
+def _is_owned_config_pair(
+    file: str,
+    key_path: str,
+    providers: Sequence[str],
+) -> bool:
+    """Return whether MAP can safely reconcile this exact ownership pair."""
+    if "claude" not in providers or not _is_canonical_project_relative_path(file):
+        return False
+    if file == ".claude/settings.local.json":
+        return key_path == "statusLine"
+    if file != ".mcp.json" or not key_path.startswith("mcpServers."):
+        return False
+
+    from mapify_cli.config.mcp import build_standard_mcp_servers
+
+    server_name = key_path[len("mcpServers.") :]
+    return server_name in build_standard_mcp_servers()
 
 
 def write_manifest(project_path: Path, manifest: InstallManifest) -> Path:
@@ -658,6 +695,8 @@ def read_manifest(project_path: Path) -> InstallManifest | None:
             "hooks-merge",
         }:
             return None
+        if not _is_managed_destination(raw_entry["dest"], providers):
+            return None
         entries.append(ManifestEntry(**raw_entry))
 
     raw_config = data.get("config_entries", [])
@@ -669,6 +708,10 @@ def read_manifest(project_path: Path) -> InstallManifest | None:
         if not isinstance(raw_entry, dict) or set(raw_entry) != config_fields:
             return None
         if not all(isinstance(raw_entry[field], str) for field in config_fields):
+            return None
+        if not _is_owned_config_pair(
+            raw_entry["file"], raw_entry["key_path"], providers
+        ):
             return None
         config_entries.append(ConfigEntry(**raw_entry))
 

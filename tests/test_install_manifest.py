@@ -39,6 +39,7 @@ from mapify_cli.delivery.managed_file_copier import (
 from mapify_cli.install_manifest import (
     MANIFEST_FILENAME,
     InstallManifest,
+    ReconcileResult,
     _build_entry_from_file,
     _infer_management_mode,
     _scan_mcp_config_entries,
@@ -96,9 +97,7 @@ def _write_managed_file(
     path.write_text(content, encoding="utf-8")
 
 
-def _write_json_managed(
-    path: Path, body: dict[str, Any], version: str = VERSION
-) -> None:
+def _write_json_managed(path: Path, body: dict[str, Any], version: str = VERSION) -> None:
     """Write a MAP-managed JSON file at *path*."""
     raw = json.dumps(body, indent=2)
     managed = inject_metadata(raw, ".json", version, compute_hash(raw))
@@ -160,7 +159,7 @@ def _setup_codex_install(project: Path) -> list[str]:
 
     # .codex/agents/actor.toml (fenced)
     p = project / ".codex" / "agents" / "actor.toml"
-    _write_managed_file(p, '[agent]\nname = "actor"\n', fenced=True)
+    _write_managed_file(p, "[agent]\nname = \"actor\"\n", fenced=True)
     installed.append(".codex/agents/actor.toml")
 
     # .codex/config.toml (fenced)
@@ -191,7 +190,6 @@ def _setup_codex_install(project: Path) -> list[str]:
 # VC1: Claude install writes manifest with correct entries
 # ---------------------------------------------------------------------------
 
-
 class TestVC1ClaudeManifest:
     def test_build_manifest_claude_collects_all_managed_files(
         self, tmp_path: Path
@@ -204,7 +202,9 @@ class TestVC1ClaudeManifest:
         assert manifest.installed_at != ""
 
         actual_dests = sorted(e.dest for e in manifest.entries)
-        assert actual_dests == expected, f"Expected {expected}, got {actual_dests}"
+        assert actual_dests == expected, (
+            f"Expected {expected}, got {actual_dests}"
+        )
 
     def test_build_and_write_manifest_roundtrip(self, tmp_path: Path) -> None:
         _setup_claude_install(tmp_path)
@@ -232,9 +232,7 @@ class TestVC1ClaudeManifest:
             assert entry.template_hash != "", f"{entry.dest} missing template_hash"
             assert entry.content_hash != "", f"{entry.dest} missing content_hash"
 
-    def test_manifest_entries_have_correct_management_mode(
-        self, tmp_path: Path
-    ) -> None:
+    def test_manifest_entries_have_correct_management_mode(self, tmp_path: Path) -> None:
         _setup_claude_install(tmp_path)
         manifest = build_manifest(tmp_path, "claude", VERSION)
 
@@ -257,7 +255,6 @@ class TestVC1ClaudeManifest:
 # VC2: Codex install writes manifest with correct entries
 # ---------------------------------------------------------------------------
 
-
 class TestVC2CodexManifest:
     def test_build_manifest_codex_collects_all_managed_files(
         self, tmp_path: Path
@@ -267,7 +264,9 @@ class TestVC2CodexManifest:
 
         assert manifest.provider == "codex"
         actual_dests = sorted(e.dest for e in manifest.entries)
-        assert actual_dests == expected, f"Expected {expected}, got {actual_dests}"
+        assert actual_dests == expected, (
+            f"Expected {expected}, got {actual_dests}"
+        )
 
     def test_codex_hooks_json_recorded_as_hooks_merge(self, tmp_path: Path) -> None:
         _setup_codex_install(tmp_path)
@@ -291,7 +290,6 @@ class TestVC2CodexManifest:
 # ---------------------------------------------------------------------------
 # VC3: Re-init idempotency — writing manifest twice overwrites the first
 # ---------------------------------------------------------------------------
-
 
 class TestVC3Idempotency:
     def test_write_manifest_twice_overwrites(self, tmp_path: Path) -> None:
@@ -392,7 +390,6 @@ def test_write_manifest_replace_failure_preserves_old_file_and_cleans_tempfile(
 # VC4: check_installed detects missing files
 # ---------------------------------------------------------------------------
 
-
 class TestVC4MissingDetection:
     def test_missing_file_is_reported(self, tmp_path: Path) -> None:
         _setup_claude_install(tmp_path)
@@ -431,7 +428,6 @@ class TestVC4MissingDetection:
 # ---------------------------------------------------------------------------
 # VC5: check_installed detects drifted files
 # ---------------------------------------------------------------------------
-
 
 class TestVC5DriftDetection:
     def test_drifted_template_hash_reported(self, tmp_path: Path) -> None:
@@ -490,7 +486,6 @@ class TestVC5DriftDetection:
 # ---------------------------------------------------------------------------
 # VC6: check_installed detects orphaned files
 # ---------------------------------------------------------------------------
-
 
 class TestVC6OrphanDetection:
     def test_orphaned_file_detected_after_manifest_written_without_it(
@@ -823,6 +818,183 @@ class TestVC7ReadManifestEdgeCases:
 
         assert read_manifest(tmp_path) is None
 
+    @pytest.mark.parametrize(
+        "unsafe_dest",
+        [
+            pytest.param("", id="empty"),
+            pytest.param(".claude/skills/\x00", id="nul-byte"),
+            pytest.param(".", id="current-directory"),
+            pytest.param("/tmp/x", id="posix-absolute"),
+            pytest.param("../x", id="parent-traversal"),
+            pytest.param(".claude/skills/../../x", id="nested-parent-traversal"),
+            pytest.param(r"C:\tmp\x", id="windows-drive-backslashes"),
+            pytest.param("C:/tmp/x", id="windows-drive-slashes"),
+            pytest.param("C:relative", id="windows-drive-relative"),
+            pytest.param(r"\rooted", id="windows-rooted"),
+            pytest.param(r"\\server\share\x", id="windows-unc"),
+            pytest.param(r".claude\skills\map-plan\SKILL.md", id="backslashes"),
+            pytest.param(
+                r".claude\skills\..\outside.md",
+                id="backslash-traversal",
+            ),
+            pytest.param(
+                ".claude//skills/map-plan/SKILL.md",
+                id="redundant-separator",
+            ),
+            pytest.param(
+                ".claude/./skills/map-plan/SKILL.md",
+                id="dot-segment",
+            ),
+            pytest.param(
+                ".claude/skills/map-plan/SKILL.md/",
+                id="trailing-separator",
+            ),
+            pytest.param("README.md", id="outside-managed-roots"),
+            pytest.param(
+                ".claude/settings.local.json",
+                id="machine-local-file",
+            ),
+        ],
+    )
+    def test_unsafe_or_unmanaged_dest_returns_none(
+        self,
+        tmp_path: Path,
+        unsafe_dest: str,
+    ) -> None:
+        raw = _valid_raw_manifest()
+        raw["entries"][0]["dest"] = unsafe_dest
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    def test_dest_must_belong_to_a_manifest_provider(self, tmp_path: Path) -> None:
+        raw = _valid_raw_manifest()
+        raw["entries"][0]["dest"] = ".codex/config.toml"
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    @pytest.mark.parametrize(
+        "unsafe_file",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("/tmp/settings.json", id="posix-absolute"),
+            pytest.param("../settings.json", id="parent-traversal"),
+            pytest.param(r"C:\tmp\settings.json", id="windows-drive-backslashes"),
+            pytest.param("C:/tmp/settings.json", id="windows-drive-slashes"),
+            pytest.param("C:settings.json", id="windows-drive-relative"),
+            pytest.param(r"\settings.json", id="windows-rooted"),
+            pytest.param(r"\\server\share\settings.json", id="windows-unc"),
+            pytest.param(r"..\settings.json", id="backslash-traversal"),
+            pytest.param(".claude//settings.local.json", id="redundant-separator"),
+            pytest.param(".claude/./settings.local.json", id="dot-segment"),
+        ],
+    )
+    def test_unsafe_config_file_returns_none(
+        self,
+        tmp_path: Path,
+        unsafe_file: str,
+    ) -> None:
+        raw = _valid_raw_manifest()
+        raw["config_entries"][0]["file"] = unsafe_file
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    @pytest.mark.parametrize(
+        ("file", "key_path"),
+        [
+            pytest.param(
+                ".mcp.json",
+                "statusLine",
+                id="statusline-in-mcp-config",
+            ),
+            pytest.param(
+                ".claude/settings.local.json",
+                "mcpServers.sequential-thinking",
+                id="mcp-server-in-statusline-config",
+            ),
+            pytest.param(
+                ".mcp.json",
+                "mcpServers.custom-server",
+                id="unknown-mcp-server",
+            ),
+            pytest.param(
+                ".mcp.json",
+                "mcpServers.",
+                id="empty-mcp-server-name",
+            ),
+        ],
+    )
+    def test_unowned_config_pair_returns_none(
+        self,
+        tmp_path: Path,
+        file: str,
+        key_path: str,
+    ) -> None:
+        raw = _valid_raw_manifest()
+        raw["config_entries"][0]["file"] = file
+        raw["config_entries"][0]["key_path"] = key_path
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    def test_config_entry_requires_claude_provider(self, tmp_path: Path) -> None:
+        raw = _valid_raw_manifest()
+        raw["provider"] = "codex"
+        raw["providers"] = ["codex"]
+        raw["entries"][0]["dest"] = ".codex/config.toml"
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    def test_reconcile_rejects_outside_statusline_without_mutating_it(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        outside_path = tmp_path.parent / f"{tmp_path.name}-outside-settings.json"
+        original = (
+            b'{"statusLine":{"type":"command",'
+            b'"command":"map-statusline.py"},"keep":true}\n'
+        )
+        outside_path.write_bytes(original)
+        raw = _valid_raw_manifest()
+        raw["config_entries"] = [
+            {
+                "file": str(outside_path),
+                "key_path": "statusLine",
+                "installed_at": "2026-07-05T00:00:00Z",
+                "mapify_version": VERSION,
+            }
+        ]
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+        assert reconcile_config(tmp_path) == ReconcileResult()
+        assert outside_path.read_bytes() == original
+
+    def test_reconcile_rejects_unknown_mcp_owner_without_mutating_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        original = b'{"mcpServers":{"custom-server":null},"keep":true}\n'
+        mcp_path.write_bytes(original)
+        raw = _valid_raw_manifest()
+        raw["config_entries"] = [
+            {
+                "file": ".mcp.json",
+                "key_path": "mcpServers.custom-server",
+                "installed_at": "2026-07-05T00:00:00Z",
+                "mapify_version": VERSION,
+            }
+        ]
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+        assert reconcile_config(tmp_path) == ReconcileResult()
+        assert mcp_path.read_bytes() == original
+
 
 # ---------------------------------------------------------------------------
 # VC8: management_mode inference
@@ -832,9 +1004,7 @@ class TestVC7ReadManifestEdgeCases:
 class TestVC8ManagementModeInference:
     def test_md_with_fence_marker_is_fenced(self, tmp_path: Path) -> None:
         p = tmp_path / "test.md"
-        content = (
-            "<!-- MAP-MANAGED: {} -->\n<!-- map:start -->\nbody\n<!-- map:end -->\n"
-        )
+        content = "<!-- MAP-MANAGED: {} -->\n<!-- map:start -->\nbody\n<!-- map:end -->\n"
         assert _infer_management_mode(p, content, ".md") == "fenced"
 
     def test_md_without_fence_marker_is_full(self, tmp_path: Path) -> None:
@@ -861,16 +1031,13 @@ class TestVC8ManagementModeInference:
 # VC9: Local-only paths excluded from the committed manifest
 # ---------------------------------------------------------------------------
 
-
 class TestVC9LocalOnlyExclusion:
     def test_settings_local_json_excluded(self, tmp_path: Path) -> None:
         _setup_claude_install(tmp_path)
 
         # Create a settings.local.json (machine-local, should be excluded)
         local_settings = tmp_path / ".claude" / "settings.local.json"
-        _write_json_managed(
-            local_settings, {"statusLine": {"type": "command", "command": "x"}}
-        )
+        _write_json_managed(local_settings, {"statusLine": {"type": "command", "command": "x"}})
 
         manifest = build_manifest(tmp_path, "claude", VERSION)
         dests = {e.dest for e in manifest.entries}
@@ -892,7 +1059,6 @@ class TestVC9LocalOnlyExclusion:
 # ---------------------------------------------------------------------------
 # Integration: check_installed returns empty CheckResult when no manifest
 # ---------------------------------------------------------------------------
-
 
 class TestCheckInstalledNoManifest:
     def test_no_manifest_returns_empty_check_result(self, tmp_path: Path) -> None:
@@ -930,8 +1096,7 @@ def _write_statusline_local(project: Path, command: str) -> None:
     settings.write_text(
         __import__("json").dumps(
             {"statusLine": {"type": "command", "command": command}}, indent=2
-        )
-        + "\n",
+        ) + "\n",
         encoding="utf-8",
     )
 
@@ -976,21 +1141,16 @@ class TestVC10McpConfigEntries:
         entries = _scan_mcp_config_entries(tmp_path, VERSION, _TIMESTAMP)
         for e in entries:
             assert not e.file.startswith("/"), "file must be relative"
-            assert not e.key_path.startswith("/"), (
-                "key_path must not contain absolute path"
-            )
+            assert not e.key_path.startswith("/"), "key_path must not contain absolute path"
 
 
 # ---------------------------------------------------------------------------
 # VC11: Config entries for statusline are detected
 # ---------------------------------------------------------------------------
 
-
 class TestVC11StatuslineConfigEntry:
     def test_map_statusline_detected(self, tmp_path: Path) -> None:
-        _write_statusline_local(
-            tmp_path, '"/abs/path/to/.claude/hooks/map-statusline.py"'
-        )
+        _write_statusline_local(tmp_path, '"/abs/path/to/.claude/hooks/map-statusline.py"')
         entry = _scan_statusline_config_entry(tmp_path, VERSION, _TIMESTAMP)
         assert entry is not None
         assert entry.file == ".claude/settings.local.json"
@@ -1021,9 +1181,7 @@ class TestVC11StatuslineConfigEntry:
         entry = _scan_statusline_config_entry(tmp_path, VERSION, _TIMESTAMP)
         assert entry is None
 
-    def test_build_manifest_includes_statusline_config_entry(
-        self, tmp_path: Path
-    ) -> None:
+    def test_build_manifest_includes_statusline_config_entry(self, tmp_path: Path) -> None:
         _setup_claude_install(tmp_path)
         _write_statusline_local(tmp_path, '"/path/to/map-statusline.py"')
         manifest = build_manifest(tmp_path, "claude", VERSION)
@@ -1035,7 +1193,6 @@ class TestVC11StatuslineConfigEntry:
 # VC12: User-modified MCP servers are NOT recorded as MAP-owned
 # ---------------------------------------------------------------------------
 
-
 class TestVC12UserModifiedMcp:
     def test_user_modified_server_not_recorded(self, tmp_path: Path) -> None:
         user_config = {"command": "npx", "args": ["-y", "my-custom-version"]}
@@ -1044,13 +1201,10 @@ class TestVC12UserModifiedMcp:
         assert entries == [], "user-modified config must not be recorded as MAP-owned"
 
     def test_extra_user_server_not_recorded(self, tmp_path: Path) -> None:
-        _write_mcp_json(
-            tmp_path,
-            {
-                _MAP_SERVER_NAME: _MAP_SERVER_CONFIG,
-                "user-custom-server": {"command": "node", "args": ["server.js"]},
-            },
-        )
+        _write_mcp_json(tmp_path, {
+            _MAP_SERVER_NAME: _MAP_SERVER_CONFIG,
+            "user-custom-server": {"command": "node", "args": ["server.js"]},
+        })
         entries = _scan_mcp_config_entries(tmp_path, VERSION, _TIMESTAMP)
         keys = [e.key_path for e in entries]
         assert f"mcpServers.{_MAP_SERVER_NAME}" in keys
@@ -1060,7 +1214,6 @@ class TestVC12UserModifiedMcp:
 # ---------------------------------------------------------------------------
 # VC13: reconcile_config removes MAP-owned MCP server entry
 # ---------------------------------------------------------------------------
-
 
 class TestVC13ReconcileMcpRemove:
     def test_removes_map_owned_server(self, tmp_path: Path) -> None:
@@ -1080,14 +1233,10 @@ class TestVC13ReconcileMcpRemove:
 
     def test_preserves_other_top_level_keys(self, tmp_path: Path) -> None:
         (tmp_path / ".mcp.json").write_text(
-            __import__("json").dumps(
-                {
-                    "mcpServers": {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG},
-                    "globalShortcut": "Cmd+Shift+.",
-                },
-                indent=2,
-            )
-            + "\n",
+            __import__("json").dumps({
+                "mcpServers": {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG},
+                "globalShortcut": "Cmd+Shift+.",
+            }, indent=2) + "\n",
             encoding="utf-8",
         )
         manifest = build_manifest(tmp_path, "claude", VERSION)
@@ -1112,7 +1261,9 @@ class TestVC13ReconcileMcpRemove:
         write_manifest(tmp_path, manifest)
 
         # Remove the server before reconciling
-        (tmp_path / ".mcp.json").write_text('{"mcpServers": {}}\n', encoding="utf-8")
+        (tmp_path / ".mcp.json").write_text(
+            '{"mcpServers": {}}\n', encoding="utf-8"
+        )
 
         result = reconcile_config(tmp_path)
         assert f".mcp.json:mcpServers.{_MAP_SERVER_NAME}" in result.missing
@@ -1122,7 +1273,6 @@ class TestVC13ReconcileMcpRemove:
 # ---------------------------------------------------------------------------
 # VC14: reconcile_config preserves user-modified MCP server
 # ---------------------------------------------------------------------------
-
 
 class TestVC14ReconcilePreservesUserModified:
     def test_user_modified_server_skipped(self, tmp_path: Path) -> None:
@@ -1150,7 +1300,6 @@ class TestVC14ReconcilePreservesUserModified:
 # VC15: reconcile_config removes MAP-owned statusline
 # ---------------------------------------------------------------------------
 
-
 class TestVC15ReconcileStatuslineRemove:
     def test_removes_map_owned_statusline(self, tmp_path: Path) -> None:
         _setup_claude_install(tmp_path)
@@ -1171,17 +1320,10 @@ class TestVC15ReconcileStatuslineRemove:
         settings = tmp_path / ".claude" / "settings.local.json"
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(
-            __import__("json").dumps(
-                {
-                    "statusLine": {
-                        "type": "command",
-                        "command": '"/path/map-statusline.py"',
-                    },
-                    "permissions": {"allow": ["Bash"]},
-                },
-                indent=2,
-            )
-            + "\n",
+            __import__("json").dumps({
+                "statusLine": {"type": "command", "command": '"/path/map-statusline.py"'},
+                "permissions": {"allow": ["Bash"]},
+            }, indent=2) + "\n",
             encoding="utf-8",
         )
         manifest = build_manifest(tmp_path, "claude", VERSION)
@@ -1189,7 +1331,9 @@ class TestVC15ReconcileStatuslineRemove:
 
         reconcile_config(tmp_path)
 
-        remaining = __import__("json").loads(settings.read_text(encoding="utf-8"))
+        remaining = __import__("json").loads(
+            settings.read_text(encoding="utf-8")
+        )
         assert "permissions" in remaining, "user settings keys must be preserved"
         assert "statusLine" not in remaining
 
@@ -1197,7 +1341,6 @@ class TestVC15ReconcileStatuslineRemove:
 # ---------------------------------------------------------------------------
 # VC16: reconcile_config refuses to remove user-defined statusline
 # ---------------------------------------------------------------------------
-
 
 class TestVC16ReconcileRefusesUserStatusline:
     def test_user_defined_statusline_skipped(self, tmp_path: Path) -> None:
@@ -1232,7 +1375,6 @@ class TestVC16ReconcileRefusesUserStatusline:
 # VC17: read_manifest backward compatibility — old manifest without config_entries
 # ---------------------------------------------------------------------------
 
-
 class TestVC17BackwardCompat:
     def test_old_manifest_without_config_entries_readable(self, tmp_path: Path) -> None:
         old_manifest = {
@@ -1252,13 +1394,9 @@ class TestVC17BackwardCompat:
         manifest = read_manifest(tmp_path)
         assert manifest is not None
         assert manifest.mapify_version == "3.10.0"
-        assert manifest.config_entries == [], (
-            "old manifests must deserialize with empty config_entries"
-        )
+        assert manifest.config_entries == [], "old manifests must deserialize with empty config_entries"
 
-    def test_idempotent_build_does_not_duplicate_config_entries(
-        self, tmp_path: Path
-    ) -> None:
+    def test_idempotent_build_does_not_duplicate_config_entries(self, tmp_path: Path) -> None:
         _write_mcp_json(tmp_path, {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG})
         _write_statusline_local(tmp_path, '"/path/map-statusline.py"')
 
@@ -1330,12 +1468,13 @@ def test_dual_provider_manifest_contains_union_without_duplicate_shared_files(
     destinations = [entry.dest for entry in manifest.entries]
     assert len(destinations) == len(set(destinations))
     assert any(dest.startswith(".claude/") for dest in destinations)
-    assert any(dest.startswith((".codex/", ".agents/")) for dest in destinations)
+    assert any(
+        dest.startswith((".codex/", ".agents/"))
+        for dest in destinations
+    )
 
 
-def test_dual_provider_manifest_serializes_legacy_provider_field(
-    tmp_path: Path,
-) -> None:
+def test_dual_provider_manifest_serializes_legacy_provider_field(tmp_path: Path) -> None:
     _setup_claude_install(tmp_path)
     _setup_codex_install(tmp_path)
 
