@@ -1,5 +1,7 @@
 """Test suite for mapify CLI tool."""
 
+import builtins
+import contextlib
 import json
 import os
 import shlex
@@ -272,9 +274,22 @@ class TestInitCommand:
         assert first.exit_code == second.exit_code == 0
         assert "updates.auto: true" in (tmp_path / ".map" / "config.yaml").read_text()
 
-    def test_init_without_update_flag_preserves_false(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("provider", ["claude", "codex"])
+    @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
+    def test_init_without_update_flag_preserves_existing_value(
+        self,
+        tmp_path: Path,
+        provider: str,
+        enabled: bool,
+    ) -> None:
         os.chdir(tmp_path)
-        runner.invoke(
+        config_path = tmp_path / ".map" / "config.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            f"updates.auto: {'true' if enabled else 'false'}\n",
+            encoding="utf-8",
+        )
+        result = runner.invoke(
             app,
             [
                 "init",
@@ -283,14 +298,120 @@ class TestInitCommand:
                 "--no-git",
                 "--mcp",
                 "none",
-                "--no-auto-update",
+                "--provider",
+                provider,
             ],
         )
-        result = runner.invoke(
-            app, ["init", ".", "--force", "--no-git", "--mcp", "none"]
+
+        assert result.exit_code == 0, result.stdout
+        assert config_path.read_text(encoding="utf-8") == (
+            f"updates.auto: {'true' if enabled else 'false'}\n"
         )
-        assert result.exit_code == 0
-        assert "updates.auto: false" in (tmp_path / ".map" / "config.yaml").read_text()
+
+    @pytest.mark.parametrize("provider", ["claude", "codex"])
+    @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
+    def test_init_explicit_auto_update_override_must_be_verified(
+        self,
+        tmp_path: Path,
+        provider: str,
+        enabled: bool,
+    ) -> None:
+        os.chdir(tmp_path)
+        config_path = tmp_path / ".map" / "config.yaml"
+        config_path.parent.mkdir()
+        previous = not enabled
+        config_path.write_text(
+            f"updates.auto: {'true' if previous else 'false'}\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch(
+            "mapify_cli.config.project_config.apply_auto_update_override",
+            return_value=None,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--mcp",
+                    "none",
+                    "--provider",
+                    provider,
+                    "--auto-update" if enabled else "--no-auto-update",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "Failed to persist requested automatic-update setting" in result.stdout
+        assert "Project ready" not in result.stdout
+        assert config_path.read_text(encoding="utf-8") == (
+            f"updates.auto: {'true' if previous else 'false'}\n"
+        )
+
+    @pytest.mark.parametrize("provider", ["claude", "codex"])
+    @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
+    def test_init_explicit_auto_update_write_failure_is_fatal(
+        self,
+        tmp_path: Path,
+        provider: str,
+        enabled: bool,
+    ) -> None:
+        os.chdir(tmp_path)
+
+        with mock.patch(
+            "mapify_cli.config.project_config.apply_auto_update_override",
+            side_effect=OSError("config is read-only"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "init",
+                    ".",
+                    "--force",
+                    "--no-git",
+                    "--mcp",
+                    "none",
+                    "--provider",
+                    provider,
+                    "--auto-update" if enabled else "--no-auto-update",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert "Failed to persist requested automatic-update setting" in result.stdout
+        assert "config is read-only" in result.stdout
+        assert "Project ready" not in result.stdout
+
+    def test_init_explicit_auto_update_rejects_malformed_persisted_config(
+        self, tmp_path: Path
+    ) -> None:
+        os.chdir(tmp_path)
+        config_path = tmp_path / ".map" / "config.yaml"
+        config_path.parent.mkdir()
+        config_path.write_text(
+            "updates.auto: false\nbroken: [\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--auto-update",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Failed to persist requested automatic-update setting" in result.stdout
+        assert "Project ready" not in result.stdout
 
     def test_init_basic(self, tmp_path):
         """Test basic initialization without options.
@@ -1947,6 +2068,88 @@ class TestDoctorCommand:
 class TestInternalUpdateCommand:
     """Test the hidden machine-readable project update adapter."""
 
+    @pytest.mark.parametrize(
+        ("mode", "expected_exit_code", "expected_payload"),
+        [
+            ("automatic", 0, None),
+            (
+                "manual",
+                1,
+                {
+                    "status": "error",
+                    "message": "MAP update failed: updater import failed",
+                },
+            ),
+        ],
+    )
+    def test_internal_update_import_failure_obeys_mode_boundary(
+        self,
+        tmp_path: Path,
+        mode: str,
+        expected_exit_code: int,
+        expected_payload: dict[str, str] | None,
+    ) -> None:
+        real_import = builtins.__import__
+
+        def fail_updater_import(
+            name: str,
+            globals: object = None,
+            locals: object = None,
+            fromlist: object = (),
+            level: int = 0,
+        ) -> object:
+            if name == "mapify_cli.auto_update":
+                print("incidental import stdout")
+                print("incidental import stderr", file=sys.stderr)
+                raise ImportError("updater import failed")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=fail_updater_import):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", mode, "--project", str(tmp_path)],
+            )
+
+        assert result.exit_code == expected_exit_code
+        assert result.stderr == ""
+        if expected_payload is None:
+            assert result.stdout_bytes == b""
+            assert result.output == ""
+        else:
+            assert result.stdout.count("\n") == 1
+            assert json.loads(result.stdout) == expected_payload
+            assert "incidental import" not in result.output
+            assert "Traceback" not in result.output
+
+    def test_internal_update_invalid_raw_mode_does_not_import_updater(
+        self, tmp_path: Path
+    ) -> None:
+        real_import = builtins.__import__
+
+        def reject_updater_import(
+            name: str,
+            globals: object = None,
+            locals: object = None,
+            fromlist: object = (),
+            level: int = 0,
+        ) -> object:
+            if name == "mapify_cli.auto_update":
+                raise AssertionError("invalid mode must be rejected before import")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=reject_updater_import):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", "scheduled", "--project", str(tmp_path)],
+            )
+
+        assert result.exit_code == 1
+        assert result.stderr == ""
+        assert json.loads(result.stdout) == {
+            "status": "error",
+            "message": "--mode must be automatic or manual",
+        }
+
     @mock.patch("mapify_cli.auto_update.check_and_update")
     def test_internal_update_automatic_error_is_silent_success(
         self, mock_update: mock.Mock, tmp_path: Path
@@ -1962,6 +2165,137 @@ class TestInternalUpdateCommand:
 
         assert result.exit_code == 0
         assert result.stdout == ""
+        assert result.stderr == ""
+        assert result.output == ""
+
+    def test_internal_update_automatic_lock_cleanup_failure_preserves_reload(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".claude" / "skills").mkdir(parents=True)
+
+        @contextlib.contextmanager
+        def failing_cleanup_lock(
+            project: Path,
+            *,
+            timeout_s: float,
+        ):
+            del project, timeout_s
+            yield
+            raise OSError("lock cleanup failed")
+
+        with (
+            mock.patch(
+                "mapify_cli.auto_update.detect_install_kind",
+                return_value=InstallKind.PIP,
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.project_update_lock",
+                failing_cleanup_lock,
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.fetch_version_targets",
+                return_value=VersionTargets(StableVersion(3, 26, 0), None),
+            ),
+            mock.patch("mapify_cli.auto_update.install_exact_version"),
+            mock.patch(
+                "mapify_cli.auto_update.installed_providers",
+                return_value=("claude",),
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.refresh_installed_providers",
+                return_value=("claude",),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        assert json.loads(result.stdout) == {
+            "status": "updated",
+            "current_version": "3.25.0",
+            "installed_version": "3.26.0",
+            "refreshed_providers": ["claude"],
+            "reload_current_skill": True,
+        }
+        assert "lock cleanup failed" not in result.output
+
+    def test_internal_update_automatic_final_state_failure_preserves_reload(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".claude" / "skills").mkdir(parents=True)
+        real_write_state = write_update_state
+
+        def fail_completed_state_write(project: Path, state: UpdateState) -> None:
+            if state.last_installed_version == "3.26.0" and not state.pending_refresh:
+                raise OSError("final state write failed")
+            real_write_state(project, state)
+
+        with (
+            mock.patch(
+                "mapify_cli.auto_update.detect_install_kind",
+                return_value=InstallKind.PIP,
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.fetch_version_targets",
+                return_value=VersionTargets(StableVersion(3, 26, 0), None),
+            ),
+            mock.patch("mapify_cli.auto_update.install_exact_version"),
+            mock.patch(
+                "mapify_cli.auto_update.installed_providers",
+                return_value=("claude",),
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.refresh_installed_providers",
+                return_value=("claude",),
+            ),
+            mock.patch(
+                "mapify_cli.auto_update.write_update_state",
+                side_effect=fail_completed_state_write,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+            )
+
+        assert result.exit_code == 0
+        assert result.stderr == ""
+        assert json.loads(result.stdout) == {
+            "status": "updated",
+            "current_version": "3.25.0",
+            "installed_version": "3.26.0",
+            "refreshed_providers": ["claude"],
+            "reload_current_skill": True,
+        }
+        assert "final state write failed" not in result.output
+
+    @mock.patch("mapify_cli.auto_update.check_and_update")
+    def test_internal_update_automatic_partial_refresh_error_remains_silent(
+        self, mock_update: mock.Mock, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".claude" / "skills").mkdir(parents=True)
+        (tmp_path / ".codex").mkdir()
+        (tmp_path / ".codex" / "config.toml").write_text("", encoding="utf-8")
+        (tmp_path / ".agents" / "skills").mkdir(parents=True)
+        mock_update.return_value = UpdateResult(
+            UpdateStatus.ERROR,
+            "3.25.0",
+            installed_version="3.26.0",
+            message="codex refresh failed",
+            refreshed_providers=("claude",),
+            reload_current_skill=True,
+        )
+
+        result = runner.invoke(
+            app,
+            ["_update", "--mode", "automatic", "--project", str(tmp_path)],
+        )
+
+        assert result.exit_code == 0
+        assert result.stdout_bytes == b""
         assert result.stderr == ""
         assert result.output == ""
 

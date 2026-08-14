@@ -948,6 +948,38 @@ def _refresh_mcp_selection(
     ]
 
 
+def _apply_verified_auto_update_override(
+    config_path: Path,
+    enabled: bool,
+) -> None:
+    """Persist and reload one explicit automatic-update policy choice."""
+    import re
+
+    import yaml
+
+    from mapify_cli.config.project_config import apply_auto_update_override
+
+    apply_auto_update_override(config_path, enabled)
+    text = config_path.read_text(encoding="utf-8")
+    persisted_values = re.findall(
+        r"(?m)^updates\.auto\s*:\s*(true|false)\s*$",
+        text,
+    )
+    expected = "true" if enabled else "false"
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RuntimeError(
+            f"could not reload persisted project config: {exc}"
+        ) from exc
+    if (
+        persisted_values != [expected]
+        or not isinstance(loaded, Mapping)
+        or loaded.get("updates.auto") is not enabled
+    ):
+        raise RuntimeError(f"updates.auto was not persisted as {expected}")
+
+
 def _start_init_workflow_logger(
     project_name: str | None, mcp: str, debug: bool
 ) -> None:
@@ -1316,7 +1348,6 @@ def init(
         try:
             from mapify_cli.config.project_config import (
                 apply_agent_memory_overrides,
-                apply_auto_update_override,
                 apply_compression_overrides,
                 apply_sofa_overrides,
                 write_default_config,
@@ -1332,7 +1363,7 @@ def init(
                     config_path, compression, compression_threshold
                 )
             if auto_update is not None:
-                apply_auto_update_override(config_path, auto_update)
+                _apply_verified_auto_update_override(config_path, auto_update)
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1348,6 +1379,12 @@ def init(
             if refresh_existing:
                 console.print(
                     f"[red]Error:[/red] Failed to refresh project configuration: {e}"
+                )
+                raise typer.Exit(1) from e
+            if auto_update is not None:
+                console.print(
+                    "[red]Error:[/red] Failed to persist requested "
+                    f"automatic-update setting: {e}"
                 )
                 raise typer.Exit(1) from e
     else:
@@ -1381,7 +1418,6 @@ def init(
         try:
             from mapify_cli.config.project_config import (
                 apply_agent_memory_overrides,
-                apply_auto_update_override,
                 apply_compression_overrides,
                 apply_sofa_overrides,
                 write_default_config,
@@ -1397,7 +1433,7 @@ def init(
                     config_path, compression, compression_threshold
                 )
             if auto_update is not None:
-                apply_auto_update_override(config_path, auto_update)
+                _apply_verified_auto_update_override(config_path, auto_update)
             if sofa:
                 apply_sofa_overrides(config_path)
                 from mapify_cli.delivery.file_copier import merge_sofa_gitignore
@@ -1421,6 +1457,12 @@ def init(
             if refresh_existing:
                 console.print(
                     f"[red]Error:[/red] Failed to refresh project configuration: {e}"
+                )
+                raise typer.Exit(1) from e
+            if auto_update is not None:
+                console.print(
+                    "[red]Error:[/red] Failed to persist requested "
+                    f"automatic-update setting: {e}"
                 )
                 raise typer.Exit(1) from e
 
@@ -2037,11 +2079,7 @@ def internal_update(
     approve_major: str | None = typer.Option(None, "--approve-major"),
 ) -> None:
     """Run the machine-readable project update protocol used by MAP skills."""
-    from mapify_cli.auto_update import UpdateMode, UpdateStatus, check_and_update
-
-    try:
-        parsed_mode = UpdateMode(mode)
-    except ValueError:
+    if mode not in {"automatic", "manual"}:
         try:
             _write_internal_update_json(
                 {
@@ -2053,6 +2091,7 @@ def internal_update(
             pass
         raise typer.Exit(1) from None
 
+    automatic = mode == "automatic"
     try:
         # The internal protocol owns presentation. Suppress incidental warnings,
         # prints, and library diagnostics, then emit at most one JSON object.
@@ -2060,23 +2099,46 @@ def internal_update(
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
+            from mapify_cli.auto_update import (
+                UpdateMode,
+                UpdateStatus,
+                check_and_update,
+            )
+
+            parsed_mode = UpdateMode(mode)
+            resolved_project = project.resolve()
             result = check_and_update(
-                project.resolve(),
+                resolved_project,
                 current_version=__version__,
                 mode=parsed_mode,
                 approved_major=approve_major,
             )
-        is_error = result.status is UpdateStatus.ERROR
-        if parsed_mode is UpdateMode.AUTOMATIC and is_error:
-            return
-        _write_internal_update_json(result.to_dict())
+            is_error = result.status is UpdateStatus.ERROR
+            if automatic and is_error:
+                from mapify_cli.update_install import installed_providers
+
+                expected_providers = installed_providers(resolved_project)
+                completed_refresh = (
+                    result.installed_version is not None
+                    and result.reload_current_skill is True
+                    and bool(expected_providers)
+                    and tuple(result.refreshed_providers) == expected_providers
+                )
+                if not completed_refresh:
+                    return
+                payload = result.to_dict()
+                payload["status"] = UpdateStatus.UPDATED.value
+                payload.pop("message", None)
+            else:
+                payload = result.to_dict()
+        _write_internal_update_json(payload)
     except Exception as exc:  # noqa: BLE001 -- final presentation boundary
-        if parsed_mode is UpdateMode.AUTOMATIC:
+        if automatic:
             return
         _write_internal_update_failure(exc)
         raise typer.Exit(1) from None
 
-    if is_error:
+    if is_error and not automatic:
         raise typer.Exit(1)
 
 
