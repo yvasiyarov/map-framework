@@ -16,6 +16,7 @@ import ast
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -713,9 +714,9 @@ def test_vc3_cli_and_standalone_share_windows_mutex_identity(tmp_path: Path) -> 
     from mapify_cli.delivery import file_copier
 
     project_stat = os.stat(tmp_path, follow_symlinks=False)
-    assert sofa._windows_gitignore_mutex_name(
-        project_stat
-    ) == file_copier._windows_gitignore_mutex_name(project_stat)
+    name = sofa._windows_gitignore_mutex_name(project_stat)
+    assert name == file_copier._windows_gitignore_mutex_name(project_stat)
+    assert name.startswith("Global\\MapifyGitignore-")
 
 
 @pytest.mark.parametrize(
@@ -762,6 +763,387 @@ def test_vc3_windows_failure_never_leaves_unignored_project_lock(
         file_copier.merge_update_runtime_gitignore(tmp_path)
 
     assert not (tmp_path / ".map-gitignore.lock").exists()
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+@pytest.mark.parametrize("replacement_kind", ["directory", "outside-symlink"])
+def test_vc3_project_root_swap_cannot_mutate_replacement_or_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+    replacement_kind: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    project = tmp_path / "project"
+    project.mkdir()
+    moved_project = tmp_path / "moved-project"
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+    outside_sentinel = outside / "sentinel"
+    outside_sentinel.write_bytes(b"outside-sentinel\n")
+
+    if writer == "cli":
+        module = file_copier
+        operation = lambda: file_copier.merge_update_runtime_gitignore(project)
+        error = file_copier.UpdateRuntimeGitignoreSecurityError
+    else:
+        module = sofa
+        operation = lambda: sofa.ensure_sofa_gitignore(project)
+        error = sofa.SofaGitignoreSecurityError
+
+    real_read = module._read_safe_gitignore
+
+    def read_then_swap(path: Path, directory_fd: int | None):
+        result = real_read(path, directory_fd)
+        project.rename(moved_project)
+        if replacement_kind == "directory":
+            project.mkdir()
+        else:
+            project.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(module, "_read_safe_gitignore", read_then_swap)
+
+    with pytest.raises(error):
+        operation()
+
+    assert not (project / ".gitignore").exists()
+    assert not (moved_project / ".gitignore").exists()
+    assert not (outside / ".gitignore").exists()
+    assert outside_sentinel.read_bytes() == b"outside-sentinel\n"
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_platform_without_project_dir_fd_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    if writer == "cli":
+        monkeypatch.setattr(file_copier, "_CAN_USE_PROJECT_DIRECTORY_FD", False)
+        operation = lambda: file_copier.merge_update_runtime_gitignore(tmp_path)
+        error = file_copier.UpdateRuntimeGitignoreSecurityError
+    else:
+        monkeypatch.setattr(sofa, "_CAN_USE_PROJECT_DIRECTORY_FD", False)
+        operation = lambda: sofa.ensure_sofa_gitignore(tmp_path)
+        error = sofa.SofaGitignoreSecurityError
+
+    with pytest.raises(error, match="cannot pin project-relative"):
+        operation()
+
+    assert not (tmp_path / ".gitignore").exists()
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_windows_mutex_timeout_is_bounded_and_closes_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    module = file_copier if writer == "cli" else sofa
+    error = (
+        file_copier.UpdateRuntimeGitignoreSecurityError
+        if writer == "cli"
+        else sofa.SofaGitignoreSecurityError
+    )
+    create_mutex = MagicMock(return_value=17)
+    wait_for_single_object = MagicMock(return_value=0x00000102)
+    release_mutex = MagicMock(return_value=True)
+    close_handle = MagicMock(return_value=True)
+    kernel32 = MagicMock(
+        CreateMutexW=create_mutex,
+        WaitForSingleObject=wait_for_single_object,
+        ReleaseMutex=release_mutex,
+        CloseHandle=close_handle,
+    )
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = kernel32
+    fake_ctypes.get_last_error.return_value = 1460
+    fake_wintypes = MagicMock()
+    real_import_module = module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "ctypes":
+            return fake_ctypes
+        if name == "ctypes.wintypes":
+            return fake_wintypes
+        return real_import_module(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import_module)
+    project_stat = os.stat_result((stat.S_IFDIR | 0o755, 1, 2, 1, 0, 0, 0, 0, 0, 0))
+
+    with (
+        pytest.raises(error, match="timed out"),
+        module._windows_project_gitignore_mutex(project_stat),
+    ):
+        pytest.fail("a timed-out mutex must not enter the transaction")
+
+    wait_for_single_object.assert_called_once_with(
+        17, module._WINDOWS_GITIGNORE_MUTEX_TIMEOUT_MS
+    )
+    release_mutex.assert_not_called()
+    close_handle.assert_called_once_with(17)
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+@pytest.mark.parametrize("wait_result", [0x00000000, 0x00000080])
+def test_vc3_windows_mutex_success_and_abandonment_release_and_close(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+    wait_result: int,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    module = file_copier if writer == "cli" else sofa
+    create_mutex = MagicMock(return_value=23)
+    wait_for_single_object = MagicMock(return_value=wait_result)
+    release_mutex = MagicMock(return_value=True)
+    close_handle = MagicMock(return_value=True)
+    kernel32 = MagicMock(
+        CreateMutexW=create_mutex,
+        WaitForSingleObject=wait_for_single_object,
+        ReleaseMutex=release_mutex,
+        CloseHandle=close_handle,
+    )
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = kernel32
+    fake_wintypes = MagicMock()
+    real_import_module = module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "ctypes":
+            return fake_ctypes
+        if name == "ctypes.wintypes":
+            return fake_wintypes
+        return real_import_module(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import_module)
+    project_stat = os.stat_result((stat.S_IFDIR | 0o755, 1, 2, 1, 0, 0, 0, 0, 0, 0))
+
+    with module._windows_project_gitignore_mutex(project_stat):
+        pass
+
+    wait_for_single_object.assert_called_once_with(
+        23, module._WINDOWS_GITIGNORE_MUTEX_TIMEOUT_MS
+    )
+    release_mutex.assert_called_once_with(23)
+    close_handle.assert_called_once_with(23)
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("wait", "WaitForSingleObject failed (WinError 111)"),
+        ("release", "ReleaseMutex failed (WinError 222)"),
+        ("close", "CloseHandle failed (WinError 333)"),
+    ],
+)
+def test_vc3_windows_mutex_failures_capture_error_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+    failure: str,
+    expected: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    module = file_copier if writer == "cli" else sofa
+    error = (
+        file_copier.UpdateRuntimeGitignoreSecurityError
+        if writer == "cli"
+        else sofa.SofaGitignoreSecurityError
+    )
+    create_mutex = MagicMock(return_value=29)
+    wait_for_single_object = MagicMock(
+        return_value=0xFFFFFFFF if failure == "wait" else 0x00000000
+    )
+    release_mutex = MagicMock(return_value=failure != "release")
+    close_handle = MagicMock(return_value=failure != "close")
+    kernel32 = MagicMock(
+        CreateMutexW=create_mutex,
+        WaitForSingleObject=wait_for_single_object,
+        ReleaseMutex=release_mutex,
+        CloseHandle=close_handle,
+    )
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = kernel32
+    fake_ctypes.get_last_error.return_value = {
+        "wait": 111,
+        "release": 222,
+        "close": 333,
+    }[failure]
+    fake_wintypes = MagicMock()
+    real_import_module = module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "ctypes":
+            return fake_ctypes
+        if name == "ctypes.wintypes":
+            return fake_wintypes
+        return real_import_module(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import_module)
+    project_stat = os.stat_result((stat.S_IFDIR | 0o755, 1, 2, 1, 0, 0, 0, 0, 0, 0))
+
+    with (
+        pytest.raises(error, match=re.escape(expected)),
+        module._windows_project_gitignore_mutex(project_stat),
+    ):
+        if failure == "wait":
+            pytest.fail("a failed wait must not enter the transaction")
+
+    if failure == "wait":
+        release_mutex.assert_not_called()
+    else:
+        release_mutex.assert_called_once_with(29)
+    close_handle.assert_called_once_with(29)
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_windows_mutex_create_failure_refuses_session_local_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    module = file_copier if writer == "cli" else sofa
+    error = (
+        file_copier.UpdateRuntimeGitignoreSecurityError
+        if writer == "cli"
+        else sofa.SofaGitignoreSecurityError
+    )
+    create_mutex = MagicMock(return_value=0)
+    wait_for_single_object = MagicMock()
+    release_mutex = MagicMock()
+    close_handle = MagicMock()
+    kernel32 = MagicMock(
+        CreateMutexW=create_mutex,
+        WaitForSingleObject=wait_for_single_object,
+        ReleaseMutex=release_mutex,
+        CloseHandle=close_handle,
+    )
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = kernel32
+    fake_ctypes.get_last_error.return_value = 5
+    fake_wintypes = MagicMock()
+    real_import_module = module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "ctypes":
+            return fake_ctypes
+        if name == "ctypes.wintypes":
+            return fake_wintypes
+        return real_import_module(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import_module)
+    project_stat = os.stat_result((stat.S_IFDIR | 0o755, 1, 2, 1, 0, 0, 0, 0, 0, 0))
+
+    with (
+        pytest.raises(error, match="refusing a session-local fallback"),
+        module._windows_project_gitignore_mutex(project_stat),
+    ):
+        pytest.fail("a missing global mutex must fail closed")
+
+    wait_for_single_object.assert_not_called()
+    release_mutex.assert_not_called()
+    close_handle.assert_not_called()
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_windows_mutex_reports_release_and_close_failures_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    module = file_copier if writer == "cli" else sofa
+    error = (
+        file_copier.UpdateRuntimeGitignoreSecurityError
+        if writer == "cli"
+        else sofa.SofaGitignoreSecurityError
+    )
+    kernel32 = MagicMock()
+    kernel32.CreateMutexW.return_value = 37
+    kernel32.WaitForSingleObject.return_value = 0x00000000
+    kernel32.ReleaseMutex.return_value = False
+    kernel32.CloseHandle.return_value = False
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = kernel32
+    fake_ctypes.get_last_error.side_effect = [222, 333]
+    fake_wintypes = MagicMock()
+    real_import_module = module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "ctypes":
+            return fake_ctypes
+        if name == "ctypes.wintypes":
+            return fake_wintypes
+        return real_import_module(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import_module)
+    project_stat = os.stat_result((stat.S_IFDIR | 0o755, 1, 2, 1, 0, 0, 0, 0, 0, 0))
+
+    with (
+        pytest.raises(
+            error,
+            match=(
+                "ReleaseMutex failed \\(WinError 222\\); "
+                "CloseHandle failed \\(WinError 333\\)"
+            ),
+        ),
+        module._windows_project_gitignore_mutex(project_stat),
+    ):
+        pass
+
+    assert fake_ctypes.get_last_error.call_count == 2
+    kernel32.CloseHandle.assert_called_once_with(37)
+
+
+@pytest.mark.parametrize("writer", ["cli", "standalone"])
+def test_vc3_windows_project_pin_denies_delete_sharing_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    from mapify_cli.delivery import file_copier
+
+    module = file_copier if writer == "cli" else sofa
+    create_file = MagicMock(return_value=41)
+    close_handle = MagicMock(return_value=True)
+    kernel32 = MagicMock(CreateFileW=create_file, CloseHandle=close_handle)
+    fake_ctypes = MagicMock()
+    fake_ctypes.WinDLL.return_value = kernel32
+
+    class FakeHandle:
+        def __init__(self, value: int):
+            self.value = (2**64 - 1) if value == -1 else value
+
+    fake_wintypes = MagicMock()
+    fake_wintypes.HANDLE = FakeHandle
+    real_import_module = module.importlib.import_module
+
+    def fake_import_module(name: str):
+        if name == "ctypes":
+            return fake_ctypes
+        if name == "ctypes.wintypes":
+            return fake_wintypes
+        return real_import_module(name)
+
+    monkeypatch.setattr(module.importlib, "import_module", fake_import_module)
+    project_original = os.stat(tmp_path, follow_symlinks=False)
+
+    with module._windows_pinned_project_root(tmp_path, project_original):
+        pass
+
+    args = create_file.call_args.args
+    assert args[2] == 0x00000003
+    assert args[2] & 0x00000004 == 0
+    assert args[5] == 0x02200000
+    close_handle.assert_called_once_with(41)
 
 
 @pytest.mark.parametrize("writer", ["cli", "standalone"])
@@ -954,21 +1336,24 @@ def test_vc3_secure_merge_closes_temp_before_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_mkstemp = sofa.tempfile.mkstemp
+    real_create_temporary = sofa._create_gitignore_temporary
     real_replace = sofa.os.replace
     captured_descriptor: dict[str, int] = {}
 
-    def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
-        descriptor, temporary_name = real_mkstemp(*args, **kwargs)
+    def tracking_create_temporary(
+        gitignore: Path,
+        directory_fd: int | None,
+    ) -> tuple[int, str | Path]:
+        descriptor, temporary_name = real_create_temporary(gitignore, directory_fd)
         captured_descriptor["value"] = descriptor
         return descriptor, temporary_name
 
-    def replace_after_close(source: Path, destination: Path) -> None:
+    def replace_after_close(*args: object, **kwargs: object) -> None:
         with pytest.raises(OSError):
             os.fstat(captured_descriptor["value"])
-        real_replace(source, destination)
+        real_replace(*args, **kwargs)
 
-    monkeypatch.setattr(sofa.tempfile, "mkstemp", tracking_mkstemp)
+    monkeypatch.setattr(sofa, "_create_gitignore_temporary", tracking_create_temporary)
     monkeypatch.setattr(sofa.os, "replace", replace_after_close)
 
     assert sofa.ensure_sofa_gitignore(tmp_path) is True
@@ -983,8 +1368,8 @@ def test_vc3_secure_merge_noop_rejects_post_read_swap(
     gitignore.write_text(_SAFE_SOFA_GITIGNORE, encoding="utf-8")
     real_read = sofa._read_safe_gitignore
 
-    def read_then_swap(path: Path):
-        existing, original = real_read(path)
+    def read_then_swap(path: Path, directory_fd: int | None):
+        existing, original = real_read(path, directory_fd)
         replacement = path.with_name("replacement.gitignore")
         replacement.write_bytes(existing)
         os.replace(replacement, path)

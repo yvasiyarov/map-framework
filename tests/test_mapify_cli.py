@@ -397,8 +397,8 @@ class TestInitCommand:
         )
         real_read = file_copier._read_safe_gitignore
 
-        def read_then_swap(path: Path):
-            existing, original = real_read(path)
+        def read_then_swap(path: Path, directory_fd: int | None):
+            existing, original = real_read(path, directory_fd)
             replacement = path.with_name("replacement.gitignore")
             replacement.write_bytes(existing)
             os.replace(replacement, path)
@@ -921,31 +921,42 @@ class TestInitCommand:
     ) -> None:
         from mapify_cli.delivery import file_copier
 
-        real_mkstemp = file_copier.tempfile.mkstemp
+        real_create_temporary = file_copier._create_gitignore_temporary
         real_replace = file_copier.os.replace
         captured_descriptor: dict[str, int] = {}
 
-        def tracking_mkstemp(
-            suffix: str | None = None,
-            prefix: str | None = None,
-            dir: str | os.PathLike[str] | None = None,
-            text: bool = False,
-        ) -> tuple[int, str]:
-            descriptor, temporary_name = real_mkstemp(
-                suffix=suffix,
-                prefix=prefix,
-                dir=dir,
-                text=text,
-            )
+        def tracking_create_temporary(
+            gitignore: Path,
+            directory_fd: int | None,
+        ) -> tuple[int, str | Path]:
+            descriptor, temporary_name = real_create_temporary(gitignore, directory_fd)
             captured_descriptor["value"] = descriptor
             return descriptor, temporary_name
 
-        def replace_after_close(source: Path, destination: Path) -> None:
+        def replace_after_close(
+            source: str | Path,
+            destination: str | Path,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
             with pytest.raises(OSError):
                 os.fstat(captured_descriptor["value"])
-            real_replace(source, destination)
+            if src_dir_fd is None and dst_dir_fd is None:
+                real_replace(source, destination)
+            else:
+                real_replace(
+                    source,
+                    destination,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
 
-        monkeypatch.setattr(file_copier.tempfile, "mkstemp", tracking_mkstemp)
+        monkeypatch.setattr(
+            file_copier,
+            "_create_gitignore_temporary",
+            tracking_create_temporary,
+        )
         monkeypatch.setattr(file_copier.os, "replace", replace_after_close)
 
         changed = file_copier.merge_update_runtime_gitignore(tmp_path)

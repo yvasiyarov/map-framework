@@ -7,8 +7,10 @@ import errno
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
+import secrets
 import shutil
 import stat
 import tempfile
@@ -508,6 +510,7 @@ _UPDATE_RUNTIME_GITIGNORE_PATHS = (
     ".map/provider-refresh.lock",
     ".map/installer.lock",
 )
+_WINDOWS_GITIGNORE_MUTEX_TIMEOUT_MS = 30_000
 
 
 class UpdateRuntimeGitignoreSecurityError(RuntimeError):
@@ -550,6 +553,27 @@ def _validate_project_root_unchanged(
         _unsafe_gitignore_lock(project_root, "the project root changed")
 
 
+def _replace_supports_directory_fds() -> bool:
+    """Return whether ``os.replace`` accepts pinned directory descriptors."""
+    try:
+        parameters = inspect.signature(os.replace).parameters
+    except (TypeError, ValueError):
+        return False
+    return "src_dir_fd" in parameters and "dst_dir_fd" in parameters
+
+
+_CAN_USE_PROJECT_DIRECTORY_FD = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and _replace_supports_directory_fds()
+)
+
+
+def _supports_pinned_project_root() -> bool:
+    return _CAN_USE_PROJECT_DIRECTORY_FD
+
+
 def _gitignore_lock_path_for_stat(
     project_root: Path,
     project_stat: os.stat_result,
@@ -572,7 +596,7 @@ def _gitignore_lock_path_for_stat(
 def _windows_gitignore_mutex_name(project_stat: os.stat_result) -> str:
     identity = f"{project_stat.st_dev}:{project_stat.st_ino}".encode("ascii")
     digest = hashlib.sha256(identity).hexdigest()
-    return f"Local\\MapifyGitignore-{digest}"
+    return f"Global\\MapifyGitignore-{digest}"
 
 
 @contextlib.contextmanager
@@ -598,28 +622,141 @@ def _windows_project_gitignore_mutex(
 
     handle = create_mutex(None, False, _windows_gitignore_mutex_name(project_stat))
     if not handle:
+        create_error = ctypes.get_last_error()
         _unsafe_gitignore_lock(
             Path("<windows-mutex>"),
-            f"CreateMutexW failed ({ctypes.get_last_error()})",
+            "could not create or open the required cross-session mutex "
+            f"(WinError {create_error}); run MAP under one Windows account with "
+            "Global object access; refusing a session-local fallback",
         )
-    acquired = False
+    wait_result = wait_for_single_object(handle, _WINDOWS_GITIGNORE_MUTEX_TIMEOUT_MS)
+    if wait_result not in {0x00000000, 0x00000080}:
+        wait_error = ctypes.get_last_error() if wait_result == 0xFFFFFFFF else None
+        close_error = None
+        if not close_handle(handle):
+            close_error = ctypes.get_last_error()
+        if wait_result == 0x00000102:
+            reason = "the MAP .gitignore mutex timed out"
+        elif wait_result == 0xFFFFFFFF:
+            reason = f"WaitForSingleObject failed (WinError {wait_error})"
+        else:
+            reason = f"WaitForSingleObject returned unexpected status {wait_result:#x}"
+        if close_error is not None:
+            reason += f"; CloseHandle also failed (WinError {close_error})"
+        _unsafe_gitignore_lock(Path("<windows-mutex>"), reason)
     try:
-        wait_result = wait_for_single_object(handle, 0xFFFFFFFF)
-        if wait_result not in {0x00000000, 0x00000080}:
-            _unsafe_gitignore_lock(
-                Path("<windows-mutex>"),
-                f"WaitForSingleObject failed ({ctypes.get_last_error()})",
-            )
-        acquired = True
         yield
     finally:
-        if acquired and not release_mutex(handle):
-            close_handle(handle)
+        release_error = None
+        if not release_mutex(handle):
+            release_error = ctypes.get_last_error()
+        close_error = None
+        if not close_handle(handle):
+            close_error = ctypes.get_last_error()
+        if release_error is not None or close_error is not None:
+            failures: list[str] = []
+            if release_error is not None:
+                failures.append(f"ReleaseMutex failed (WinError {release_error})")
+            if close_error is not None:
+                failures.append(f"CloseHandle failed (WinError {close_error})")
+            _unsafe_gitignore_lock(Path("<windows-mutex>"), "; ".join(failures))
+
+
+@contextlib.contextmanager
+def _windows_pinned_project_root(
+    project_root: Path,
+    project_original: os.stat_result,
+) -> Iterator[None]:
+    """Prevent replacement of a Windows project directory during mutation."""
+    ctypes: Any = importlib.import_module("ctypes")
+    wintypes: Any = importlib.import_module("ctypes.wintypes")
+    kernel32: Any = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    # FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING,
+    # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT. Deliberately
+    # omitting FILE_SHARE_DELETE prevents a rename/replacement while held.
+    handle = create_file(
+        str(project_root),
+        0x00000080,
+        0x00000003,
+        None,
+        3,
+        0x02200000,
+        None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if not handle or handle == invalid_handle:
+        _unsafe_gitignore_lock(
+            project_root,
+            f"could not pin the Windows project root ({ctypes.get_last_error()})",
+        )
+    try:
+        _validate_project_root_unchanged(project_root, project_original)
+        yield
+    finally:
+        if not close_handle(handle):
+            close_error = ctypes.get_last_error()
             _unsafe_gitignore_lock(
-                Path("<windows-mutex>"),
-                f"ReleaseMutex failed ({ctypes.get_last_error()})",
+                project_root,
+                f"CloseHandle failed for the project root (WinError {close_error})",
             )
-        close_handle(handle)
+
+
+@contextlib.contextmanager
+def _pinned_project_root(
+    project_root: Path,
+    project_original: os.stat_result,
+) -> Iterator[int | None]:
+    """Pin the project identity used by every relative .gitignore operation."""
+    if os.name == "nt":
+        with _windows_pinned_project_root(project_root, project_original):
+            yield None
+        return
+    if not _supports_pinned_project_root():
+        _unsafe_gitignore_lock(
+            project_root,
+            "this platform cannot pin project-relative file operations",
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(project_root, flags)
+    except OSError as exc:
+        _unsafe_gitignore_lock(project_root, f"could not pin the project root ({exc})")
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            project_original.st_dev,
+            project_original.st_ino,
+        ):
+            _unsafe_gitignore_lock(
+                project_root, "the project root changed while opening"
+            )
+        _validate_project_root_unchanged(project_root, project_original)
+        yield descriptor
+    finally:
+        os.close(descriptor)
 
 
 def _gitignore_lock_path(project_root: Path) -> Path:
@@ -739,39 +876,52 @@ def _unlock_descriptor(descriptor: int) -> None:
 
 
 @contextlib.contextmanager
-def _project_gitignore_lock(project_root: Path) -> Iterator[None]:
+def _project_gitignore_lock(
+    project_root: Path,
+) -> Iterator[tuple[int | None, os.stat_result]]:
     """Serialize a complete MAP-owned root .gitignore transaction."""
     project_original = _validated_project_root_stat(project_root)
-    if _uses_windows_gitignore_mutex():
-        with _windows_project_gitignore_mutex(project_original):
+    with _pinned_project_root(project_root, project_original) as directory_fd:
+        if _uses_windows_gitignore_mutex():
+            with _windows_project_gitignore_mutex(project_original):
+                _validate_project_root_unchanged(project_root, project_original)
+                yield directory_fd, project_original
+                _validate_project_root_unchanged(project_root, project_original)
+            return
+        lock_path = _gitignore_lock_path_for_stat(project_root, project_original)
+        descriptor = _open_gitignore_lock(lock_path)
+        locked = False
+        try:
+            _lock_descriptor(descriptor)
+            locked = True
+            opened = os.fstat(descriptor)
+            _validate_lock_stat(lock_path, opened)
+            current = _required_lock_stat(lock_path)
+            if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                _unsafe_gitignore_lock(lock_path, "the path changed while waiting")
             _validate_project_root_unchanged(project_root, project_original)
-            yield
+            yield directory_fd, project_original
             _validate_project_root_unchanged(project_root, project_original)
-        return
-    lock_path = _gitignore_lock_path_for_stat(project_root, project_original)
-    descriptor = _open_gitignore_lock(lock_path)
-    locked = False
-    try:
-        _lock_descriptor(descriptor)
-        locked = True
-        opened = os.fstat(descriptor)
-        _validate_lock_stat(lock_path, opened)
-        current = _required_lock_stat(lock_path)
-        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
-            _unsafe_gitignore_lock(lock_path, "the path changed while waiting")
-        _validate_project_root_unchanged(project_root, project_original)
-        yield
-        _validate_project_root_unchanged(project_root, project_original)
-    finally:
-        if locked:
-            _unlock_descriptor(descriptor)
-        os.close(descriptor)
+        finally:
+            if locked:
+                _unlock_descriptor(descriptor)
+            os.close(descriptor)
 
 
-def _validated_gitignore_stat(gitignore: Path) -> os.stat_result | None:
+def _validated_gitignore_stat(
+    gitignore: Path,
+    directory_fd: int | None,
+) -> os.stat_result | None:
     """Return a safe direct-child .gitignore stat, or None when absent."""
     try:
-        current = os.lstat(gitignore)
+        if directory_fd is None:
+            current = os.lstat(gitignore)
+        else:
+            current = os.stat(
+                gitignore.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
     except FileNotFoundError:
         return None
     if stat.S_ISLNK(current.st_mode):
@@ -785,21 +935,25 @@ def _validated_gitignore_stat(gitignore: Path) -> os.stat_result | None:
 
 def _read_safe_gitignore(
     gitignore: Path,
+    directory_fd: int | None,
 ) -> tuple[bytes, os.stat_result | None]:
     """Read .gitignore without following links and retain its identity."""
-    initial = _validated_gitignore_stat(gitignore)
+    initial = _validated_gitignore_stat(gitignore, directory_fd)
     if initial is None:
         return b"", None
 
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(gitignore, flags)
+        if directory_fd is None:
+            descriptor = os.open(gitignore, flags)
+        else:
+            descriptor = os.open(gitignore.name, flags, dir_fd=directory_fd)
     except OSError as exc:
         _unsafe_project_gitignore(gitignore, f"could not open it safely ({exc})")
 
     try:
         opened = os.fstat(descriptor)
-        current = _validated_gitignore_stat(gitignore)
+        current = _validated_gitignore_stat(gitignore, directory_fd)
         if current is None or (
             opened.st_dev,
             opened.st_ino,
@@ -819,9 +973,10 @@ def _read_safe_gitignore(
 def _validate_gitignore_unchanged(
     gitignore: Path,
     original: os.stat_result | None,
+    directory_fd: int | None,
 ) -> None:
     """Reject a target created or swapped after the initial safe read."""
-    current = _validated_gitignore_stat(gitignore)
+    current = _validated_gitignore_stat(gitignore, directory_fd)
     if original is None:
         if current is not None:
             _unsafe_project_gitignore(gitignore, "the path appeared during the update")
@@ -833,19 +988,52 @@ def _validate_gitignore_unchanged(
         _unsafe_project_gitignore(gitignore, "the path changed during the update")
 
 
+def _create_gitignore_temporary(
+    gitignore: Path,
+    directory_fd: int | None,
+) -> tuple[int, str | Path]:
+    if directory_fd is None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=gitignore.parent,
+            prefix=".gitignore.",
+            suffix=".tmp",
+        )
+        return descriptor, Path(temporary_name)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for _ in range(32):
+        temporary_name = f".gitignore.{secrets.token_hex(12)}.tmp"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        return descriptor, temporary_name
+    raise FileExistsError("could not allocate a private .gitignore temporary file")
+
+
 def _atomic_replace_gitignore(
     gitignore: Path,
     content: bytes,
     original: os.stat_result | None,
+    directory_fd: int | None,
+    project_root: Path,
+    project_original: os.stat_result,
 ) -> None:
     """Durably prepare a replacement, then atomically install it."""
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=gitignore.parent,
-        prefix=".gitignore.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
+    _validate_project_root_unchanged(project_root, project_original)
+    descriptor, temporary = _create_gitignore_temporary(gitignore, directory_fd)
     try:
+        _validate_project_root_unchanged(project_root, project_original)
         mode = stat.S_IMODE(original.st_mode) if original is not None else 0o644
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, mode)
@@ -860,13 +1048,25 @@ def _atomic_replace_gitignore(
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        _validate_gitignore_unchanged(gitignore, original)
-        os.replace(temporary, gitignore)
+        _validate_project_root_unchanged(project_root, project_original)
+        _validate_gitignore_unchanged(gitignore, original, directory_fd)
+        if directory_fd is None:
+            os.replace(temporary, gitignore)
+        else:
+            os.replace(
+                temporary,
+                gitignore.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         try:
-            temporary.unlink()
+            if directory_fd is None:
+                Path(temporary).unlink()
+            else:
+                os.unlink(temporary, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
 
@@ -897,6 +1097,8 @@ def _has_gitignore_marker(lines: list[bytes], marker: str) -> bool:
 
 def _merge_project_gitignore_locked(
     project_root: Path,
+    directory_fd: int | None,
+    project_original: os.stat_result,
     *,
     include_runtime: bool = False,
     include_sofa: bool = False,
@@ -905,7 +1107,8 @@ def _merge_project_gitignore_locked(
 ) -> int:
     """Append selected MAP-owned blocks while the shared lock is held."""
     gitignore = project_root / ".gitignore"
-    existing, original = _read_safe_gitignore(gitignore)
+    existing, original = _read_safe_gitignore(gitignore, directory_fd)
+    _validate_project_root_unchanged(project_root, project_original)
     existing_lines = existing.splitlines()
 
     additions: list[bytes] = []
@@ -957,11 +1160,18 @@ def _merge_project_gitignore_locked(
     )
 
     if not additions:
-        _validate_gitignore_unchanged(gitignore, original)
+        _validate_gitignore_unchanged(gitignore, original, directory_fd)
         return 0
     separator = b"" if not existing or existing.endswith(b"\n") else b"\n"
     replacement = existing + separator + b"".join(additions)
-    _atomic_replace_gitignore(gitignore, replacement, original)
+    _atomic_replace_gitignore(
+        gitignore,
+        replacement,
+        original,
+        directory_fd,
+        project_root,
+        project_original,
+    )
     return 1
 
 
@@ -977,9 +1187,11 @@ def _merge_project_gitignore(
     project_root = project_path.resolve(strict=True)
     if not project_root.is_dir():
         raise NotADirectoryError(f"MAP project root is not a directory: {project_root}")
-    with _project_gitignore_lock(project_root):
+    with _project_gitignore_lock(project_root) as (directory_fd, project_original):
         return _merge_project_gitignore_locked(
             project_root,
+            directory_fd,
+            project_original,
             include_runtime=include_runtime,
             include_sofa=include_sofa,
             include_agent_memory_local=include_agent_memory_local,
