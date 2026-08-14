@@ -569,15 +569,20 @@ def _atomic_replace_gitignore(
     temporary = Path(temporary_name)
     try:
         mode = stat.S_IMODE(original.st_mode) if original is not None else 0o644
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, mode)
+        else:
+            os.chmod(temporary, mode)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
             stream.write(content)
             stream.flush()
-            os.fsync(descriptor)
+            os.fsync(stream.fileno())
         _validate_gitignore_unchanged(gitignore, original)
         os.replace(temporary, gitignore)
     finally:
-        os.close(descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
             temporary.unlink()
         except FileNotFoundError:

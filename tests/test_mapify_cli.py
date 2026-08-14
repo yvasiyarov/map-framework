@@ -337,6 +337,62 @@ class TestInitCommand:
         assert "unsafe project .gitignore" in result.stdout
         assert gitignore.is_dir()
 
+    @pytest.mark.parametrize(
+        ("provider", "extra_args"),
+        [
+            ("codex", ["--sofa"]),
+            ("claude", ["--agent-memory", "local"]),
+            ("claude", ["--autonomy"]),
+        ],
+    )
+    @pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+    def test_init_rejects_unsafe_gitignore_before_flag_specific_writers(
+        self,
+        tmp_path: Path,
+        provider: str,
+        extra_args: list[str],
+        attack: str,
+    ) -> None:
+        if attack == "hardlink" and os.name == "nt":
+            pytest.skip("POSIX hardlink security contract")
+        os.chdir(tmp_path)
+        outside = tmp_path / "outside-flag-gitignore"
+        outside.write_bytes(b"outside-flag-sentinel\n")
+        outside.chmod(0o640)
+        gitignore = tmp_path / ".gitignore"
+        if attack == "symlink":
+            gitignore.symlink_to(outside)
+        else:
+            try:
+                os.link(outside, gitignore)
+            except (NotImplementedError, OSError) as exc:
+                pytest.skip(f"hardlinks unavailable: {exc}")
+
+        result = runner.invoke(
+            app,
+            [
+                "init",
+                ".",
+                "--force",
+                "--no-git",
+                "--mcp",
+                "none",
+                "--provider",
+                provider,
+                *extra_args,
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "unsafe project .gitignore" in result.stdout
+        assert outside.read_bytes() == b"outside-flag-sentinel\n"
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+        if attack == "symlink":
+            assert gitignore.is_symlink()
+        else:
+            assert os.path.samefile(gitignore, outside)
+            assert outside.stat().st_nlink == 2
+
     def test_update_runtime_gitignore_replace_failure_preserves_file(
         self,
         tmp_path: Path,
@@ -359,6 +415,51 @@ class TestInitCommand:
         assert gitignore.read_bytes() == b"user-rule/\n"
         assert stat.S_IMODE(gitignore.stat().st_mode) == 0o640
         assert list(tmp_path.glob(".gitignore.*.tmp")) == []
+
+    def test_update_runtime_gitignore_supports_platform_without_fchmod(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mapify_cli.delivery import file_copier
+
+        monkeypatch.delattr(file_copier.os, "fchmod", raising=False)
+
+        changed = file_copier.merge_update_runtime_gitignore(tmp_path)
+
+        assert changed == 1
+        assert ".map/provider-refresh.lock" in (
+            tmp_path / ".gitignore"
+        ).read_text(encoding="utf-8").splitlines()
+
+    def test_update_runtime_gitignore_closes_temp_before_replace(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from mapify_cli.delivery import file_copier
+
+        real_mkstemp = file_copier.tempfile.mkstemp
+        real_replace = file_copier.os.replace
+        captured_descriptor: dict[str, int] = {}
+
+        def tracking_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+            descriptor, temporary_name = real_mkstemp(*args, **kwargs)
+            captured_descriptor["value"] = descriptor
+            return descriptor, temporary_name
+
+        def replace_after_close(source: Path, destination: Path) -> None:
+            with pytest.raises(OSError):
+                os.fstat(captured_descriptor["value"])
+            real_replace(source, destination)
+
+        monkeypatch.setattr(file_copier.tempfile, "mkstemp", tracking_mkstemp)
+        monkeypatch.setattr(file_copier.os, "replace", replace_after_close)
+
+        changed = file_copier.merge_update_runtime_gitignore(tmp_path)
+
+        assert changed == 1
+        assert (tmp_path / ".gitignore").is_file()
 
     def test_init_auto_update_reenables_existing_project(self, tmp_path: Path) -> None:
         os.chdir(tmp_path)

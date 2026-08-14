@@ -1388,6 +1388,30 @@ def init(
 
         tracker.complete("mcp-select", f"{len(selected_mcp_servers)} servers")
 
+    # Validate and merge the root ignore file before provider installation or
+    # any opt-in feature can reach its older flag-specific .gitignore writer.
+    # This stays after the user's non-empty-directory confirmation, so a
+    # declined init remains mutation-free.
+    from mapify_cli.delivery.file_copier import (
+        UpdateRuntimeGitignoreSecurityError,
+        merge_update_runtime_gitignore,
+    )
+
+    try:
+        merge_update_runtime_gitignore(project_path)
+    except UpdateRuntimeGitignoreSecurityError as exc:
+        console.print(
+            "[red]Error:[/red] unsafe project .gitignore was rejected. "
+            f"Remove the unsafe path and retry mapify init. Details: {exc}"
+        )
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        console.print(
+            "[red]Error:[/red] Failed to update the project .gitignore for "
+            f"automatic-update runtime files: {exc}"
+        )
+        raise typer.Exit(1) from exc
+
     if provider == "codex":
         # Codex provider: install .agents/.codex files + .map/scripts/ (skip-if-exists)
         from mapify_cli.delivery.providers import CodexProvider
@@ -1549,29 +1573,6 @@ def init(
         tracker.start("project-permissions")
         create_or_merge_project_settings_local(project_path, autonomy=autonomy)
         tracker.complete("project-permissions", ".claude/settings.local.json")
-
-    # Automatic-update state and both serialization locks are persistent local
-    # runtime files. Keep them out of Git for new and refreshed projects without
-    # replacing user-managed ignore rules.
-    from mapify_cli.delivery.file_copier import (
-        UpdateRuntimeGitignoreSecurityError,
-        merge_update_runtime_gitignore,
-    )
-
-    try:
-        merge_update_runtime_gitignore(project_path)
-    except UpdateRuntimeGitignoreSecurityError as exc:
-        console.print(
-            "[red]Error:[/red] unsafe project .gitignore was rejected. "
-            f"Remove the unsafe path and retry mapify init. Details: {exc}"
-        )
-        raise typer.Exit(1) from exc
-    except Exception as exc:
-        console.print(
-            "[red]Error:[/red] Failed to update the project .gitignore for "
-            f"automatic-update runtime files: {exc}"
-        )
-        raise typer.Exit(1) from exc
 
     # Initialize git (shared, provider-agnostic)
     if not no_git and git_available:
