@@ -198,10 +198,15 @@ def _build_entry_from_file(
     Returns None when the file has no MAP-MANAGED metadata (unmanaged).
     Skips symlinks to avoid following them (security invariant).
     """
-    if abs_path.is_symlink():
+    try:
+        project_root = project_path.resolve(strict=True)
+        rel_str = abs_path.relative_to(project_root).as_posix()
+    except (OSError, ValueError):
+        return None
+    safe_path = _safe_project_candidate(project_root, rel_str)
+    if safe_path is None:
         return None  # AGENTS.md may be a symlink to CLAUDE.md
-
-    rel_str = abs_path.relative_to(project_path).as_posix()
+    abs_path = safe_path
 
     # Local-only files are excluded from the committed manifest
     if rel_str in _LOCAL_ONLY_RELPATHS:
@@ -255,8 +260,8 @@ def _build_entry_from_file(
 def _scan_dir(project_path: Path, rel_dir: str) -> list[ManifestEntry]:
     """Recursively scan a directory for MAP-managed files."""
     entries: list[ManifestEntry] = []
-    abs_dir = project_path / rel_dir
-    if not abs_dir.is_dir():
+    abs_dir = _safe_project_candidate(project_path, rel_dir)
+    if abs_dir is None or not abs_dir.is_dir():
         return entries
     for abs_path in sorted(abs_dir.rglob("*")):
         if not abs_path.is_file():
@@ -271,7 +276,10 @@ def _scan_dir(project_path: Path, rel_dir: str) -> list[ManifestEntry]:
 
 def _scan_file(project_path: Path, rel_file: str) -> ManifestEntry | None:
     """Scan a single known file path."""
-    return _build_entry_from_file(project_path, project_path / rel_file)
+    abs_path = _safe_project_candidate(project_path, rel_file)
+    if abs_path is None:
+        return None
+    return _build_entry_from_file(project_path, abs_path)
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +305,10 @@ def _scan_mcp_config_entries(
     except ImportError:
         return []
 
-    mcp_data = read_project_mcp_json(project_path / ".mcp.json")
+    mcp_json_path = _safe_project_candidate(project_path, ".mcp.json")
+    if mcp_json_path is None:
+        return []
+    mcp_data = read_project_mcp_json(mcp_json_path)
     if not mcp_data:
         return []
 
@@ -325,8 +336,10 @@ def _scan_statusline_config_entry(
     substring is the ownership marker.  No absolute path is stored in
     the manifest — only the key path (``statusLine``).
     """
-    settings_local = project_path / ".claude" / "settings.local.json"
-    if not settings_local.is_file() or settings_local.is_symlink():
+    settings_local = _safe_project_candidate(
+        project_path, ".claude/settings.local.json"
+    )
+    if settings_local is None or not settings_local.is_file():
         return None
     try:
         data = json.loads(settings_local.read_text(encoding="utf-8"))
@@ -369,7 +382,12 @@ def _remove_mcp_server(project_path: Path, server_name: str) -> bool:
     except ImportError:
         return False
 
-    mcp_json_path = project_path / ".mcp.json"
+    standard_servers = build_standard_mcp_servers()
+    if server_name not in standard_servers:
+        return False
+    mcp_json_path = _safe_project_candidate(project_path, ".mcp.json")
+    if mcp_json_path is None:
+        return False
     mcp_data = read_project_mcp_json(mcp_json_path)
     if not mcp_data:
         return False
@@ -378,13 +396,16 @@ def _remove_mcp_server(project_path: Path, server_name: str) -> bool:
     if server_name not in servers:
         return False  # already gone
 
-    expected = build_standard_mcp_servers().get(server_name)
+    expected = standard_servers[server_name]
     if servers[server_name] != expected:
         return False  # user-modified: refuse to remove
 
     del servers[server_name]
     mcp_data["mcpServers"] = servers
-    write_project_mcp_json(mcp_json_path, mcp_data)
+    safe_write_path = _safe_project_candidate(project_path, ".mcp.json")
+    if safe_write_path is None:
+        return False
+    write_project_mcp_json(safe_write_path, mcp_data)
     return True
 
 
@@ -394,8 +415,10 @@ def _remove_statusline(project_path: Path, rel_file: str) -> bool:
     Only removes when the command contains ``map-statusline.py``.
     Returns True when removed; False when absent or user-defined.
     """
-    settings_path = project_path / rel_file
-    if not settings_path.is_file() or settings_path.is_symlink():
+    if rel_file != ".claude/settings.local.json":
+        return False
+    settings_path = _safe_project_candidate(project_path, rel_file)
+    if settings_path is None or not settings_path.is_file():
         return False
     try:
         data = json.loads(settings_path.read_text(encoding="utf-8"))
@@ -411,7 +434,10 @@ def _remove_statusline(project_path: Path, rel_file: str) -> bool:
         return False  # user-defined statusline: refuse to remove
 
     del data["statusLine"]
-    settings_path.write_text(
+    safe_write_path = _safe_project_candidate(project_path, rel_file)
+    if safe_write_path is None:
+        return False
+    safe_write_path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     return True
@@ -439,12 +465,16 @@ def reconcile_config(project_path: Path) -> ReconcileResult:
 
         if entry.file == ".mcp.json" and entry.key_path.startswith("mcpServers."):
             server_name = entry.key_path[len("mcpServers."):]
+            mcp_json_path = _safe_project_candidate(project_path, entry.file)
+            if mcp_json_path is None:
+                result.missing.append(label)
+                continue
             try:
                 from mapify_cli.config.mcp import (
                     build_standard_mcp_servers,
                     read_project_mcp_json,
                 )
-                mcp_data = read_project_mcp_json(project_path / ".mcp.json")
+                mcp_data = read_project_mcp_json(mcp_json_path)
             except ImportError:
                 result.missing.append(label)
                 continue
@@ -453,13 +483,14 @@ def reconcile_config(project_path: Path) -> ReconcileResult:
                 result.missing.append(label)
             elif mcp_data["mcpServers"][server_name] != build_standard_mcp_servers().get(server_name):
                 result.skipped.append(label)
-            else:
-                _remove_mcp_server(project_path, server_name)
+            elif _remove_mcp_server(project_path, server_name):
                 result.removed.append(label)
+            else:
+                result.skipped.append(label)
 
         elif entry.key_path == "statusLine":
-            settings_path = project_path / entry.file
-            if not settings_path.is_file():
+            settings_path = _safe_project_candidate(project_path, entry.file)
+            if settings_path is None or not settings_path.is_file():
                 result.missing.append(label)
                 continue
             try:
@@ -473,9 +504,10 @@ def reconcile_config(project_path: Path) -> ReconcileResult:
                 result.missing.append(label)
             elif "map-statusline.py" not in sl.get("command", ""):
                 result.skipped.append(label)
-            else:
-                _remove_statusline(project_path, entry.file)
+            elif _remove_statusline(project_path, entry.file):
                 result.removed.append(label)
+            else:
+                result.skipped.append(label)
 
     return result
 
@@ -560,6 +592,37 @@ def _is_canonical_project_relative_path(value: str) -> bool:
     )
 
 
+def _safe_project_candidate(project_path: Path, relative: str) -> Path | None:
+    """Return a contained path only when no existing component is a symlink.
+
+    Rechecking this helper immediately before filesystem operations provides
+    defense in depth for the local-project-owner threat model. It cannot make
+    separate check/open calls atomic against a malicious concurrent process;
+    kernel-specific no-follow handles would be required for that stronger model.
+    """
+    if not _is_canonical_project_relative_path(relative):
+        return None
+    try:
+        project_root = project_path.resolve(strict=True)
+    except OSError:
+        return None
+    if not project_root.is_dir():
+        return None
+
+    candidate = project_root.joinpath(*PurePosixPath(relative).parts)
+    current = project_root
+    for part in PurePosixPath(relative).parts:
+        current /= part
+        if current.is_symlink():
+            return None
+    try:
+        resolved_candidate = candidate.resolve(strict=False)
+        resolved_candidate.relative_to(project_root)
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
 def _is_managed_destination(dest: str, providers: Sequence[str]) -> bool:
     """Return whether *dest* is emitted by one of the manifest's providers."""
     if not _is_canonical_project_relative_path(dest):
@@ -600,9 +663,14 @@ def _is_owned_config_pair(
 
 def write_manifest(project_path: Path, manifest: InstallManifest) -> Path:
     """Write the manifest to .map/mapify.lock.json and return the path."""
-    map_dir = project_path / ".map"
+    map_dir = _safe_project_candidate(project_path, ".map")
+    if map_dir is None:
+        raise OSError("Refusing to write manifest through a symlinked path")
     map_dir.mkdir(parents=True, exist_ok=True)
-    dest = map_dir / MANIFEST_FILENAME
+    map_dir = _safe_project_candidate(project_path, ".map")
+    dest = _safe_project_candidate(project_path, f".map/{MANIFEST_FILENAME}")
+    if map_dir is None or dest is None:
+        raise OSError("Refusing to write manifest through a symlinked path")
     data = asdict(manifest)
     fd, temp_name = tempfile.mkstemp(
         dir=map_dir,
@@ -615,7 +683,12 @@ def write_manifest(project_path: Path, manifest: InstallManifest) -> Path:
             temp_file.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             temp_file.flush()
             os.fsync(temp_file.fileno())
-        os.replace(temp_path, dest)
+        safe_dest = _safe_project_candidate(
+            project_path, f".map/{MANIFEST_FILENAME}"
+        )
+        if safe_dest is None:
+            raise OSError("Refusing to replace a symlinked manifest path")
+        os.replace(temp_path, safe_dest)
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
@@ -627,8 +700,8 @@ def read_manifest(project_path: Path) -> InstallManifest | None:
 
     Returns None when the manifest does not exist or cannot be parsed.
     """
-    path = project_path / ".map" / MANIFEST_FILENAME
-    if not path.exists():
+    path = _safe_project_candidate(project_path, f".map/{MANIFEST_FILENAME}")
+    if path is None or not path.exists():
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -697,6 +770,8 @@ def read_manifest(project_path: Path) -> InstallManifest | None:
             return None
         if not _is_managed_destination(raw_entry["dest"], providers):
             return None
+        if _safe_project_candidate(project_path, raw_entry["dest"]) is None:
+            return None
         entries.append(ManifestEntry(**raw_entry))
 
     raw_config = data.get("config_entries", [])
@@ -712,6 +787,8 @@ def read_manifest(project_path: Path) -> InstallManifest | None:
         if not _is_owned_config_pair(
             raw_entry["file"], raw_entry["key_path"], providers
         ):
+            return None
+        if _safe_project_candidate(project_path, raw_entry["file"]) is None:
             return None
         config_entries.append(ConfigEntry(**raw_entry))
 
@@ -750,27 +827,34 @@ def check_installed(project_path: Path) -> CheckResult:
     manifest_paths: set[str] = set()
     for entry in manifest.entries:
         manifest_paths.add(entry.dest)
-        abs_path = project_path / entry.dest
+        abs_path = _safe_project_candidate(project_path, entry.dest)
+        if abs_path is None:
+            result.missing.append(entry.dest)
+            continue
 
         if entry.management_mode == "hooks-merge":
             # hooks.json has no MAP metadata; just check existence
-            if abs_path.exists() and not abs_path.is_symlink():
+            if abs_path.exists():
                 result.ok.append(entry.dest)
             else:
                 result.missing.append(entry.dest)
             continue
 
-        if not abs_path.exists() or abs_path.is_symlink():
+        if not abs_path.exists():
             result.missing.append(entry.dest)
             continue
 
+        read_path = _safe_project_candidate(project_path, entry.dest)
+        if read_path is None:
+            result.missing.append(entry.dest)
+            continue
         try:
-            content = abs_path.read_text(encoding="utf-8")
+            content = read_path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             result.missing.append(entry.dest)
             continue
 
-        ext = abs_path.suffix.lower()
+        ext = read_path.suffix.lower()
         meta, _ = extract_metadata(content, ext)
 
         if meta is None:

@@ -32,6 +32,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import mapify_cli.install_manifest as install_manifest_module
 from mapify_cli.delivery.managed_file_copier import (
     compute_hash,
     inject_metadata,
@@ -994,6 +995,239 @@ class TestVC7ReadManifestEdgeCases:
         assert read_manifest(tmp_path) is None
         assert reconcile_config(tmp_path) == ReconcileResult()
         assert mcp_path.read_bytes() == original
+
+    def test_read_rejects_statusline_through_symlinked_claude_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        outside_dir = tmp_path.parent / f"{tmp_path.name}-outside-claude"
+        outside_dir.mkdir()
+        outside_settings = outside_dir / "settings.local.json"
+        original = b'{"statusLine":{"command":"map-statusline.py"},"keep":true}\n'
+        outside_settings.write_bytes(original)
+        (tmp_path / ".claude").symlink_to(outside_dir, target_is_directory=True)
+        raw = _valid_raw_manifest()
+        raw["entries"] = []
+        raw["config_entries"] = [
+            {
+                "file": ".claude/settings.local.json",
+                "key_path": "statusLine",
+                "installed_at": "2026-07-05T00:00:00Z",
+                "mapify_version": VERSION,
+            }
+        ]
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+        assert reconcile_config(tmp_path) == ReconcileResult()
+        assert outside_settings.read_bytes() == original
+
+    def test_read_rejects_mcp_config_final_symlink(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        outside_mcp = tmp_path.parent / f"{tmp_path.name}-outside-mcp.json"
+        original = json.dumps(
+            {"mcpServers": {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG}, "keep": True}
+        ).encode()
+        outside_mcp.write_bytes(original)
+        (tmp_path / ".mcp.json").symlink_to(outside_mcp)
+        raw = _valid_raw_manifest()
+        raw["entries"] = []
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+        assert reconcile_config(tmp_path) == ReconcileResult()
+        assert outside_mcp.read_bytes() == original
+
+    def test_read_rejects_managed_dest_through_symlinked_ancestor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        outside_skills = tmp_path.parent / f"{tmp_path.name}-outside-skills"
+        outside_skill = outside_skills / "map-plan" / "SKILL.md"
+        _write_managed_file(outside_skill, "outside\n")
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "skills").symlink_to(
+            outside_skills,
+            target_is_directory=True,
+        )
+        raw = _valid_raw_manifest()
+        raw["config_entries"] = []
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    def test_read_rejects_managed_dest_final_symlink(self, tmp_path: Path) -> None:
+        outside_skill = tmp_path.parent / f"{tmp_path.name}-outside-skill.md"
+        _write_managed_file(outside_skill, "outside\n")
+        managed_skill = tmp_path / ".claude" / "skills" / "map-plan" / "SKILL.md"
+        managed_skill.parent.mkdir(parents=True)
+        managed_skill.symlink_to(outside_skill)
+        raw = _valid_raw_manifest()
+        raw["config_entries"] = []
+        _write_raw_manifest(tmp_path, raw)
+
+        assert read_manifest(tmp_path) is None
+
+    def test_check_revalidates_ancestor_symlinks_after_manifest_load(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        raw = _valid_raw_manifest()
+        raw["config_entries"] = []
+        _write_raw_manifest(tmp_path, raw)
+        accepted_manifest = read_manifest(tmp_path)
+        assert accepted_manifest is not None
+
+        outside_skills = tmp_path.parent / f"{tmp_path.name}-late-skills"
+        outside_skill = outside_skills / "map-plan" / "SKILL.md"
+        _write_managed_file(
+            outside_skill,
+            "outside\n",
+            template_hash="template-sha256",
+        )
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / "skills").symlink_to(
+            outside_skills,
+            target_is_directory=True,
+        )
+        monkeypatch.setattr(
+            install_manifest_module,
+            "read_manifest",
+            lambda project_path: accepted_manifest,
+        )
+
+        result = check_installed(tmp_path)
+
+        assert ".claude/skills/map-plan/SKILL.md" in result.missing
+        assert ".claude/skills/map-plan/SKILL.md" not in result.ok
+
+    def test_reconcile_revalidates_statusline_ancestor_before_mutation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        settings = tmp_path / ".claude" / "settings.local.json"
+        settings.parent.mkdir()
+        settings.write_text('{"statusLine":{"command":"map-statusline.py"}}\n')
+        raw = _valid_raw_manifest()
+        raw["entries"] = []
+        raw["config_entries"] = [
+            {
+                "file": ".claude/settings.local.json",
+                "key_path": "statusLine",
+                "installed_at": "2026-07-05T00:00:00Z",
+                "mapify_version": VERSION,
+            }
+        ]
+        _write_raw_manifest(tmp_path, raw)
+        accepted_manifest = read_manifest(tmp_path)
+        assert accepted_manifest is not None
+
+        safe_claude = tmp_path / ".claude-safe"
+        settings.parent.rename(safe_claude)
+        outside_claude = tmp_path.parent / f"{tmp_path.name}-late-claude"
+        outside_claude.mkdir()
+        outside_settings = outside_claude / "settings.local.json"
+        original = b'{"statusLine":{"command":"map-statusline.py"},"keep":true}\n'
+        outside_settings.write_bytes(original)
+        (tmp_path / ".claude").symlink_to(
+            outside_claude,
+            target_is_directory=True,
+        )
+        monkeypatch.setattr(
+            install_manifest_module,
+            "read_manifest",
+            lambda project_path: accepted_manifest,
+        )
+
+        result = reconcile_config(tmp_path)
+
+        assert result.removed == []
+        assert outside_settings.read_bytes() == original
+
+    def test_reconcile_revalidates_mcp_final_symlink_before_mutation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mcp_path = tmp_path / ".mcp.json"
+        mcp_path.write_text(
+            json.dumps({"mcpServers": {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG}}),
+            encoding="utf-8",
+        )
+        raw = _valid_raw_manifest()
+        raw["entries"] = []
+        _write_raw_manifest(tmp_path, raw)
+        accepted_manifest = read_manifest(tmp_path)
+        assert accepted_manifest is not None
+
+        safe_mcp = tmp_path / ".mcp.safe.json"
+        mcp_path.rename(safe_mcp)
+        outside_mcp = tmp_path.parent / f"{tmp_path.name}-late-mcp.json"
+        original = json.dumps(
+            {"mcpServers": {_MAP_SERVER_NAME: _MAP_SERVER_CONFIG}, "keep": True}
+        ).encode()
+        outside_mcp.write_bytes(original)
+        mcp_path.symlink_to(outside_mcp)
+        monkeypatch.setattr(
+            install_manifest_module,
+            "read_manifest",
+            lambda project_path: accepted_manifest,
+        )
+
+        result = reconcile_config(tmp_path)
+
+        assert result.removed == []
+        assert outside_mcp.read_bytes() == original
+
+    def test_read_rejects_symlinked_manifest_file(self, tmp_path: Path) -> None:
+        outside_manifest = tmp_path.parent / f"{tmp_path.name}-manifest.json"
+        outside_manifest.write_text(json.dumps(_valid_raw_manifest()), encoding="utf-8")
+        manifest_path = tmp_path / ".map" / MANIFEST_FILENAME
+        manifest_path.parent.mkdir()
+        manifest_path.symlink_to(outside_manifest)
+
+        assert read_manifest(tmp_path) is None
+
+    def test_write_rejects_symlinked_map_directory(self, tmp_path: Path) -> None:
+        outside_map = tmp_path.parent / f"{tmp_path.name}-outside-map"
+        outside_map.mkdir()
+        (tmp_path / ".map").symlink_to(outside_map, target_is_directory=True)
+        manifest = InstallManifest(
+            mapify_version=VERSION,
+            provider="claude",
+            installed_at="2026-07-05T00:00:00Z",
+            providers=["claude"],
+        )
+
+        with pytest.raises(OSError, match="symlink"):
+            write_manifest(tmp_path, manifest)
+
+        assert not (outside_map / MANIFEST_FILENAME).exists()
+
+    def test_write_rejects_symlinked_manifest_file(self, tmp_path: Path) -> None:
+        outside_manifest = tmp_path.parent / f"{tmp_path.name}-write-target.json"
+        original = b"outside sentinel\n"
+        outside_manifest.write_bytes(original)
+        manifest_path = tmp_path / ".map" / MANIFEST_FILENAME
+        manifest_path.parent.mkdir()
+        manifest_path.symlink_to(outside_manifest)
+        manifest = InstallManifest(
+            mapify_version=VERSION,
+            provider="claude",
+            installed_at="2026-07-05T00:00:00Z",
+            providers=["claude"],
+        )
+
+        with pytest.raises(OSError, match="symlink"):
+            write_manifest(tmp_path, manifest)
+
+        assert outside_manifest.read_bytes() == original
 
 
 # ---------------------------------------------------------------------------
